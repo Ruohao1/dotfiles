@@ -14,13 +14,13 @@ alias dotfiles='/usr/bin/git --git-dir=$HOME/.cfg/ --work-tree=$HOME'
 mkdir -p .config-backup
 dotfiles checkout 2>&1 | egrep "\s+\." | awk {'print $1'} | xargs -I{} mv {} .config-backup/{}
 dotfiles checkout
-dotfiles config --local status.showUntrackedFiles no```
+dotfiles config --local status.showUntrackedFiles no
+```
 
 ---
 ## Get started
 
 ```Bash
-
 git init $HOME/.cfg
 alias dotfiles='/usr/bin/git --git-dir=$HOME/.cfg/ --work-tree=$HOME'
 echo "alias dotfiles='/usr/bin/git --git-dir=$HOME/.cfg/ --work-tree=$HOME'" >> $HOME/.zshrc
