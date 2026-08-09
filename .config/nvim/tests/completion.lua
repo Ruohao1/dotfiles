@@ -48,13 +48,16 @@ local state = {
   autocmds = {},
   clients = {},
   completeopt_calls = {},
+  dynamic_registrations = {},
   enable_calls = {},
+  enable_errors = {},
   group_calls = {},
   mapping_calls = {},
   mappings = {},
   popup_visible = false,
   selected = -1,
   support_checks = {},
+  trigger_snapshots = {},
 }
 
 local controller = completion._test.new({
@@ -87,13 +90,27 @@ local controller = completion._test.new({
   get_client = function(client_id)
     return state.clients[client_id]
   end,
+  get_dynamic_registrations = function(client, provider, bufnr)
+    if provider ~= "completionProvider" then
+      return nil
+    end
+
+    return (state.dynamic_registrations[client.id] or {})[bufnr]
+  end,
   enable_completion = function(enable, client_id, bufnr, options)
+    local provider = state.clients[client_id].server_capabilities.completionProvider
+    state.trigger_snapshots[#state.trigger_snapshots + 1] =
+      vim.deepcopy(provider and provider.triggerCharacters)
     state.enable_calls[#state.enable_calls + 1] = {
       bufnr = bufnr,
       client_id = client_id,
       enable = enable,
       options = vim.deepcopy(options),
     }
+
+    if state.enable_errors[client_id] then
+      error(state.enable_errors[client_id])
+    end
   end,
   popup_visible = function()
     return state.popup_visible
@@ -199,12 +216,13 @@ eq(state.support_checks[1], {
 eq(unsupported_triggers, { "." }, "unsupported client triggers remain unchanged")
 eq(#state.enable_calls, 0, "unsupported client is not enabled")
 
+local static_provider = {
+  triggerCharacters = { ".", ":", ".", "0", "_" },
+}
 state.clients[12] = {
   id = 12,
   server_capabilities = {
-    completionProvider = {
-      triggerCharacters = { ".", ":", ".", "0", "_" },
-    },
+    completionProvider = static_provider,
   },
   supports_method = function(client, method, bufnr)
     state.support_checks[#state.support_checks + 1] = {
@@ -223,9 +241,9 @@ vim.list_extend(
   characters("123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
 )
 eq(
-  state.clients[12].server_capabilities.completionProvider.triggerCharacters,
+  state.trigger_snapshots[1],
   expected_triggers,
-  "server triggers preserved and identifier triggers normalized"
+  "static server triggers preserved and identifier triggers normalized during enablement"
 )
 eq(state.support_checks[2], {
   bufnr = 22,
@@ -239,19 +257,61 @@ eq(state.enable_calls[1], {
   options = { autotrigger = true },
 }, "exact native completion enablement")
 
+local function dynamic_completion_support(client_id, matching_bufnr)
+  return function(client, method, bufnr)
+    state.support_checks[#state.support_checks + 1] = {
+      bufnr = bufnr,
+      client_id = client.id,
+      method = method,
+    }
+
+    if client.server_capabilities.completionProvider ~= nil then
+      return true
+    end
+
+    return client.id == client_id
+      and method == "textDocument/completion"
+      and bufnr == matching_bufnr
+  end
+end
+
+state.dynamic_registrations[13] = {
+  [23] = {
+    {
+      id = "dynamic-completion-13",
+      method = "textDocument/completion",
+      registerOptions = {
+        documentSelector = { { language = "lua" } },
+        triggerCharacters = { ".", "0", "." },
+      },
+    },
+  },
+}
 state.clients[13] = {
   id = 13,
   server_capabilities = {},
-  supports_method = function()
-    return true
-  end,
+  supports_method = dynamic_completion_support(13, 23),
 }
 
 attach({ buf = 23, data = { client_id = 13 } })
+local expected_dynamic_triggers = { ".", "0" }
+vim.list_extend(
+  expected_dynamic_triggers,
+  characters("123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz")
+)
 eq(
-  state.clients[13].server_capabilities.completionProvider.triggerCharacters,
-  characters("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"),
-  "identifier triggers for a dynamically registered completion provider"
+  state.trigger_snapshots[2],
+  expected_dynamic_triggers,
+  "dynamic and identifier triggers are snapshotted for the matching buffer"
+)
+assert(
+  state.clients[13].server_capabilities.completionProvider == nil,
+  "absent static provider must be restored after dynamic enablement"
+)
+eq(
+  state.clients[13]:supports_method("textDocument/completion", 24),
+  false,
+  "dynamic completion registration remains buffer-specific"
 )
 eq(state.enable_calls[2], {
   bufnr = 23,
@@ -259,6 +319,61 @@ eq(state.enable_calls[2], {
   enable = true,
   options = { autotrigger = true },
 }, "dynamic provider enablement")
+
+assert(
+  state.clients[12].server_capabilities.completionProvider == static_provider,
+  "static provider identity must be restored after enablement"
+)
+eq(
+  static_provider.triggerCharacters,
+  { ".", ":", ".", "0", "_" },
+  "static provider triggers remain unchanged after enablement"
+)
+
+state.dynamic_registrations[14] = {
+  [25] = {
+    {
+      id = "dynamic-completion-14",
+      method = "textDocument/completion",
+      registerOptions = {
+        documentSelector = { { language = "lua" } },
+        triggerCharacters = { ":" },
+      },
+    },
+  },
+}
+state.clients[14] = {
+  id = 14,
+  server_capabilities = {},
+  supports_method = dynamic_completion_support(14, 25),
+}
+state.enable_errors[14] = "forced completion enable failure"
+
+local enable_ok, enable_error = pcall(attach, { buf = 25, data = { client_id = 14 } })
+assert(not enable_ok, "native completion enablement failure must remain visible")
+assert(
+  tostring(enable_error):find("forced completion enable failure", 1, true),
+  "native completion enablement failure must be preserved"
+)
+local expected_error_triggers = { ":" }
+vim.list_extend(
+  expected_error_triggers,
+  characters("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz")
+)
+eq(
+  state.trigger_snapshots[3],
+  expected_error_triggers,
+  "dynamic and identifier triggers are installed before failing enablement"
+)
+assert(
+  state.clients[14].server_capabilities.completionProvider == nil,
+  "absent static provider must be restored after enablement failure"
+)
+eq(
+  state.clients[14]:supports_method("textDocument/completion", 26),
+  false,
+  "failed enablement must not widen dynamic completion support"
+)
 
 local missing_ok, missing_error = pcall(attach, { buf = 24, data = { client_id = 99 } })
 assert(not missing_ok, "missing LSP client must fail")
