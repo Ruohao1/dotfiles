@@ -336,7 +336,18 @@ local function picker_harness(options)
   local root_calls = 0
   local api = {}
 
-  for _, name in ipairs({ "files", "live_grep", "buffers", "oldfiles", "helptags" }) do
+  for _, name in ipairs({
+    "files",
+    "live_grep",
+    "buffers",
+    "oldfiles",
+    "helptags",
+    "lsp_finder",
+    "lsp_document_symbols",
+    "lsp_live_workspace_symbols",
+    "diagnostics_document",
+    "diagnostics_workspace",
+  }) do
     api[name] = function(call_options)
       if options.error_method == name then
         error(options.error_message or "picker exploded")
@@ -386,18 +397,48 @@ local function picker_harness(options)
   }
 end
 
+local expected_lsp_finder_options = {
+  async = true,
+  silent = true,
+  includeDeclaration = false,
+  providers = {
+    { "definitions", prefix = "def " },
+    { "implementations", prefix = "impl" },
+    { "typedefs", prefix = "type" },
+    { "references", prefix = "ref " },
+  },
+}
+
+local function invoke_lsp_pickers(controller)
+  controller.lsp_locations()
+  controller.document_symbols()
+  controller.workspace_symbols()
+  controller.document_diagnostics()
+  controller.all_diagnostics()
+end
+
 local dispatch = picker_harness()
 dispatch.controller.files()
 dispatch.controller.grep()
 dispatch.controller.buffers()
 dispatch.controller.recent()
 dispatch.controller.help()
+invoke_lsp_pickers(dispatch.controller)
 eq(dispatch.calls[1], { name = "files", options = { cwd = "/project" } }, "files dispatch")
 eq(dispatch.calls[2], { name = "live_grep", options = { cwd = "/project" } }, "grep dispatch")
 eq(dispatch.calls[3], { name = "buffers" }, "buffer dispatch has no cwd")
 eq(dispatch.calls[4], { name = "oldfiles" }, "recent dispatch has no cwd")
 eq(dispatch.calls[5], { name = "helptags" }, "help dispatch has no cwd")
-eq(dispatch.counts(), { system = 1, fzf = 5, root = 2 }, "successful dispatch counts")
+eq(
+  dispatch.calls[6],
+  { name = "lsp_finder", options = expected_lsp_finder_options },
+  "LSP locations dispatch"
+)
+eq(dispatch.calls[7], { name = "lsp_document_symbols" }, "document symbols dispatch")
+eq(dispatch.calls[8], { name = "lsp_live_workspace_symbols" }, "workspace symbols dispatch")
+eq(dispatch.calls[9], { name = "diagnostics_document" }, "document diagnostics dispatch")
+eq(dispatch.calls[10], { name = "diagnostics_workspace" }, "all diagnostics dispatch")
+eq(dispatch.counts(), { system = 1, fzf = 10, root = 2 }, "successful dispatch counts")
 
 for _, version_case in ipairs({
   { version = "0.36.0", accepted = true },
@@ -416,8 +457,10 @@ end
 local function assert_guard(options, expected_message, label)
   local harness = picker_harness(options)
   harness.controller.buffers()
+  invoke_lsp_pickers(harness.controller)
   harness.controller.buffers()
-  eq(#harness.calls, 0, label .. " blocks picker")
+  invoke_lsp_pickers(harness.controller)
+  eq(#harness.calls, 0, label .. " blocks pickers")
   eq(#harness.notifications, 1, label .. " notifies once")
   eq(harness.notifications[1].message, expected_message, label .. " message")
   eq(harness.notifications[1].level, vim.log.levels.ERROR, label .. " level")
@@ -499,17 +542,46 @@ no_grep.controller.help()
 eq(no_grep.calls, { { name = "helptags" } }, "missing grep provider blocks only grep")
 eq(no_grep.notifications[1].message, "Live grep requires rg or grep", "missing grep message")
 
+local lsp_only = picker_harness({ available = { fzf = true } })
+invoke_lsp_pickers(lsp_only.controller)
+eq(#lsp_only.calls, 5, "LSP pickers do not require file or grep providers")
+eq(#lsp_only.notifications, 0, "LSP pickers do not emit provider notifications")
+eq(lsp_only.counts(), { system = 1, fzf = 5, root = 0 }, "LSP-only dispatch counts")
+
 local exploding = picker_harness({ error_method = "buffers", error_message = "picker exploded" })
 local picker_ok, picker_error = pcall(exploding.controller.buffers)
 assert(not picker_ok, "unexpected picker error must propagate")
 assert(tostring(picker_error):find("picker exploded", 1, true), "propagated picker error changed")
 
-for _, method in ipairs({ "files", "grep", "buffers", "recent", "help" }) do
-  assert(type(pickers[method]) == "function", "missing public picker " .. method)
+local exploding_lsp = picker_harness({
+  error_method = "lsp_finder",
+  error_message = "LSP picker exploded",
+})
+local lsp_ok, lsp_error = pcall(exploding_lsp.controller.lsp_locations)
+assert(not lsp_ok, "unexpected LSP picker error must propagate")
+assert(tostring(lsp_error):find("LSP picker exploded", 1, true), "LSP picker error changed")
+
+local expected_public_pickers = {
+  "files",
+  "grep",
+  "buffers",
+  "recent",
+  "help",
+  "lsp_locations",
+  "document_symbols",
+  "workspace_symbols",
+  "document_diagnostics",
+  "all_diagnostics",
+  "_test",
+}
+for _, method in ipairs(expected_public_pickers) do
+  if method ~= "_test" then
+    assert(type(pickers[method]) == "function", "missing public picker " .. method)
+  end
 end
 for public_name in pairs(pickers) do
   assert(
-    contains({ "files", "grep", "buffers", "recent", "help", "_test" }, public_name),
+    contains(expected_public_pickers, public_name),
     "unexpected public picker surface " .. tostring(public_name)
   )
 end
