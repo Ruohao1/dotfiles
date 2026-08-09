@@ -1,0 +1,326 @@
+#!/bin/sh
+set -eu
+
+LC_ALL=C
+export LC_ALL
+umask 077
+
+program=tmux-workspace
+schema=1
+retention=10
+workspace_state=
+workspace_runtime=
+lock_path=
+lock_held=0
+staging_dir=
+
+usage() {
+  destination=$1
+  if [ "$destination" -eq 1 ]; then
+    output=/dev/stdout
+  else
+    output=/dev/stderr
+  fi
+  printf '%s\n' \
+    'usage: tmux-workspace COMMAND' \
+    '' \
+    '  tmux-workspace save         checkpoint the current server' \
+    '  tmux-workspace restore      restore a safe detached server' \
+    '  tmux-workspace ensure       wait for or perform login restore' \
+    '  tmux-workspace status       report snapshot and supervisor state' \
+    '  tmux-workspace doctor       validate persistence dependencies' \
+    '  tmux-workspace supervise    restore, checkpoint, and save on stop' \
+    '  tmux-workspace codex-hook   handle Codex hook JSON from stdin' \
+    '  tmux-workspace resume-pane GENERATION PANE_KEY' \
+    >"$output"
+}
+
+die() {
+  printf '%s: %s\n' "$program" "$1" >&2
+  exit "$2"
+}
+
+state_root() {
+  if [ -n "${TMUX_WORKSPACE_STATE_ROOT-}" ]; then
+    printf '%s\n' "$TMUX_WORKSPACE_STATE_ROOT"
+  elif [ -n "${XDG_STATE_HOME-}" ]; then
+    printf '%s\n' "$XDG_STATE_HOME/dotfiles/tmux"
+  else
+    printf '%s\n' "$HOME/.local/state/dotfiles/tmux"
+  fi
+}
+
+runtime_root() {
+  if [ -n "${TMUX_WORKSPACE_RUNTIME_ROOT-}" ]; then
+    printf '%s\n' "$TMUX_WORKSPACE_RUNTIME_ROOT"
+  elif [ -n "${XDG_RUNTIME_DIR-}" ]; then
+    printf '%s\n' "$XDG_RUNTIME_DIR/dotfiles-tmux"
+  else
+    printf '%s\n' "${TMPDIR:-/tmp}/dotfiles-tmux-$(id -u)"
+  fi
+}
+
+require_test_socket() {
+  if [ "${TMUX_WORKSPACE_TESTING:-0}" = 1 ] \
+    && [ -z "${TMUX_WORKSPACE_SOCKET-}" ]; then
+    die 'TMUX_WORKSPACE_SOCKET is required in test mode' 2
+  fi
+}
+
+tmux_run() {
+  require_test_socket
+  if [ -n "${TMUX_WORKSPACE_SOCKET-}" ]; then
+    command tmux -S "$TMUX_WORKSPACE_SOCKET" "$@"
+  else
+    command tmux "$@"
+  fi
+}
+
+prepare_roots() {
+  workspace_state=$(state_root)
+  workspace_runtime=$(runtime_root)
+  case $workspace_state:$workspace_runtime in
+    /*:/*) ;;
+    *) die 'state and runtime roots must be absolute paths' 2 ;;
+  esac
+  mkdir -p "$workspace_state/snapshots" "$workspace_runtime"
+  chmod 0700 "$workspace_state" "$workspace_state/snapshots" "$workspace_runtime"
+}
+
+pid_is_live() {
+  owner_pid=$1
+  case $owner_pid in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$owner_pid" >/dev/null 2>&1
+}
+
+acquire_lock() {
+  lock_name=$1
+  lock_path=$workspace_runtime/$lock_name.lock
+  lock_held=0
+
+  if mkdir "$lock_path" 2>/dev/null; then
+    printf '%s\n' "$$" >"$lock_path/owner"
+    chmod 0600 "$lock_path/owner"
+    lock_held=1
+    return 0
+  fi
+
+  [ ! -L "$lock_path" ] || return 1
+  [ -d "$lock_path" ] || return 1
+  lock_owner=$(sed -n '1p' "$lock_path/owner" 2>/dev/null || :)
+  if pid_is_live "$lock_owner"; then
+    return 1
+  fi
+
+  rm -f "$lock_path/owner"
+  rmdir "$lock_path" 2>/dev/null || return 1
+  if mkdir "$lock_path" 2>/dev/null; then
+    printf '%s\n' "$$" >"$lock_path/owner"
+    chmod 0600 "$lock_path/owner"
+    lock_held=1
+    return 0
+  fi
+  return 1
+}
+
+release_lock() {
+  [ "$lock_held" -eq 1 ] || return 0
+  [ -n "$lock_path" ] || return 0
+  case $lock_path in
+    "$workspace_runtime"/*.lock) ;;
+    *) return 1 ;;
+  esac
+  recorded_owner=$(sed -n '1p' "$lock_path/owner" 2>/dev/null || :)
+  if [ "$recorded_owner" = "$$" ]; then
+    rm -f "$lock_path/owner"
+    rmdir "$lock_path" 2>/dev/null || :
+  fi
+  lock_held=0
+  lock_path=
+}
+
+generation_is_valid() {
+  candidate=$1
+  if [ "${TMUX_WORKSPACE_TESTING:-0}" = 1 ]; then
+    printf '%s\n' "$candidate" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$'
+  else
+    printf '%s\n' "$candidate" | grep -Eq '^[0-9]{8}T[0-9]{6}Z-[0-9]+$'
+  fi
+}
+
+validate_snapshot() {
+  snapshot_file=$1
+  [ -f "$snapshot_file" ] && [ ! -L "$snapshot_file" ] || return 1
+  jq -e '
+    .schema == 1
+    and (.saved_at | type == "number")
+    and (.tmux_version | type == "string")
+    and (.sessions | type == "array")
+    and (.windows | type == "array")
+    and (.panes | type == "array")
+    and all(.sessions[]; (.key | type == "string") and (.name | type == "string"))
+    and all(.windows[]; (.key | type == "string") and (.links | type == "array"))
+    and all(.panes[];
+      (.key | type == "string")
+      and (.process.kind == "shell"
+        or .process.kind == "nvim"
+        or .process.kind == "codex"
+        or .process.kind == "other"))
+  ' "$snapshot_file" >/dev/null 2>&1
+}
+
+select_snapshot() {
+  selected_generation=
+  selected_manifest=
+  current_file=$workspace_state/current
+
+  if [ -f "$current_file" ] && [ ! -L "$current_file" ]; then
+    current_generation=$(sed -n '1p' "$current_file" 2>/dev/null || :)
+    if generation_is_valid "$current_generation"; then
+      current_manifest=$workspace_state/snapshots/$current_generation/snapshot.json
+      if validate_snapshot "$current_manifest"; then
+        selected_generation=$current_generation
+        selected_manifest=$current_manifest
+        return 0
+      fi
+    fi
+  fi
+
+  generations=$(find "$workspace_state/snapshots" -mindepth 1 -maxdepth 1 -type d \
+    ! -name '.staging-*' -exec basename {} \; 2>/dev/null | sort -r)
+  for candidate in $generations; do
+    generation_is_valid "$candidate" || continue
+    candidate_manifest=$workspace_state/snapshots/$candidate/snapshot.json
+    if validate_snapshot "$candidate_manifest"; then
+      selected_generation=$candidate
+      selected_manifest=$candidate_manifest
+      return 0
+    fi
+  done
+  return 1
+}
+
+new_generation() {
+  if [ -n "${TMUX_WORKSPACE_TEST_GENERATION-}" ]; then
+    candidate=$TMUX_WORKSPACE_TEST_GENERATION
+    printf '%s\n' "$candidate" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' \
+      || die 'invalid test generation' 2
+  else
+    candidate=$(date -u '+%Y%m%dT%H%M%SZ')-$$
+  fi
+  generation_is_valid "$candidate" || die 'invalid generated snapshot name' 1
+  [ ! -e "$workspace_state/snapshots/$candidate" ] \
+    || die "snapshot generation already exists: $candidate" 1
+  [ ! -e "$workspace_state/snapshots/.staging-$candidate" ] \
+    || die "staging generation already exists: $candidate" 1
+  printf '%s\n' "$candidate"
+}
+
+prune_generations() {
+  kept=0
+  generations=$(find "$workspace_state/snapshots" -mindepth 1 -maxdepth 1 -type d \
+    ! -name '.staging-*' -exec basename {} \; 2>/dev/null | sort -r)
+  for candidate in $generations; do
+    generation_is_valid "$candidate" || continue
+    kept=$((kept + 1))
+    [ "$kept" -le "$retention" ] && continue
+    obsolete=$workspace_state/snapshots/$candidate
+    case $obsolete in
+      "$workspace_state"/snapshots/*) rm -rf "$obsolete" ;;
+      *) die 'refusing to prune an unsafe path' 1 ;;
+    esac
+  done
+}
+
+publish_generation() {
+  generation=$1
+  manifest_file=$staging_dir/snapshot.json
+  validate_snapshot "$manifest_file" || die 'refusing to publish an invalid snapshot' 1
+  chmod 0600 "$manifest_file"
+
+  completed_dir=$workspace_state/snapshots/$generation
+  mv "$staging_dir" "$completed_dir"
+  staging_dir=
+
+  pointer_file=$workspace_state/.current-$generation
+  printf '%s\n' "$generation" >"$pointer_file"
+  chmod 0600 "$pointer_file"
+  mv "$pointer_file" "$workspace_state/current"
+  prune_generations
+}
+
+save_snapshot() {
+  prepare_roots
+  acquire_lock checkpoint || die 'checkpoint already in progress' 1
+  generation=$(new_generation)
+  staging_dir=$workspace_state/snapshots/.staging-$generation
+  mkdir "$staging_dir"
+  chmod 0700 "$staging_dir"
+
+  saved_at=$(date '+%s')
+  tmux_version=$(tmux -V 2>/dev/null || printf '%s' unavailable)
+  jq -n \
+    --argjson schema "$schema" \
+    --argjson saved_at "$saved_at" \
+    --arg tmux_version "$tmux_version" \
+    '{
+      schema: $schema,
+      saved_at: $saved_at,
+      tmux_version: $tmux_version,
+      sessions: [],
+      windows: [],
+      panes: []
+    }' >"$staging_dir/snapshot.json"
+
+  publish_generation "$generation"
+  release_lock
+  printf '%s\n' "$generation"
+}
+
+status_snapshot() {
+  prepare_roots
+  if ! select_snapshot; then
+    die 'no valid snapshot' 1
+  fi
+  printf 'Current snapshot: %s\n' "$selected_generation"
+  printf 'Last checkpoint: %s\n' "$(jq -r '.saved_at' "$selected_manifest")"
+}
+
+cleanup_on_exit() {
+  if [ -n "$staging_dir" ] && [ -d "$staging_dir" ] && [ ! -L "$staging_dir" ]; then
+    case $staging_dir in
+      "$workspace_state"/snapshots/.staging-*) rm -rf "$staging_dir" ;;
+    esac
+  fi
+  release_lock || :
+}
+
+trap cleanup_on_exit 0
+trap 'exit 130' HUP INT TERM
+
+require_test_socket
+
+case ${1-} in
+  --help|help)
+    [ "$#" -eq 1 ] || { usage 0; exit 2; }
+    usage 1
+    ;;
+  save)
+    [ "$#" -eq 1 ] || { usage 0; exit 2; }
+    save_snapshot
+    ;;
+  status)
+    [ "$#" -eq 1 ] || { usage 0; exit 2; }
+    status_snapshot
+    ;;
+  '')
+    usage 0
+    exit 2
+    ;;
+  *)
+    usage 0
+    exit 2
+    ;;
+esac
