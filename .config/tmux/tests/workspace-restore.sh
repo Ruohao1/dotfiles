@@ -60,6 +60,22 @@ run_workspace() {
   set -e
 }
 
+run_workspace_missing_executable() {
+  missing_executable=$1
+  shift
+  set +e
+  HOME=$test_root/home \
+    SHELL=/bin/sh \
+    XDG_STATE_HOME=$state \
+    XDG_RUNTIME_DIR=$runtime \
+    TMUX_WORKSPACE_TESTING=1 \
+    TMUX_WORKSPACE_SOCKET=$socket \
+    TMUX_WORKSPACE_TEST_MISSING_EXECUTABLE=$missing_executable \
+    "$workspace" "$@" >"$stdout" 2>"$stderr"
+  status=$?
+  set -e
+}
+
 run_codex_hook() {
   hook_pane=$1
   hook_payload=$2
@@ -171,6 +187,29 @@ counts_after=$(printf '%s|%s|%s' \
 assert_equal "$counts_before" "$counts_after" "idempotent topology counts"
 
 stop_private_server
+missing_generation=missing-cwd
+missing_generation_dir=$state/dotfiles/tmux/snapshots/$missing_generation
+mkdir -p "$missing_generation_dir"
+chmod 0700 "$missing_generation_dir"
+jq --arg path "$test_root/projects/removed" '
+  (.sessions[].path) = $path
+  | (.panes[].path) = $path
+' "$state/dotfiles/tmux/snapshots/$generation/snapshot.json" \
+  >"$missing_generation_dir/snapshot.json"
+chmod 0600 "$missing_generation_dir/snapshot.json"
+printf '%s\n' "$missing_generation" >"$state/dotfiles/tmux/current"
+run_workspace restore
+[ "$status" -eq 0 ] || sed -n '1,120p' "$stderr" >&2
+assert_equal 0 "$status" "missing working directory fallback restore"
+assert_equal "$test_root/home" \
+  "$(private_tmux list-panes -a -F '#{pane_current_path}' | sort -u)" \
+  "missing working directories fall back to HOME"
+assert_contains 'a saved working directory is missing; HOME was used' \
+  "$state/dotfiles/tmux/last-warning" \
+  "missing working directory warning"
+stop_private_server
+rm -rf "$missing_generation_dir"
+
 corrupt_generation=zz-corrupt
 mkdir -p "$state/dotfiles/tmux/snapshots/$corrupt_generation"
 chmod 0700 "$state/dotfiles/tmux/snapshots/$corrupt_generation"
@@ -374,6 +413,21 @@ if grep -R -F '/ignored/a.jsonl' "$state/dotfiles/tmux" >/dev/null 2>&1 \
 fi
 
 stop_private_server
+rm -f "$codex_log_directory/alpha" "$codex_log_directory/picker"
+run_workspace_missing_executable codex restore
+[ "$status" -eq 0 ] || sed -n '1,120p' "$stderr" >&2
+assert_equal 0 "$status" "missing Codex executable restore"
+assert_equal sh \
+  "$(private_tmux list-panes -a -F '#{pane_current_command}' | sort -u)" \
+  "missing Codex leaves restored shells open"
+assert_contains 'codex is unavailable; the restored shell was left open' \
+  "$state/dotfiles/tmux/last-warning" \
+  "missing Codex warning"
+[ ! -e "$codex_log_directory/alpha" ] \
+  && [ ! -e "$codex_log_directory/picker" ] \
+  || fail "missing Codex restore dispatched a process"
+
+stop_private_server
 real_nvim=$(command -v nvim) || fail "nvim is required"
 nvim_project=$test_root/projects/nvim
 mkdir -p "$nvim_project"
@@ -426,6 +480,22 @@ nvim_session_file=$state/dotfiles/tmux/snapshots/$nvim_generation/$nvim_relative
 [ -s "$nvim_session_file" ] || fail "native Neovim session file"
 assert_equal 600 "$(stat -c %a "$nvim_session_file")" "native Neovim session mode"
 
+private_tmux set-option -pt "$nvim_pane" \
+  @dotfiles_nvim_server "$test_root/missing-nvim.sock"
+run_workspace save
+assert_equal 0 "$status" "failed Neovim RPC checkpoint"
+failed_nvim_generation=$(cat "$state/dotfiles/tmux/current")
+failed_nvim_manifest=$state/dotfiles/tmux/snapshots/$failed_nvim_generation/snapshot.json
+jq -e '
+  any(.panes[];
+    .process.kind == "nvim" and .process.nvim_session == null)
+' "$failed_nvim_manifest" >/dev/null \
+  || fail "failed Neovim RPC fallback metadata"
+assert_contains 'a Neovim checkpoint RPC failed; a clean editor will be restored' \
+  "$state/dotfiles/tmux/last-warning" \
+  "failed Neovim RPC warning"
+printf '%s\n' "$nvim_generation" >"$state/dotfiles/tmux/current"
+
 stop_private_server
 cat >"$shim_directory/nvim" <<'SHIM'
 #!/bin/sh
@@ -448,5 +518,29 @@ done
 assert_equal "$(printf '%s\n%s' -S "$nvim_session_file")" \
   "$(cat "$codex_log_directory/nvim")" \
   "native Neovim restore argv"
+
+nvim_pane_key=$(jq -er '
+  .panes[] | select(.process.kind == "nvim") | .key
+' "$nvim_manifest")
+mv "$nvim_session_file" "$nvim_session_file.private"
+ln -s "$nvim_session_file.private" "$nvim_session_file"
+rm -f "$codex_log_directory/nvim"
+run_workspace resume-pane "$nvim_generation" "$nvim_pane_key"
+assert_equal 0 "$status" "symlinked Neovim session fallback"
+[ -f "$codex_log_directory/nvim" ] || fail "symlink fallback Neovim invocation"
+assert_equal '' "$(cat "$codex_log_directory/nvim")" \
+  "symlinked Neovim session starts a clean editor"
+rm -f "$nvim_session_file"
+mv "$nvim_session_file.private" "$nvim_session_file"
+
+chmod 0644 "$nvim_session_file"
+rm -f "$codex_log_directory/nvim"
+run_workspace resume-pane "$nvim_generation" "$nvim_pane_key"
+assert_equal 0 "$status" "world-readable Neovim session fallback"
+[ -f "$codex_log_directory/nvim" ] \
+  || fail "world-readable fallback Neovim invocation"
+assert_equal '' "$(cat "$codex_log_directory/nvim")" \
+  "world-readable Neovim session starts a clean editor"
+chmod 0600 "$nvim_session_file"
 
 pass "workspace structural restore"

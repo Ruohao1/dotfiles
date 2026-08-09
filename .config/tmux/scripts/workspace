@@ -94,15 +94,49 @@ tmux_run() {
   fi
 }
 
-prepare_roots() {
+set_root_paths() {
   workspace_state=$(state_root)
   workspace_runtime=$(runtime_root)
   case $workspace_state:$workspace_runtime in
     /*:/*) ;;
     *) die 'state and runtime roots must be absolute paths' 2 ;;
   esac
-  mkdir -p "$workspace_state/snapshots" "$workspace_runtime"
-  chmod 0700 "$workspace_state" "$workspace_state/snapshots" "$workspace_runtime"
+}
+
+ensure_private_directory() {
+  private_directory=$1
+  [ ! -L "$private_directory" ] \
+    || die "refusing symlinked private directory: $private_directory" 1
+  mkdir -p "$private_directory"
+  [ -d "$private_directory" ] && [ ! -L "$private_directory" ] \
+    || die "private directory is unavailable: $private_directory" 1
+  chmod 0700 "$private_directory"
+}
+
+cleanup_stale_staging() {
+  for stale_staging in "$workspace_state"/snapshots/.staging-*; do
+    [ -d "$stale_staging" ] && [ ! -L "$stale_staging" ] || continue
+    staging_name=${stale_staging##*/}
+    staging_identity=${staging_name#.staging-}
+    staging_owner=${staging_identity%%-*}
+    staging_generation=${staging_identity#*-}
+    case $staging_owner:$staging_generation in
+      *[!0-9]*:*|:*) continue ;;
+    esac
+    generation_is_valid "$staging_generation" || continue
+    pid_is_live "$staging_owner" && continue
+    case $stale_staging in
+      "$workspace_state"/snapshots/.staging-*) rm -rf "$stale_staging" ;;
+    esac
+  done
+}
+
+prepare_roots() {
+  set_root_paths
+  ensure_private_directory "$workspace_state"
+  ensure_private_directory "$workspace_state/snapshots"
+  ensure_private_directory "$workspace_runtime"
+  cleanup_stale_staging
 }
 
 pid_is_live() {
@@ -171,6 +205,7 @@ generation_is_valid() {
 validate_snapshot() {
   snapshot_file=$1
   [ -f "$snapshot_file" ] && [ ! -L "$snapshot_file" ] || return 1
+  [ "$(file_mode "$snapshot_file" 2>/dev/null || :)" = 600 ] || return 1
   jq -e '
     def safe_text($limit):
       type == "string"
@@ -585,11 +620,16 @@ select_snapshot() {
   selected_manifest=
   current_file=$workspace_state/current
 
-  if [ -f "$current_file" ] && [ ! -L "$current_file" ]; then
+  if [ -f "$current_file" ] && [ ! -L "$current_file" ] \
+    && [ "$(file_mode "$current_file" 2>/dev/null || :)" = 600 ]; then
     current_generation=$(sed -n '1p' "$current_file" 2>/dev/null || :)
     if generation_is_valid "$current_generation"; then
       current_manifest=$workspace_state/snapshots/$current_generation/snapshot.json
-      if validate_snapshot "$current_manifest"; then
+      if [ -d "$workspace_state/snapshots/$current_generation" ] \
+        && [ ! -L "$workspace_state/snapshots/$current_generation" ] \
+        && [ "$(file_mode "$workspace_state/snapshots/$current_generation" \
+          2>/dev/null || :)" = 700 ] \
+        && validate_snapshot "$current_manifest"; then
         selected_generation=$current_generation
         selected_manifest=$current_manifest
         return 0
@@ -602,7 +642,9 @@ select_snapshot() {
   for candidate in $generations; do
     generation_is_valid "$candidate" || continue
     candidate_manifest=$workspace_state/snapshots/$candidate/snapshot.json
-    if validate_snapshot "$candidate_manifest"; then
+    if [ "$(file_mode "$workspace_state/snapshots/$candidate" \
+        2>/dev/null || :)" = 700 ] \
+      && validate_snapshot "$candidate_manifest"; then
       selected_generation=$candidate
       selected_manifest=$candidate_manifest
       return 0
@@ -633,8 +675,6 @@ new_generation() {
   generation_is_valid "$candidate" || die 'invalid generated snapshot name' 1
   [ ! -e "$workspace_state/snapshots/$candidate" ] \
     || die "snapshot generation already exists: $candidate" 1
-  [ ! -e "$workspace_state/snapshots/.staging-$candidate" ] \
-    || die "staging generation already exists: $candidate" 1
   printf '%s\n' "$candidate"
 }
 
@@ -675,7 +715,9 @@ save_snapshot() {
   prepare_roots
   acquire_lock checkpoint || die 'checkpoint already in progress' 1
   generation=$(new_generation)
-  staging_dir=$workspace_state/snapshots/.staging-$generation
+  staging_dir=$workspace_state/snapshots/.staging-$$-$generation
+  [ ! -e "$staging_dir" ] \
+    || die "staging generation already exists: $generation" 1
   mkdir "$staging_dir"
   chmod 0700 "$staging_dir"
 
@@ -689,13 +731,231 @@ save_snapshot() {
   printf '%s\n' "$generation"
 }
 
+status_add_warning() {
+  new_status_warning=$1
+  if [ -z "$status_warnings" ]; then
+    status_warnings=$new_status_warning
+  else
+    status_warnings="$status_warnings; $new_status_warning"
+  fi
+}
+
 status_snapshot() {
-  prepare_roots
+  set_root_paths
   if ! select_snapshot; then
     die 'no valid snapshot' 1
   fi
+
+  status_warnings=
+  current_file=$workspace_state/current
+  pointer_generation=
+  if [ -f "$current_file" ] && [ ! -L "$current_file" ] \
+    && [ "$(file_mode "$current_file" 2>/dev/null || :)" = 600 ]; then
+    pointer_generation=$(sed -n '1p' "$current_file" 2>/dev/null || :)
+  fi
+  if [ "$pointer_generation" != "$selected_generation" ]; then
+    status_add_warning 'the current pointer is invalid; a fallback snapshot was selected'
+  fi
+
+  supervisor_state=stopped
+  supervisor_status_lock=$workspace_runtime/supervisor.lock
+  if [ -L "$supervisor_status_lock" ]; then
+    supervisor_state=invalid
+    status_add_warning 'the supervisor lock is a symlink and was ignored'
+  elif [ -d "$supervisor_status_lock" ]; then
+    supervisor_status_owner=$(sed -n '1p' \
+      "$supervisor_status_lock/owner" 2>/dev/null || :)
+    if pid_is_live "$supervisor_status_owner"; then
+      supervisor_state=running
+    else
+      supervisor_state=stale
+      status_add_warning 'the supervisor lock is stale'
+    fi
+  fi
+
+  readiness_state=not-ready
+  ready_file=$workspace_runtime/ready
+  if [ -f "$ready_file" ] && [ ! -L "$ready_file" ] \
+    && [ "$(file_mode "$ready_file" 2>/dev/null || :)" = 600 ]; then
+    status_ready_generation=$(sed -n '1p' "$ready_file" 2>/dev/null || :)
+    if [ -z "$status_ready_generation" ] \
+      || { generation_is_valid "$status_ready_generation" \
+        && [ "$status_ready_generation" = "$selected_generation" ]; }; then
+      readiness_state=ready
+    else
+      readiness_state=stale-ready-marker
+      status_add_warning 'the ready marker does not match the selected snapshot'
+    fi
+  elif [ -e "$ready_file" ] || [ -L "$ready_file" ]; then
+    readiness_state=invalid-ready-marker
+    status_add_warning 'the ready marker is invalid'
+  fi
+
+  last_restore=never
+  last_restore_file=$workspace_state/last-restore.json
+  if [ -f "$last_restore_file" ] && [ ! -L "$last_restore_file" ] \
+    && [ "$(file_mode "$last_restore_file" 2>/dev/null || :)" = 600 ]; then
+    restore_generation=$(jq -er \
+      '.generation | select(type == "string")' "$last_restore_file" 2>/dev/null || :)
+    restored_at=$(jq -er \
+      '.restored_at | select(type == "number" and floor == . and . > 0)' \
+      "$last_restore_file" 2>/dev/null || :)
+    if generation_is_valid "$restore_generation" \
+      && [ -n "$restored_at" ]; then
+      last_restore="$restore_generation at $restored_at"
+    else
+      last_restore=invalid
+      status_add_warning 'the last restore record is invalid'
+    fi
+  elif [ -e "$last_restore_file" ] || [ -L "$last_restore_file" ]; then
+    last_restore=invalid
+    status_add_warning 'the last restore record is invalid'
+  fi
+
+  server_state=stopped
+  if tmux_run list-sessions >/dev/null 2>&1; then
+    if [ "$(tmux_run show-options -gqv @dotfiles_workspace_adopted \
+        2>/dev/null || :)" = 1 ]; then
+      server_state=adopted
+    else
+      status_server_generation=$(tmux_run show-options -gqv \
+        @dotfiles_workspace_generation 2>/dev/null || :)
+      if [ "$status_server_generation" = "$selected_generation" ]; then
+        server_state="restored $selected_generation"
+      else
+        server_state=running-unmanaged
+      fi
+    fi
+  fi
+
+  private_warning_file=$workspace_state/last-warning
+  if [ -f "$private_warning_file" ] && [ ! -L "$private_warning_file" ] \
+    && [ "$(file_mode "$private_warning_file" 2>/dev/null || :)" = 600 ]; then
+    private_warning=$(sed -n '1p' "$private_warning_file" 2>/dev/null || :)
+    if [ -n "$private_warning" ] && safe_text "$private_warning" 1024; then
+      status_add_warning "$private_warning"
+    elif [ -n "$private_warning" ]; then
+      status_add_warning 'the private warning record is invalid'
+    fi
+  elif [ -e "$private_warning_file" ] || [ -L "$private_warning_file" ]; then
+    status_add_warning 'the private warning record is invalid'
+  fi
+
+  [ -n "$status_warnings" ] || status_warnings=none
+  printf 'Supervisor: %s, %s\n' "$supervisor_state" "$readiness_state"
   printf 'Current snapshot: %s\n' "$selected_generation"
   printf 'Last checkpoint: %s\n' "$(jq -r '.saved_at' "$selected_manifest")"
+  printf 'Last restore: %s\n' "$last_restore"
+  printf 'Server state: %s\n' "$server_state"
+  printf 'Warnings: %s\n' "$status_warnings"
+}
+
+doctor_failure=0
+
+doctor_fail() {
+  printf '%s doctor: %s\n' "$program" "$1"
+  doctor_failure=1
+}
+
+doctor_hook_is_valid() {
+  doctor_hook_file=$1
+  [ -f "$doctor_hook_file" ] && [ ! -L "$doctor_hook_file" ] || return 1
+  jq -e '
+    def workspace_hook:
+      .type == "command"
+      and .command == "\"$HOME/.config/tmux/scripts/workspace\" codex-hook";
+    (.hooks.SessionStart | type == "array")
+    and (.hooks.SessionEnd | type == "array")
+    and any(.hooks.SessionStart[]?.hooks[]?; workspace_hook)
+    and any(.hooks.SessionEnd[]?.hooks[]?; workspace_hook)
+  ' "$doctor_hook_file" >/dev/null 2>&1
+}
+
+doctor_service_enabled() {
+  doctor_platform=$1
+  if [ "${TMUX_WORKSPACE_TESTING:-0}" = 1 ]; then
+    case ${TMUX_WORKSPACE_TEST_SERVICE_ENABLED:-false} in
+      true) return 0 ;;
+      false) return 1 ;;
+      *) return 1 ;;
+    esac
+  fi
+  case $doctor_platform in
+    Linux)
+      command -v systemctl >/dev/null 2>&1 \
+        && systemctl --user is-enabled --quiet tmux-workspace.service \
+          >/dev/null 2>&1
+      ;;
+    Darwin)
+      command -v launchctl >/dev/null 2>&1 \
+        && launchctl print "gui/$(id -u)/dev.ruohao.tmux-workspace" \
+          >/dev/null 2>&1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+doctor_workspace() {
+  set_root_paths
+  doctor_failure=0
+  doctor_has_jq=1
+  command -v tmux >/dev/null 2>&1 \
+    || doctor_fail 'tmux dependency is missing'
+  if ! command -v jq >/dev/null 2>&1; then
+    doctor_fail 'jq dependency is missing'
+    doctor_has_jq=0
+  fi
+
+  if [ ! -d "$workspace_state" ] \
+    || [ -L "$workspace_state" ] \
+    || [ ! -w "$workspace_state" ] \
+    || [ "$(file_mode "$workspace_state" 2>/dev/null || :)" != 700 ]; then
+    doctor_fail 'writable private state root is missing or invalid'
+  fi
+
+  doctor_hook_file=$HOME/.codex/hooks.json
+  if [ "$doctor_has_jq" -ne 1 ] \
+    || ! doctor_hook_is_valid "$doctor_hook_file"; then
+    doctor_fail 'Codex hook JSON is missing or invalid'
+  fi
+
+  doctor_helper=$HOME/.config/tmux/scripts/workspace
+  if [ ! -f "$doctor_helper" ] || [ -L "$doctor_helper" ] \
+    || [ ! -x "$doctor_helper" ]; then
+    doctor_fail 'workspace helper is missing or not executable'
+  fi
+
+  doctor_nvim=$HOME/.config/nvim/lua/integrations/tmux_persistence.lua
+  if [ ! -f "$doctor_nvim" ] || [ -L "$doctor_nvim" ]; then
+    doctor_fail 'Neovim integration file is missing'
+  fi
+
+  doctor_platform=$(uname -s 2>/dev/null || printf '%s' unknown)
+  case $doctor_platform in
+    Linux)
+      doctor_service=$HOME/.config/systemd/user/tmux-workspace.service
+      ;;
+    Darwin)
+      doctor_service=$HOME/Library/LaunchAgents/dev.ruohao.tmux-workspace.plist
+      ;;
+    *)
+      doctor_service=
+      doctor_fail 'platform service file is missing for this operating system'
+      ;;
+  esac
+  if [ -n "$doctor_service" ]; then
+    if [ ! -f "$doctor_service" ] || [ -L "$doctor_service" ]; then
+      doctor_fail 'platform service file is missing'
+    elif ! doctor_service_enabled "$doctor_platform"; then
+      doctor_fail 'platform login service is not enabled'
+    fi
+  fi
+
+  if [ "$doctor_failure" -eq 0 ]; then
+    printf '%s doctor: ok\n' "$program"
+  fi
+  printf '%s\n' 'Codex hook trust: review with /hooks'
+  [ "$doctor_failure" -eq 0 ]
 }
 
 append_warning() {
@@ -1054,6 +1314,17 @@ resume_restored_processes() {
     require_identifier "$saved_pane_key" '^%[0-9]+$' 'resumed pane identifier'
     actual_pane_id=$(map_lookup "$restore_pane_map" "$saved_pane_key") \
       || die 'missing process pane mapping' 1
+    resumed_process_kind=$(jq -er --arg key "$saved_pane_key" \
+      '.panes[] | select(.key == $key) | .process.kind' "$selected_manifest")
+    case $resumed_process_kind in
+      codex) resumed_executable=codex ;;
+      nvim) resumed_executable=nvim ;;
+      *) die 'invalid resumed process kind' 1 ;;
+    esac
+    if ! executable_available "$resumed_executable"; then
+      notify_unavailable_process "$resumed_executable" "$actual_pane_id"
+      continue
+    fi
     # The restored shell, not this coordinator, expands its own HOME.
     # shellcheck disable=SC2016
     resume_command='"$HOME/.config/tmux/scripts/workspace" resume-pane '
@@ -1062,6 +1333,28 @@ resume_restored_processes() {
     tmux_run send-keys -t "$actual_pane_id" Enter
   done <"$resume_keys_file"
   rm -f "$resume_keys_file"
+}
+
+executable_available() {
+  executable_name=$1
+  if [ "${TMUX_WORKSPACE_TESTING:-0}" = 1 ] \
+    && [ "${TMUX_WORKSPACE_TEST_MISSING_EXECUTABLE:-}" = "$executable_name" ]; then
+    return 1
+  fi
+  command -v "$executable_name" >/dev/null 2>&1
+}
+
+notify_unavailable_process() {
+  unavailable_executable=$1
+  unavailable_pane=$2
+  unavailable_message="$unavailable_executable is unavailable; the restored shell was left open"
+  append_warning "$unavailable_message"
+  case $unavailable_pane in
+    %*)
+      tmux_run display-message -d 5000 -t "$unavailable_pane" \
+        "tmux-workspace: $unavailable_message" >/dev/null 2>&1 || :
+      ;;
+  esac
 }
 
 codex_hook() {
@@ -1117,8 +1410,10 @@ resume_pane() {
   process_kind=$(printf '%s\n' "$pane_record" | jq -er '.process.kind')
   case $process_kind in
     codex)
-      command -v codex >/dev/null 2>&1 \
-        || die 'codex is unavailable; leaving the restored shell open' 127
+      if ! executable_available codex; then
+        notify_unavailable_process codex "${TMUX_PANE-}"
+        exit 127
+      fi
       codex_session_id=$(printf '%s\n' "$pane_record" | \
         jq -r '.process.codex_session_id // empty')
       if [ -n "$codex_session_id" ]; then
@@ -1129,8 +1424,10 @@ resume_pane() {
       exec codex resume
       ;;
     nvim)
-      command -v nvim >/dev/null 2>&1 \
-        || die 'nvim is unavailable; leaving the restored shell open' 127
+      if ! executable_available nvim; then
+        notify_unavailable_process nvim "${TMUX_PANE-}"
+        exit 127
+      fi
       nvim_session=$(printf '%s\n' "$pane_record" | \
         jq -r '.process.nvim_session // empty')
       if [ -n "$nvim_session" ]; then
@@ -1366,6 +1663,10 @@ case ${1-} in
   status)
     [ "$#" -eq 1 ] || { usage 0; exit 2; }
     status_snapshot
+    ;;
+  doctor)
+    [ "$#" -eq 1 ] || { usage 0; exit 2; }
+    doctor_workspace
     ;;
   '')
     usage 0

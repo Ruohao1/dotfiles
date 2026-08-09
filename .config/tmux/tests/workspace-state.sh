@@ -24,6 +24,15 @@ assert_contains() {
   grep -F "$needle" "$file" >/dev/null 2>&1 || fail "$label: missing <$needle>"
 }
 
+assert_not_contains() {
+  needle=$1
+  file=$2
+  label=$3
+  if grep -F "$needle" "$file" >/dev/null 2>&1; then
+    fail "$label: unexpectedly found <$needle>"
+  fi
+}
+
 script_dir=$(CDPATH='' cd -P "$(dirname "$0")" && pwd -P)
 workspace=$script_dir/../scripts/workspace
 real_tmux=$(command -v tmux) || fail "tmux is required"
@@ -51,6 +60,7 @@ run_workspace() {
     XDG_RUNTIME_DIR=$runtime \
     TMUX_WORKSPACE_TESTING=1 \
     TMUX_WORKSPACE_SOCKET=$socket \
+    TMUX_WORKSPACE_TEST_SERVICE_ENABLED=true \
     "$workspace" "$@" >"$stdout" 2>"$stderr"
   status=$?
   set -e
@@ -88,6 +98,28 @@ jq -e '.schema == 1 and .sessions == [] and .windows == [] and .panes == []' \
 assert_equal 700 "$(stat -c %a "$state/dotfiles/tmux")" "Linux state directory mode"
 assert_equal 600 "$(stat -c %a "$manifest")" "Linux manifest mode"
 
+run_workspace status
+assert_equal 0 "$status" "complete status report"
+for status_label in \
+  'Supervisor:' \
+  'Current snapshot:' \
+  'Last checkpoint:' \
+  'Last restore:' \
+  'Server state:' \
+  'Warnings:'
+do
+  assert_contains "$status_label" "$stdout" "status label $status_label"
+done
+assert_not_contains 'transcript_path' "$stdout" "status excludes transcript metadata"
+assert_not_contains 'TMUX_WORKSPACE_STATUS_SECRET' "$stdout" \
+  "status excludes environment names"
+
+chmod 0644 "$manifest"
+run_workspace status
+assert_equal 1 "$status" "world-readable snapshot rejection"
+assert_contains 'no valid snapshot' "$stderr" "world-readable snapshot diagnostic"
+chmod 0600 "$manifest"
+
 printf '%s\n' broken >"$state/dotfiles/tmux/current"
 printf '%s\n' '{' >"$manifest"
 run_workspace status
@@ -102,6 +134,65 @@ set -e
 assert_equal 2 "$status" "test mode requires private socket"
 assert_contains 'TMUX_WORKSPACE_SOCKET is required in test mode' "$stderr" \
   "private socket guard"
+
+doctor_bin=$test_root/doctor-bin
+mkdir -p "$doctor_bin"
+ln -s "$(command -v uname)" "$doctor_bin/uname"
+ln -s "$(command -v stat)" "$doctor_bin/stat"
+set +e
+HOME=$test_root/home XDG_STATE_HOME=$state XDG_RUNTIME_DIR=$runtime \
+  TMUX_WORKSPACE_TESTING=1 TMUX_WORKSPACE_SOCKET=$socket \
+  TMUX_WORKSPACE_TEST_SERVICE_ENABLED=true PATH=$doctor_bin \
+  /bin/sh "$workspace" doctor >"$stdout" 2>"$stderr"
+status=$?
+set -e
+assert_equal 1 "$status" "doctor aggregates missing requirements"
+assert_contains 'tmux dependency is missing' "$stdout" "doctor missing tmux"
+assert_contains 'jq dependency is missing' "$stdout" "doctor missing jq"
+assert_contains 'Codex hook JSON is missing or invalid' "$stdout" \
+  "doctor missing Codex hooks"
+assert_contains 'workspace helper is missing or not executable' "$stdout" \
+  "doctor missing helper"
+assert_contains 'Neovim integration file is missing' "$stdout" \
+  "doctor missing Neovim integration"
+assert_contains 'platform service file is missing' "$stdout" \
+  "doctor missing service file"
+
+source_config_root=$(CDPATH='' cd -P "$script_dir/../.." && pwd -P)
+mkdir -p \
+  "$test_root/home/.codex" \
+  "$test_root/home/.config/nvim/lua/integrations" \
+  "$test_root/home/.config/systemd/user" \
+  "$test_root/home/.config/tmux/scripts"
+cp "$source_config_root/../.codex/hooks.json" \
+  "$test_root/home/.codex/hooks.json"
+cp "$source_config_root/nvim/lua/integrations/tmux_persistence.lua" \
+  "$test_root/home/.config/nvim/lua/integrations/tmux_persistence.lua"
+cp "$source_config_root/systemd/user/tmux-workspace.service" \
+  "$test_root/home/.config/systemd/user/tmux-workspace.service"
+cp "$workspace" "$test_root/home/.config/tmux/scripts/workspace"
+chmod 0600 "$test_root/home/.codex/hooks.json"
+chmod 0755 "$test_root/home/.config/tmux/scripts/workspace"
+run_workspace doctor
+assert_equal 0 "$status" "complete doctor status"
+assert_equal "$(printf '%s\n%s' \
+  'tmux-workspace doctor: ok' \
+  'Codex hook trust: review with /hooks')" \
+  "$(cat "$stdout")" \
+  "complete doctor report"
+
+mkdir -p \
+  "$runtime/dotfiles-tmux/checkpoint.lock" \
+  "$state/dotfiles/tmux/snapshots/.staging-99999999-interrupted"
+printf '%s\n' 99999999 >"$runtime/dotfiles-tmux/checkpoint.lock/owner"
+printf '%s\n' partial \
+  >"$state/dotfiles/tmux/snapshots/.staging-99999999-interrupted/partial"
+run_workspace_generation cleanup-pass save
+assert_equal 0 "$status" "stale workspace artifact cleanup"
+[ ! -e "$runtime/dotfiles-tmux/checkpoint.lock" ] \
+  || fail "stale checkpoint lock remained"
+[ ! -e "$state/dotfiles/tmux/snapshots/.staging-99999999-interrupted" ] \
+  || fail "interrupted staging generation remained"
 
 mkdir -p "$test_root/projects/alpha" "$test_root/projects/beta"
 "$real_tmux" -f "$script_dir/../conf/options.conf" -S "$socket" \
