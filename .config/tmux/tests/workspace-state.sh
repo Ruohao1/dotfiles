@@ -56,6 +56,21 @@ run_workspace() {
   set -e
 }
 
+run_workspace_generation() {
+  test_generation=$1
+  shift
+  set +e
+  HOME=$test_root/home \
+    XDG_STATE_HOME=$state \
+    XDG_RUNTIME_DIR=$runtime \
+    TMUX_WORKSPACE_TESTING=1 \
+    TMUX_WORKSPACE_SOCKET=$socket \
+    TMUX_WORKSPACE_TEST_GENERATION=$test_generation \
+    "$workspace" "$@" >"$stdout" 2>"$stderr"
+  status=$?
+  set -e
+}
+
 run_workspace --help
 assert_equal 0 "$status" "help status"
 assert_contains 'tmux-workspace save' "$stdout" "help save command"
@@ -87,5 +102,68 @@ set -e
 assert_equal 2 "$status" "test mode requires private socket"
 assert_contains 'TMUX_WORKSPACE_SOCKET is required in test mode' "$stderr" \
   "private socket guard"
+
+mkdir -p "$test_root/projects/alpha" "$test_root/projects/beta"
+"$real_tmux" -f "$script_dir/../conf/options.conf" -S "$socket" \
+  new-session -d -s alpha -c "$test_root/projects/alpha" -n editor
+"$real_tmux" -S "$socket" split-window -d -t '=alpha:1' \
+  -c "$test_root/projects/alpha"
+"$real_tmux" -S "$socket" select-layout -t '=alpha:1' even-horizontal
+"$real_tmux" -S "$socket" new-window -d -t '=alpha:2' -n shell \
+  -c "$test_root/projects/beta"
+"$real_tmux" -S "$socket" new-session -d -s mirror -t '=alpha'
+"$real_tmux" -S "$socket" new-session -d -s linked \
+  -c "$test_root/projects/beta" -n local
+"$real_tmux" -S "$socket" link-window -d -s '=alpha:2' -t '=linked:2'
+"$real_tmux" -S "$socket" select-pane -t '=alpha:1.2'
+"$real_tmux" -S "$socket" select-window -t '=alpha:2'
+
+run_workspace save
+if [ "$status" -ne 0 ]; then
+  sed -n '1,80p' "$stderr" >&2
+  "$real_tmux" -S "$socket" list-windows -a -F '#{window_id} #{window_layout}' >&2
+fi
+assert_equal 0 "$status" "topology checkpoint"
+generation=$(cat "$state/dotfiles/tmux/current")
+manifest=$state/dotfiles/tmux/snapshots/$generation/snapshot.json
+jq -e '
+  (.sessions | length) == 3
+  and ([.sessions[].name] | sort) == ["alpha", "linked", "mirror"]
+  and ([.windows[].links | length] | max) >= 2
+  and ([.windows[].panes | length] | max) == 2
+  and any(.sessions[]; .group != null)
+  and any(.sessions[]; .active_window_index == 2)
+  and all(.panes[]; .process.kind == "shell")
+' "$manifest" >/dev/null || fail "captured topology"
+
+valid_generation=$generation
+TMUX_WORKSPACE_TEST_FAIL_CAPTURE=1
+export TMUX_WORKSPACE_TEST_FAIL_CAPTURE
+run_workspace_generation bad-capture save
+unset TMUX_WORKSPACE_TEST_FAIL_CAPTURE
+assert_equal 1 "$status" "interrupted capture rejection"
+assert_equal "$valid_generation" "$(cat "$state/dotfiles/tmux/current")" \
+  "failed capture preserves current pointer"
+[ ! -e "$state/dotfiles/tmux/snapshots/bad-capture" ] \
+  || fail "failed capture published a completed generation"
+[ ! -e "$state/dotfiles/tmux/snapshots/.staging-bad-capture" ] \
+  || fail "failed capture retained its staging generation"
+
+"$real_tmux" -S "$socket" kill-server
+generation_number=1
+while [ "$generation_number" -le 12 ]; do
+  padded=$(printf '%02d' "$generation_number")
+  run_workspace_generation "gen-$padded" save
+  assert_equal 0 "$status" "retention generation $padded"
+  generation_number=$((generation_number + 1))
+done
+actual_generations=$(
+  find "$state/dotfiles/tmux/snapshots" -mindepth 1 -maxdepth 1 -type d \
+    -name 'gen-*' -exec basename {} \; | sort | tr '\n' ' '
+)
+assert_equal \
+  'gen-03 gen-04 gen-05 gen-06 gen-07 gen-08 gen-09 gen-10 gen-11 gen-12 ' \
+  "$actual_generations" \
+  "ten-generation retention"
 
 pass "workspace state boundary"

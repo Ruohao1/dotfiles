@@ -154,21 +154,336 @@ validate_snapshot() {
   snapshot_file=$1
   [ -f "$snapshot_file" ] && [ ! -L "$snapshot_file" ] || return 1
   jq -e '
-    .schema == 1
-    and (.saved_at | type == "number")
-    and (.tmux_version | type == "string")
+    def safe_text($limit):
+      type == "string"
+      and utf8bytelength <= $limit
+      and (test("[\u0000-\u001f\u007f-\u009f]") | not);
+    def positive: type == "number" and floor == . and . > 0;
+    def topology($root; $session_key):
+      [$root.windows[] as $window
+        | $window.links[]
+        | select(.session_key == $session_key)
+        | {window_key: $window.key, index: .index}]
+      | sort_by(.index, .window_key);
+    . as $root
+    | .schema == 1
+    and (.saved_at | type == "number" and floor == . and . > 0)
+    and (.tmux_version | safe_text(128))
     and (.sessions | type == "array")
     and (.windows | type == "array")
     and (.panes | type == "array")
-    and all(.sessions[]; (.key | type == "string") and (.name | type == "string"))
-    and all(.windows[]; (.key | type == "string") and (.links | type == "array"))
+    and ([.sessions[].key] | unique | length) == (.sessions | length)
+    and ([.sessions[].name] | unique | length) == (.sessions | length)
+    and ([.windows[].key] | unique | length) == (.windows | length)
+    and ([.panes[].key] | unique | length) == (.panes | length)
+    and all(.sessions[];
+      (.key | type == "string" and test("^\\$[0-9]+$"))
+      and (.name | safe_text(256) and length > 0)
+      and (.path | safe_text(8192) and startswith("/"))
+      and (.group == null or (.group | safe_text(256) and length > 0))
+      and (.active_window_index | positive)
+      and (.last_window_index | positive))
+    and all(.windows[];
+      (.key | type == "string" and test("^@[0-9]+$"))
+      and (.name | safe_text(512))
+      and (.layout | type == "string" and test("^[0-9A-Fa-fx,{}\\[\\]]+$"))
+      and (.zoomed | type == "boolean")
+      and (.active_pane_index | positive)
+      and (.automatic_rename | type == "boolean")
+      and (.links | type == "array" and length > 0)
+      and (.panes | type == "array" and length > 0)
+      and ([.links[] | .session_key + ":" + (.index | tostring)] | unique | length) == (.links | length)
+      and ([.panes[]] | unique | length) == (.panes | length))
+    and all(.windows[].links[];
+      (.session_key | type == "string")
+      and (.index | positive)
+      and (.session_key as $key | any($root.sessions[]; .key == $key)))
     and all(.panes[];
-      (.key | type == "string")
+      (.key | type == "string" and test("^%[0-9]+$"))
+      and (.window_key | type == "string" and test("^@[0-9]+$"))
+      and (.index | positive)
+      and (.path | safe_text(8192) and startswith("/"))
+      and (.title | safe_text(1024))
+      and (.process | type == "object")
       and (.process.kind == "shell"
         or .process.kind == "nvim"
         or .process.kind == "codex"
-        or .process.kind == "other"))
+        or .process.kind == "other")
+      and (.process.codex_session_id == null or (.process.codex_session_id | safe_text(512) and length > 0))
+      and (.process.nvim_session == null or (.process.nvim_session | safe_text(1024) and length > 0)))
+    and all(.windows[];
+      . as $window
+      | all($window.panes[];
+          . as $pane_key
+          | any($root.panes[]; .key == $pane_key and .window_key == $window.key)))
+    and all(.panes[];
+      . as $pane
+      | any($root.windows[];
+          .key == $pane.window_key and any(.panes[]; . == $pane.key)))
+    and all(.sessions[];
+      . as $session
+      | any($root.windows[].links[];
+          .session_key == $session.key and .index == $session.active_window_index)
+        and any($root.windows[].links[];
+          .session_key == $session.key and .index == $session.last_window_index))
+    and all(.windows[];
+      . as $window
+      | any($root.panes[];
+          .window_key == $window.key and .index == $window.active_pane_index))
+    and all(.sessions[];
+      . as $left
+      | all($root.sessions[];
+          . as $right
+          | if $left.group != null and $left.group == $right.group then
+              topology($root; $left.key) == topology($root; $right.key)
+            else true end))
   ' "$snapshot_file" >/dev/null 2>&1
+}
+
+safe_text() {
+  value=$1
+  maximum=$2
+  byte_count=$(printf '%s' "$value" | wc -c | tr -d '[:space:]')
+  [ "$byte_count" -le "$maximum" ] || return 1
+  jq -ne --arg value "$value" \
+    '$value | test("[\u0000-\u001f\u007f-\u009f]") | not' \
+    >/dev/null 2>&1
+}
+
+require_safe_text() {
+  value=$1
+  maximum=$2
+  label=$3
+  safe_text "$value" "$maximum" || die "unsafe $label in tmux state" 1
+}
+
+require_identifier() {
+  value=$1
+  expression=$2
+  label=$3
+  printf '%s\n' "$value" | grep -Eq "$expression" \
+    || die "invalid $label in tmux state" 1
+}
+
+require_positive() {
+  value=$1
+  label=$2
+  case $value in
+    ''|*[!0-9]*|0) die "invalid $label in tmux state" 1 ;;
+  esac
+}
+
+display_field() {
+  target=$1
+  format=$2
+  label=$3
+  maximum=$4
+  field_value=$(tmux_run display-message -p -t "$target" "$format") \
+    || die "could not read $label from tmux" 1
+  require_safe_text "$field_value" "$maximum" "$label"
+  printf '%s\n' "$field_value"
+}
+
+capture_snapshot() {
+  destination=$1
+  sessions_file=$staging_dir/sessions.ndjson
+  windows_file=$staging_dir/windows.ndjson
+  panes_file=$staging_dir/panes.ndjson
+  session_ids_file=$staging_dir/session-ids
+  window_ids_file=$staging_dir/window-ids
+  pane_ids_file=$staging_dir/pane-ids
+  links_file=$staging_dir/window-links
+  : >"$sessions_file"
+  : >"$windows_file"
+  : >"$panes_file"
+  : >"$session_ids_file"
+  : >"$window_ids_file"
+  : >"$pane_ids_file"
+  : >"$links_file"
+
+  if tmux_run list-sessions -F '#{session_id}' >"$session_ids_file" 2>/dev/null; then
+    tmux_run list-windows -a -F '#{window_id}' | sort -u >"$window_ids_file"
+    tmux_run list-panes -a -F '#{pane_id}' | sort -u >"$pane_ids_file"
+    tmux_run list-windows -a \
+      -F '#{session_id}|#{window_id}|#{window_index}|#{window_active}|#{window_last_flag}' \
+      >"$links_file"
+  fi
+
+  while IFS= read -r session_key; do
+    [ -n "$session_key" ] || continue
+    require_identifier "$session_key" '^\$[0-9]+$' 'session identifier'
+    session_name=$(display_field "$session_key:" '#{session_name}' 'session name' 256)
+    session_path=$(display_field "$session_key:" '#{session_path}' 'session path' 8192)
+    session_group=$(display_field "$session_key:" '#{session_group}' 'session group' 256)
+    [ -n "$session_name" ] || die 'empty session name in tmux state' 1
+    case $session_path in
+      /*) ;;
+      *) die 'relative session path in tmux state' 1 ;;
+    esac
+
+    active_window_index=$(awk -F '|' -v key="$session_key" \
+      '$1 == key && $4 == "1" { print $3; exit }' "$links_file")
+    last_window_index=$(awk -F '|' -v key="$session_key" \
+      '$1 == key && $5 == "1" { print $3; exit }' "$links_file")
+    require_positive "$active_window_index" 'active window index'
+    if [ -z "$last_window_index" ]; then
+      last_window_index=$active_window_index
+    fi
+    require_positive "$last_window_index" 'last window index'
+
+    if [ -n "$session_group" ]; then
+      jq -n \
+        --arg key "$session_key" \
+        --arg name "$session_name" \
+        --arg path "$session_path" \
+        --arg group "$session_group" \
+        --argjson active_window_index "$active_window_index" \
+        --argjson last_window_index "$last_window_index" \
+        '{key:$key,name:$name,path:$path,group:$group,
+          active_window_index:$active_window_index,last_window_index:$last_window_index}' \
+        >>"$sessions_file"
+    else
+      jq -n \
+        --arg key "$session_key" \
+        --arg name "$session_name" \
+        --arg path "$session_path" \
+        --argjson active_window_index "$active_window_index" \
+        --argjson last_window_index "$last_window_index" \
+        '{key:$key,name:$name,path:$path,group:null,
+          active_window_index:$active_window_index,last_window_index:$last_window_index}' \
+        >>"$sessions_file"
+    fi
+  done <"$session_ids_file"
+
+  while IFS= read -r window_key; do
+    [ -n "$window_key" ] || continue
+    require_identifier "$window_key" '^@[0-9]+$' 'window identifier'
+    window_name=$(display_field "$window_key" '#{window_name}' 'window name' 512)
+    window_layout=$(display_field "$window_key" '#{window_layout}' 'window layout' 8192)
+    printf '%s\n' "$window_layout" | grep -Eq '^[][0-9A-Fa-fx,{}]+$' \
+      || die 'invalid window layout in tmux state' 1
+    window_zoomed=$(display_field "$window_key" '#{window_zoomed_flag}' 'window zoom flag' 1)
+    case $window_zoomed in
+      0) window_zoomed_json=false ;;
+      1) window_zoomed_json=true ;;
+      *) die 'invalid window zoom flag in tmux state' 1 ;;
+    esac
+    automatic_rename=$(tmux_run show-options -wqv -t "$window_key" automatic-rename) \
+      || die 'could not read automatic-rename from tmux' 1
+    case $automatic_rename in
+      on) automatic_rename_json=true ;;
+      off) automatic_rename_json=false ;;
+      *) die 'invalid automatic-rename value in tmux state' 1 ;;
+    esac
+
+    window_panes_file=$staging_dir/window-panes-${window_key#@}
+    window_links_file=$staging_dir/window-links-${window_key#@}.ndjson
+    tmux_run list-panes -t "$window_key" -F '#{pane_id}' >"$window_panes_file"
+    : >"$window_links_file"
+    while IFS='|' read -r link_session link_window link_index link_active link_last; do
+      [ "$link_window" = "$window_key" ] || continue
+      require_identifier "$link_session" '^\$[0-9]+$' 'linked session identifier'
+      require_positive "$link_index" 'linked window index'
+      case $link_active:$link_last in
+        0:0|0:1|1:0|1:1) ;;
+        *) die 'invalid linked window flags in tmux state' 1 ;;
+      esac
+      jq -n --arg session_key "$link_session" --argjson index "$link_index" \
+        '{session_key:$session_key,index:$index}' >>"$window_links_file"
+    done <"$links_file"
+
+    active_pane_index=$(tmux_run list-panes -t "$window_key" \
+      -F '#{pane_index}|#{pane_active}' | awk -F '|' '$2 == "1" { print $1; exit }')
+    require_positive "$active_pane_index" 'active pane index'
+    jq -n \
+      --arg key "$window_key" \
+      --arg name "$window_name" \
+      --arg layout "$window_layout" \
+      --argjson zoomed "$window_zoomed_json" \
+      --argjson active_pane_index "$active_pane_index" \
+      --argjson automatic_rename "$automatic_rename_json" \
+      --slurpfile links "$window_links_file" \
+      --rawfile pane_lines "$window_panes_file" \
+      '{
+        key:$key,
+        name:$name,
+        layout:$layout,
+        zoomed:$zoomed,
+        active_pane_index:$active_pane_index,
+        automatic_rename:$automatic_rename,
+        links:$links,
+        panes:($pane_lines | split("\n") | map(select(length > 0)))
+      }' >>"$windows_file"
+  done <"$window_ids_file"
+
+  while IFS= read -r pane_key; do
+    [ -n "$pane_key" ] || continue
+    require_identifier "$pane_key" '^%[0-9]+$' 'pane identifier'
+    pane_window=$(display_field "$pane_key" '#{window_id}' 'pane window identifier' 64)
+    require_identifier "$pane_window" '^@[0-9]+$' 'pane window identifier'
+    pane_index=$(display_field "$pane_key" '#{pane_index}' 'pane index' 16)
+    require_positive "$pane_index" 'pane index'
+    pane_path=$(display_field "$pane_key" '#{pane_current_path}' 'pane path' 8192)
+    case $pane_path in
+      /*) ;;
+      *) die 'relative pane path in tmux state' 1 ;;
+    esac
+    pane_title=$(display_field "$pane_key" '#{pane_title}' 'pane title' 1024)
+    pane_command=$(display_field "$pane_key" '#{pane_current_command}' 'pane command' 256)
+    case ${pane_command##*/} in
+      sh|ash|bash|dash|fish|ksh|mksh|nu|tcsh|zsh|elvish)
+        process_kind=shell
+        ;;
+      *)
+        process_kind=other
+        ;;
+    esac
+    jq -n \
+      --arg key "$pane_key" \
+      --arg window_key "$pane_window" \
+      --argjson index "$pane_index" \
+      --arg path "$pane_path" \
+      --arg title "$pane_title" \
+      --arg process_kind "$process_kind" \
+      '{
+        key:$key,
+        window_key:$window_key,
+        index:$index,
+        path:$path,
+        title:$title,
+        process:{kind:$process_kind,codex_session_id:null,nvim_session:null}
+      }' >>"$panes_file"
+  done <"$pane_ids_file"
+
+  if [ "${TMUX_WORKSPACE_TESTING:-0}" = 1 ] \
+    && [ "${TMUX_WORKSPACE_TEST_FAIL_CAPTURE:-0}" = 1 ]; then
+    die 'injected capture failure' 1
+  fi
+
+  saved_at=$(date '+%s')
+  tmux_version=$(tmux -V 2>/dev/null || printf '%s' unavailable)
+  jq -n \
+    --argjson schema "$schema" \
+    --argjson saved_at "$saved_at" \
+    --arg tmux_version "$tmux_version" \
+    --slurpfile sessions "$sessions_file" \
+    --slurpfile windows "$windows_file" \
+    --slurpfile panes "$panes_file" \
+    '{
+      schema:$schema,
+      saved_at:$saved_at,
+      tmux_version:$tmux_version,
+      sessions:$sessions,
+      windows:$windows,
+      panes:$panes
+    }' >"$destination"
+
+  rm -f "$sessions_file" "$windows_file" "$panes_file" \
+    "$session_ids_file" "$window_ids_file" "$pane_ids_file" "$links_file"
+  for temporary in "$staging_dir"/window-panes-* "$staging_dir"/window-links-*.ndjson; do
+    [ -e "$temporary" ] || continue
+    rm -f "$temporary"
+  done
 }
 
 select_snapshot() {
@@ -259,20 +574,7 @@ save_snapshot() {
   mkdir "$staging_dir"
   chmod 0700 "$staging_dir"
 
-  saved_at=$(date '+%s')
-  tmux_version=$(tmux -V 2>/dev/null || printf '%s' unavailable)
-  jq -n \
-    --argjson schema "$schema" \
-    --argjson saved_at "$saved_at" \
-    --arg tmux_version "$tmux_version" \
-    '{
-      schema: $schema,
-      saved_at: $saved_at,
-      tmux_version: $tmux_version,
-      sessions: [],
-      windows: [],
-      panes: []
-    }' >"$staging_dir/snapshot.json"
+  capture_snapshot "$staging_dir/snapshot.json"
 
   publish_generation "$generation"
   release_lock
