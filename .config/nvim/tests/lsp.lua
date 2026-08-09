@@ -89,11 +89,12 @@ local ok, failure = xpcall(function()
   local registry = require("config.lsp")
 
   exact_keys(registry, { "servers", "setup" }, "LSP registry exports")
-  eq(registry.servers(), { "lua_ls" }, "exact enabled-server allowlist")
+  eq(registry.servers(), { "lua_ls", "pyright" }, "exact enabled-server allowlist")
 
   local copied_servers = registry.servers()
   copied_servers[1] = "not_lua_ls"
-  eq(registry.servers(), { "lua_ls" }, "server allowlist defensive copy")
+  copied_servers[2] = "not_pyright"
+  eq(registry.servers(), { "lua_ls", "pyright" }, "server allowlist defensive copy")
 
   local original_enable = vim.lsp.enable
   local enable_calls = {}
@@ -104,7 +105,7 @@ local ok, failure = xpcall(function()
   local setup_ok, setup_failure = xpcall(registry.setup, debug.traceback)
   vim.lsp.enable = original_enable
   assert(setup_ok, setup_failure)
-  eq(enable_calls, { { "lua_ls" } }, "registry setup delegates exactly once")
+  eq(enable_calls, { { "lua_ls", "pyright" } }, "registry setup delegates exactly once")
 
   local config = dofile(vim.fs.joinpath(nvim_root, "lsp", "lua_ls.lua"))
   exact_keys(
