@@ -110,6 +110,45 @@ else
   fail 'window-manager contract checker accepts the repository configs'
 fi
 
+if command -v git >/dev/null 2>&1; then
+  local_root=$test_tmp/local-root
+  mkdir -p \
+    "$local_root/.config/aerospace" \
+    "$local_root/.config/dotfiles/manifests" \
+    "$local_root/.config/hypr" \
+    "$local_root/.config/i3"
+  cp "$workspace_root/.config/aerospace/aerospace.toml" \
+    "$local_root/.config/aerospace/aerospace.toml"
+  cp "$workspace_root/.config/dotfiles/manifests/window-manager-bindings.tsv" \
+    "$local_root/.config/dotfiles/manifests/window-manager-bindings.tsv"
+  cp "$workspace_root/.config/hypr/hyprland.lua" \
+    "$local_root/.config/hypr/hyprland.lua"
+  cp "$workspace_root/.config/i3/config" "$local_root/.config/i3/config"
+  git -C "$local_root" init -q -b main
+  git -C "$local_root" add .config
+  printf '%s\n' 'machine-local legacy config' \
+    >"$local_root/.config/hypr/hyprland.conf"
+  run_capture "$test_tmp/checker-untracked-legacy.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -eq 0 ]; then
+    pass 'contract checker preserves an untracked local legacy config'
+  else
+    fail 'contract checker preserves an untracked local legacy config'
+  fi
+
+  git -C "$local_root" add .config/hypr/hyprland.conf
+  run_capture "$test_tmp/checker-tracked-legacy.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects a tracked legacy manager entrypoint'
+  else
+    fail 'contract checker rejects a tracked legacy manager entrypoint'
+  fi
+else
+  pass 'contract checker local legacy tracking tests skipped without Git'
+  pass 'contract checker tracked legacy rejection skipped without Git'
+fi
+
 if command -v luac >/dev/null 2>&1 \
   && [ -f "$workspace_root/.config/hypr/hyprland.lua" ]; then
   run_capture "$test_tmp/luac.output" luac -p \

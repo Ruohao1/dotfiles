@@ -62,6 +62,24 @@ fail() {
   printf 'FAIL  %s\n' "$1" >&2
 }
 
+repository_tracks_path() {
+  tracked_relative=$1
+  command -v git >/dev/null 2>&1 || return 1
+
+  if [ -e "$root/.git" ]; then
+    git -C "$root" ls-files --error-unmatch -- "$tracked_relative" \
+      >/dev/null 2>&1
+    return
+  fi
+  if [ -d "$root/.cfg" ]; then
+    git --git-dir="$root/.cfg" --work-tree="$root" \
+      ls-files --error-unmatch -- "$tracked_relative" \
+      >/dev/null 2>&1
+    return
+  fi
+  return 1
+}
+
 for required_file in "$manifest" "$hypr_config" "$i3_config" "$aerospace_config"; do
   if [ -r "$required_file" ]; then
     pass "readable file: ${required_file#"$root/"}"
@@ -227,8 +245,8 @@ else
   fail 'AeroSpace config contains no desktop-shell behavior'
 fi
 
-if [ ! -e "$root/.config/hypr/hyprland.conf" ] \
-  && [ ! -e "$root/.aerospace.toml" ]; then
+if ! repository_tracks_path .config/hypr/hyprland.conf \
+  && ! repository_tracks_path .aerospace.toml; then
   pass 'repository contains no legacy manager entrypoint'
 else
   fail 'repository contains no legacy manager entrypoint'
