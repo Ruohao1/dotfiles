@@ -97,6 +97,8 @@ jq -e '.schema == 1 and .sessions == [] and .windows == [] and .panes == []' \
   "$manifest" >/dev/null || fail "empty snapshot schema"
 assert_equal 700 "$(stat -c %a "$state/dotfiles/tmux")" "Linux state directory mode"
 assert_equal 600 "$(stat -c %a "$manifest")" "Linux manifest mode"
+fallback_generation=$generation
+fallback_manifest=$manifest
 
 run_workspace status
 assert_equal 0 "$status" "complete status report"
@@ -114,17 +116,34 @@ assert_not_contains 'transcript_path' "$stdout" "status excludes transcript meta
 assert_not_contains 'TMUX_WORKSPACE_STATUS_SECRET' "$stdout" \
   "status excludes environment names"
 
+ready_file=$runtime/dotfiles-tmux/ready
+: >"$ready_file"
+chmod 0600 "$ready_file"
+run_workspace_generation empty-ready save
+assert_equal 0 "$status" "empty ready-state checkpoint"
+generation=$(cat "$state/dotfiles/tmux/current")
+manifest=$state/dotfiles/tmux/snapshots/$generation/snapshot.json
+run_workspace ensure
+assert_equal 0 "$status" "empty ready-state ensure"
+[ ! -e "$state/dotfiles/tmux/last-restore.json" ] \
+  || fail "empty ready state performed a redundant restore"
+
 chmod 0644 "$manifest"
 run_workspace status
-assert_equal 1 "$status" "world-readable snapshot rejection"
-assert_contains 'no valid snapshot' "$stderr" "world-readable snapshot diagnostic"
+assert_equal 0 "$status" "world-readable snapshot fallback"
+assert_contains "Current snapshot: $fallback_generation" "$stdout" \
+  "world-readable snapshot fallback generation"
+assert_contains 'a fallback snapshot was selected' "$stdout" \
+  "world-readable snapshot warning"
 chmod 0600 "$manifest"
 
 printf '%s\n' broken >"$state/dotfiles/tmux/current"
 printf '%s\n' '{' >"$manifest"
+chmod 0644 "$fallback_manifest"
 run_workspace status
 assert_equal 1 "$status" "invalid current pointer status"
 assert_contains 'no valid snapshot' "$stderr" "invalid current diagnostic"
+chmod 0600 "$fallback_manifest"
 
 set +e
 HOME=$test_root/home XDG_STATE_HOME=$state XDG_RUNTIME_DIR=$runtime \
@@ -217,6 +236,10 @@ fi
 assert_equal 0 "$status" "topology checkpoint"
 generation=$(cat "$state/dotfiles/tmux/current")
 manifest=$state/dotfiles/tmux/snapshots/$generation/snapshot.json
+assert_equal "$generation" \
+  "$("$real_tmux" -S "$socket" show-options -gqv \
+    @dotfiles_workspace_generation)" \
+  "checkpoint marks the live server generation"
 jq -e '
   (.sessions | length) == 3
   and ([.sessions[].name] | sort) == ["alpha", "linked", "mirror"]

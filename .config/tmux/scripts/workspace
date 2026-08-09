@@ -724,6 +724,12 @@ save_snapshot() {
   capture_snapshot "$staging_dir/snapshot.json"
 
   publish_generation "$generation"
+  if tmux_run list-sessions >/dev/null 2>&1; then
+    if ! tmux_run set-option -g @dotfiles_workspace_generation "$generation" \
+      \; set-option -guq @dotfiles_workspace_adopted; then
+      append_warning 'the live tmux server could not be marked with its checkpoint generation'
+    fi
+  fi
   if [ -f "$workspace_runtime/ready" ] && [ ! -L "$workspace_runtime/ready" ]; then
     publish_ready "$generation"
   fi
@@ -1497,7 +1503,12 @@ ready_is_valid() {
     return 0
   fi
   generation_is_valid "$ready_generation" || return 1
-  tmux_run list-sessions >/dev/null 2>&1 || return 1
+  select_snapshot || return 1
+  [ "$selected_generation" = "$ready_generation" ] || return 1
+  if ! tmux_run list-sessions >/dev/null 2>&1; then
+    [ "$(jq -r '.sessions | length' "$selected_manifest")" -eq 0 ]
+    return
+  fi
   live_generation=$(tmux_run show-options -gqv @dotfiles_workspace_generation 2>/dev/null || :)
   [ "$live_generation" = "$ready_generation" ] && return 0
   [ "$(tmux_run show-options -gqv @dotfiles_workspace_adopted 2>/dev/null || :)" = 1 ]
