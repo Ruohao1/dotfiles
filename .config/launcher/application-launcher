@@ -1,0 +1,25 @@
+#!/bin/sh
+
+set -eu
+
+program=${0##*/}
+rofi_command=${APPLICATION_LAUNCHER_ROFI:-rofi}
+config_home=${XDG_CONFIG_HOME:-${HOME:?HOME is required}/.config}
+config_file=$config_home/launcher/rofi.rasi
+
+if ! command -v "$rofi_command" >/dev/null 2>&1; then
+  printf '%s: Rofi is required but was not found: %s\n' \
+    "$program" "$rofi_command" >&2
+  exit 127
+fi
+
+if [ ! -r "$config_file" ]; then
+  printf '%s: Rofi configuration is not readable: %s\n' \
+    "$program" "$config_file" >&2
+  exit 1
+fi
+
+exec "$rofi_command" \
+  -config "$config_file" \
+  -show drun \
+  -show-icons

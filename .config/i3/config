@@ -28,6 +28,7 @@ bindsym $mod+f fullscreen toggle
 bindsym $mod+Shift+space floating toggle
 bindsym $mod+Shift+q kill
 bindsym $mod+Shift+r reload
+bindsym $mod+Shift+semicolon exec --no-startup-id ~/.config/launcher/application-launcher
 
 bindsym $mod+1 workspace --no-auto-back-and-forth "0"
 bindsym $mod+2 workspace --no-auto-back-and-forth "1"

@@ -283,7 +283,9 @@ else
 fi
 
 if awk '
-  /hl[.]dsp[.]exec_/ && $0 !~ /hl[.]dsp[.]exec_cmd[(]"hyprctl reload"[)]/ {
+  /hl[.]dsp[.]exec_/ \
+    && $0 !~ /hl[.]dsp[.]exec_cmd[(]"hyprctl reload"[)]/ \
+    && $0 !~ /hl[.]dsp[.]exec_cmd[(]"[$]HOME[/][.]config[/]launcher[/]application-launcher"[)]/ {
     bad = 1
   }
   /hl[.](on|window_rule|layer_rule|animation|curve|gesture|device)[(]/ {
@@ -291,9 +293,9 @@ if awk '
   }
   END { exit bad }
 ' "$hypr_config"; then
-  pass 'Hyprland config contains no desktop-shell behavior'
+  pass 'Hyprland config contains only the approved launcher execution exception'
 else
-  fail 'Hyprland config contains no desktop-shell behavior'
+  fail 'Hyprland config contains only the approved launcher execution exception'
 fi
 
 if awk -v allowed_exec="$i3_dwindle_start" '

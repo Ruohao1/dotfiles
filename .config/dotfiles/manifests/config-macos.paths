@@ -1,3 +1,4 @@
 .config/ghostty/platform-macos.ghostty
+.config/macos/spotlight-shortcut
 .config/tmux/conf/platform/macos.conf
 Library/Application Support/com.mitchellh.ghostty/config.ghostty

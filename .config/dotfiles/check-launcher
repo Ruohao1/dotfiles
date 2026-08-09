@@ -1,0 +1,217 @@
+#!/bin/sh
+
+set -eu
+
+LC_ALL=C
+export LC_ALL
+
+program=${0##*/}
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
+
+usage() {
+  printf 'usage: %s [--root PATH]\n' "$program"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --root)
+      [ "$#" -ge 2 ] || {
+        usage >&2
+        exit 2
+      }
+      root=$2
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+case "$root" in
+  /*) ;;
+  *)
+    printf '%s: root must be an absolute path\n' "$program" >&2
+    exit 2
+    ;;
+esac
+
+launcher=$root/.config/launcher/application-launcher
+rofi_config=$root/.config/launcher/rofi.rasi
+spotlight_helper=$root/.config/macos/spotlight-shortcut
+hypr_config=$root/.config/hypr/hyprland.lua
+i3_config=$root/.config/i3/config
+aerospace_config=$root/.config/aerospace/aerospace.toml
+manifest_root=$root/.config/dotfiles/manifests
+
+failures=0
+checks=0
+
+pass() {
+  checks=$((checks + 1))
+  printf 'PASS  %s\n' "$1"
+}
+
+fail() {
+  checks=$((checks + 1))
+  failures=$((failures + 1))
+  printf 'FAIL  %s\n' "$1" >&2
+}
+
+require_exact_line() {
+  file=$1
+  line=$2
+  label=$3
+  if [ -r "$file" ] && [ "$(grep -Fxc "$line" "$file" || true)" -eq 1 ]; then
+    pass "$label"
+  else
+    fail "$label"
+  fi
+}
+
+require_absent_text() {
+  file=$1
+  value=$2
+  label=$3
+  if [ -r "$file" ] && ! grep -Fq "$value" "$file"; then
+    pass "$label"
+  else
+    fail "$label"
+  fi
+}
+
+for required_file in \
+  "$launcher" \
+  "$rofi_config" \
+  "$spotlight_helper" \
+  "$hypr_config" \
+  "$i3_config" \
+  "$aerospace_config" \
+  "$manifest_root/config-common.paths" \
+  "$manifest_root/config-linux.paths" \
+  "$manifest_root/config-linux-hypr.paths" \
+  "$manifest_root/config-linux-i3.paths" \
+  "$manifest_root/config-macos.paths" \
+  "$manifest_root/packages-pacman-hypr.list" \
+  "$manifest_root/packages-pacman-i3.list" \
+  "$manifest_root/packages-apt-i3.list"
+do
+  if [ -r "$required_file" ]; then
+    pass "readable file: ${required_file#"$root/"}"
+  else
+    fail "readable file: ${required_file#"$root/"}"
+  fi
+done
+
+if [ -x "$launcher" ]; then
+  pass 'application launcher is executable'
+else
+  fail 'application launcher is executable'
+fi
+
+if [ -r "$launcher" ] && sh -n "$launcher"; then
+  pass 'application launcher has valid POSIX shell syntax'
+else
+  fail 'application launcher has valid POSIX shell syntax'
+fi
+
+if [ -x "$spotlight_helper" ]; then
+  pass 'macOS Spotlight shortcut helper is executable'
+else
+  fail 'macOS Spotlight shortcut helper is executable'
+fi
+
+if [ -r "$spotlight_helper" ] && sh -n "$spotlight_helper"; then
+  pass 'macOS Spotlight shortcut helper has valid POSIX shell syntax'
+else
+  fail 'macOS Spotlight shortcut helper has valid POSIX shell syntax'
+fi
+
+# shellcheck disable=SC2016 # The contract intentionally contains literal shell variables.
+require_exact_line "$hypr_config" \
+  'hl.bind("SUPER + SHIFT + semicolon", hl.dsp.exec_cmd("$HOME/.config/launcher/application-launcher"))' \
+  'Hyprland binds Super+Shift+semicolon to the application launcher exactly once'
+# shellcheck disable=SC2016 # The contract intentionally contains literal i3 variables.
+require_exact_line "$i3_config" \
+  'bindsym $mod+Shift+semicolon exec --no-startup-id ~/.config/launcher/application-launcher' \
+  'i3 binds Super+Shift+semicolon to the application launcher exactly once'
+require_absent_text "$aerospace_config" 'application-launcher' \
+  'AeroSpace delegates the launcher shortcut to native macOS Spotlight'
+
+if [ -r "$rofi_config" ] \
+  && [ "$(grep -Ec '^[[:space:]]*modes:[[:space:]]*"drun";' "$rofi_config" || true)" -eq 1 ] \
+  && [ "$(grep -Ec '^[[:space:]]*modes:' "$rofi_config" || true)" -eq 1 ]; then
+  pass 'Rofi exposes only desktop applications'
+else
+  fail 'Rofi exposes only desktop applications'
+fi
+require_exact_line "$rofi_config" \
+  '    font:                "SpaceMono Nerd Font Mono 12";' \
+  'Rofi uses the configured SpaceMono Nerd Font'
+require_exact_line "$rofi_config" \
+  '    matching:            "fuzzy";' \
+  'Rofi uses fuzzy application matching'
+require_exact_line "$rofi_config" \
+  '    show-icons:          true;' \
+  'Rofi shows application icons'
+
+require_exact_line "$spotlight_helper" 'preference_domain=com.apple.symbolichotkeys' \
+  'macOS helper targets only the symbolic hot-key preference domain'
+require_exact_line "$spotlight_helper" 'spotlight_key=64' \
+  'macOS helper targets the Spotlight search symbolic hot key'
+require_exact_line "$spotlight_helper" \
+  'target_entry='"'"'{"enabled":true,"value":{"parameters":[59,41,1179648],"type":"standard"}}'"'"'' \
+  'macOS helper encodes Command+Shift+semicolon exactly'
+
+for profile_manifest in \
+  "$manifest_root/config-linux-hypr.paths" \
+  "$manifest_root/config-linux-i3.paths"
+do
+  require_exact_line "$profile_manifest" \
+    '.config/launcher/application-launcher' \
+    "$(basename "$profile_manifest") selects the launcher command"
+  require_exact_line "$profile_manifest" \
+    '.config/launcher/rofi.rasi' \
+    "$(basename "$profile_manifest") selects the Rofi configuration"
+done
+
+require_exact_line "$manifest_root/config-macos.paths" \
+  '.config/macos/spotlight-shortcut' \
+  'macOS profile selects the native Spotlight shortcut helper'
+require_absent_text "$manifest_root/config-macos.paths" '.config/launcher' \
+  'macOS profile excludes Linux launcher configuration'
+
+for excluded_manifest in \
+  "$manifest_root/config-common.paths" \
+  "$manifest_root/config-linux.paths"
+do
+  require_absent_text "$excluded_manifest" '.config/launcher' \
+    "$(basename "$excluded_manifest") does not install the profile-scoped launcher"
+done
+
+for linux_profile_manifest in \
+  "$manifest_root/config-linux-hypr.paths" \
+  "$manifest_root/config-linux-i3.paths"
+do
+  require_absent_text "$linux_profile_manifest" '.config/macos' \
+    "$(basename "$linux_profile_manifest") excludes macOS preference helpers"
+done
+
+for package_manifest in \
+  "$manifest_root/packages-pacman-hypr.list" \
+  "$manifest_root/packages-pacman-i3.list" \
+  "$manifest_root/packages-apt-i3.list"
+do
+  require_exact_line "$package_manifest" rofi \
+    "$(basename "$package_manifest") installs Rofi exactly once"
+done
+
+printf 'Summary: %d failure(s), %d check(s)\n' "$failures" "$checks"
+[ "$failures" -eq 0 ]

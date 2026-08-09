@@ -74,7 +74,7 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-printf '1..115\n'
+printf '1..125\n'
 
 if [ -x "$bootstrap" ]; then
   pass 'bootstrap is executable'
@@ -174,6 +174,9 @@ require_contains "$macos_output" '.config/tmux/conf/platform/macos.conf' 'macOS 
 require_contains "$macos_output" 'install homebrew-formula neovim' 'Homebrew plan includes Neovim formula'
 require_contains "$macos_output" 'install homebrew-cask ghostty' 'Homebrew plan includes Ghostty cask'
 require_excludes "$macos_output" '.config/tmux/conf/platform/linux.conf' 'macOS plan excludes Linux tmux adapter'
+require_contains "$macos_output" \
+  'backup and set Spotlight shortcut Command+Shift+semicolon' \
+  'macOS dry-run reports the transactional Spotlight shortcut change'
 
 if [ ! -e "$test_tmp/linux-home" ] && [ ! -e "$test_tmp/linux-state" ]; then
   pass 'dry-run creates no persistent home or state paths'
@@ -345,6 +348,8 @@ cp -R \
   "$workspace_root/.config/herdr" \
   "$workspace_root/.config/hypr" \
   "$workspace_root/.config/i3" \
+  "$workspace_root/.config/launcher" \
+  "$workspace_root/.config/macos" \
   "$workspace_root/.config/nvim" \
   "$fixture_work/.config/"
 mkdir -p \
@@ -385,9 +390,10 @@ git clone -q --bare "$fixture_work" "$fixture_repo"
 
 hypr_home=$test_tmp/hypr-home
 hypr_state=$test_tmp/hypr-state
-mkdir -p "$hypr_home/.config/hypr"
+mkdir -p "$hypr_home/.config/hypr" "$hypr_home/.config/launcher"
 printf '%s\n' 'legacy hypr config' >"$hypr_home/.config/hypr/hyprland.conf"
 printf '%s\n' 'local hypr overrides' >"$hypr_home/.config/hypr/local.lua"
+printf '%s\n' 'local Rofi configuration' >"$hypr_home/.config/launcher/rofi.rasi"
 run_capture "$test_tmp/hypr-dry-run.output" env \
   HOME="$hypr_home" \
   XDG_STATE_HOME="$hypr_state" \
@@ -404,7 +410,11 @@ fi
 hypr_dry_output=$(cat "$test_tmp/hypr-dry-run.output")
 require_contains "$hypr_dry_output" 'conflict .config/hypr/hyprland.conf' \
   'Hyprland dry-run reports the legacy entrypoint migration'
+require_contains "$hypr_dry_output" 'conflict .config/launcher/rofi.rasi' \
+  'Hyprland dry-run reports a conflicting launcher configuration'
 if [ "$(cat "$hypr_home/.config/hypr/hyprland.conf")" = 'legacy hypr config' ] \
+  && [ "$(cat "$hypr_home/.config/launcher/rofi.rasi")" = \
+    'local Rofi configuration' ] \
   && [ ! -e "$hypr_home/.cfg" ] \
   && [ ! -e "$hypr_state" ]; then
   pass 'Hyprland dry-run leaves the legacy config and state untouched'
@@ -431,6 +441,11 @@ fi
 hypr_run=$hypr_state/dotfiles-bootstrap/window-manager-hypr
 if cmp -s "$fixture_work/.config/hypr/hyprland.lua" \
   "$hypr_home/.config/hypr/hyprland.lua" \
+  && cmp -s "$fixture_work/.config/launcher/application-launcher" \
+    "$hypr_home/.config/launcher/application-launcher" \
+  && cmp -s "$fixture_work/.config/launcher/rofi.rasi" \
+    "$hypr_home/.config/launcher/rofi.rasi" \
+  && [ ! -e "$hypr_home/.config/macos/spotlight-shortcut" ] \
   && [ ! -e "$hypr_home/.config/i3/config" ] \
   && [ ! -e "$hypr_home/.config/i3/dwindle" ] \
   && [ ! -e "$hypr_home/.config/aerospace/aerospace.toml" ] \
@@ -445,6 +460,12 @@ if [ ! -e "$hypr_home/.config/hypr/hyprland.conf" ] \
   pass 'Hyprland apply automatically backs up the legacy entrypoint'
 else
   fail 'Hyprland apply automatically backs up the legacy entrypoint'
+fi
+if [ "$(cat "$hypr_run/backup/.config/launcher/rofi.rasi" 2>/dev/null || true)" = \
+    'local Rofi configuration' ]; then
+  pass 'Hyprland apply automatically backs up a launcher conflict'
+else
+  fail 'Hyprland apply automatically backs up a launcher conflict'
 fi
 if [ "$(cat "$hypr_home/.config/hypr/local.lua")" = 'local hypr overrides' ]; then
   pass 'Hyprland apply preserves a preexisting machine-local override'
@@ -471,6 +492,9 @@ fi
 if [ "$(cat "$hypr_home/.config/hypr/hyprland.conf" 2>/dev/null || true)" = \
     'legacy hypr config' ] \
   && [ ! -e "$hypr_home/.config/hypr/hyprland.lua" ] \
+  && [ ! -e "$hypr_home/.config/launcher/application-launcher" ] \
+  && [ "$(cat "$hypr_home/.config/launcher/rofi.rasi" 2>/dev/null || true)" = \
+    'local Rofi configuration' ] \
   && [ "$(cat "$hypr_home/.config/hypr/local.lua")" = 'local hypr overrides' ]; then
   pass 'Hyprland rollback restores legacy config and preserves local overrides'
 else
@@ -529,7 +553,11 @@ fi
 
 aerospace_home=$test_tmp/aerospace-home
 aerospace_state=$test_tmp/aerospace-state
+aerospace_spotlight_state=$test_tmp/aerospace-spotlight-state
 mkdir -p "$aerospace_home/.config/aerospace"
+mkdir -p "$aerospace_spotlight_state"
+printf '%s\n' 'original Aerospace Spotlight shortcut' \
+  >"$aerospace_spotlight_state/entry"
 printf '%s\n' 'legacy aerospace config' >"$aerospace_home/.aerospace.toml"
 printf '%s\n' '#!/bin/sh' 'echo local aerospace' \
   >"$aerospace_home/.config/aerospace/local.sh"
@@ -540,6 +568,7 @@ run_capture "$test_tmp/aerospace-apply.output" env \
   DOTFILES_BOOTSTRAP_TESTING=1 \
   DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
   DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STATE="$aerospace_spotlight_state" \
   DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
   DOTFILES_BOOTSTRAP_TEST_RUN_ID=window-manager-aerospace \
   "$bootstrap" --apply --window-manager aerospace \
@@ -551,10 +580,23 @@ else
   sed 's/^/  /' "$test_tmp/aerospace-apply.output" >&2
 fi
 aerospace_run=$aerospace_state/dotfiles-bootstrap/window-manager-aerospace
+if [ "$(cat "$aerospace_spotlight_state/entry" 2>/dev/null || true)" = \
+    '{"enabled":true,"value":{"parameters":[59,41,1179648],"type":"standard"}}' ] \
+  && [ "$(cat "$aerospace_run/preferences/spotlight-shortcut/before.entry" 2>/dev/null || true)" = \
+    'original Aerospace Spotlight shortcut' ] \
+  && [ "$(cat "$aerospace_run/preferences/spotlight-shortcut/status" 2>/dev/null || true)" = \
+    applied ]; then
+  pass 'macOS apply journals and sets the native Spotlight shortcut'
+else
+  fail 'macOS apply journals and sets the native Spotlight shortcut'
+fi
 if cmp -s "$fixture_work/.config/aerospace/aerospace.toml" \
   "$aerospace_home/.config/aerospace/aerospace.toml" \
   && cmp -s "$fixture_work/.config/aerospace/dwindle" \
     "$aerospace_home/.config/aerospace/dwindle" \
+  && cmp -s "$fixture_work/.config/macos/spotlight-shortcut" \
+    "$aerospace_home/.config/macos/spotlight-shortcut" \
+  && [ ! -e "$aerospace_home/.config/launcher/application-launcher" ] \
   && [ -x "$aerospace_home/.config/aerospace/dwindle" ] \
   && [ ! -e "$aerospace_home/.config/hypr/hyprland.lua" ] \
   && [ ! -e "$aerospace_home/.config/i3/config" ] \
@@ -582,6 +624,7 @@ run_capture "$test_tmp/aerospace-rollback.output" env \
   DOTFILES_BOOTSTRAP_TESTING=1 \
   DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
   DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STATE="$aerospace_spotlight_state" \
   "$bootstrap" --rollback window-manager-aerospace
 if [ "$run_status" -eq 0 ]; then
   pass 'Aerospace profile rollback succeeds in the macOS simulation'
@@ -592,11 +635,91 @@ if [ "$(cat "$aerospace_home/.aerospace.toml" 2>/dev/null || true)" = \
     'legacy aerospace config' ] \
   && [ ! -e "$aerospace_home/.config/aerospace/aerospace.toml" ] \
   && [ ! -e "$aerospace_home/.config/aerospace/dwindle" ] \
+  && [ ! -e "$aerospace_home/.config/macos/spotlight-shortcut" ] \
+  && [ "$(cat "$aerospace_spotlight_state/entry" 2>/dev/null || true)" = \
+    'original Aerospace Spotlight shortcut' ] \
   && grep -Fq 'echo local aerospace' \
     "$aerospace_home/.config/aerospace/local.sh"; then
   pass 'Aerospace rollback restores legacy config and preserves its local hook'
 else
   fail 'Aerospace rollback restores legacy config and preserves its local hook'
+fi
+
+mac_failure_home=$test_tmp/mac-failure-home
+mac_failure_state=$test_tmp/mac-failure-state
+mac_failure_spotlight_state=$test_tmp/mac-failure-spotlight-state
+mkdir -p "$mac_failure_spotlight_state"
+printf '%s\n' 'Spotlight before failed bootstrap' \
+  >"$mac_failure_spotlight_state/entry"
+run_capture "$test_tmp/mac-failure.output" env \
+  HOME="$mac_failure_home" \
+  XDG_STATE_HOME="$mac_failure_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STATE="$mac_failure_spotlight_state" \
+  DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_RUN_ID=mac-forced-failure \
+  DOTFILES_BOOTSTRAP_TEST_FAIL_AFTER_CHECKOUT=1 \
+  "$bootstrap" --apply --repo "$fixture_repo" --ref main
+if [ "$run_status" -ne 0 ]; then
+  pass 'forced macOS failure exits unsuccessfully after preference application'
+else
+  fail 'forced macOS failure exits unsuccessfully after preference application'
+fi
+if [ "$(cat "$mac_failure_spotlight_state/entry" 2>/dev/null || true)" = \
+    'Spotlight before failed bootstrap' ] \
+  && [ "$(cat "$mac_failure_state/dotfiles-bootstrap/mac-forced-failure/status" 2>/dev/null || true)" = \
+    rolled-back ] \
+  && [ ! -e "$mac_failure_home/.cfg" ]; then
+  pass 'automatic rollback restores macOS preferences and deployed files'
+else
+  fail 'automatic rollback restores macOS preferences and deployed files'
+fi
+
+mac_conflict_home=$test_tmp/mac-conflict-home
+mac_conflict_state=$test_tmp/mac-conflict-state
+mac_conflict_spotlight_state=$test_tmp/mac-conflict-spotlight-state
+mkdir -p "$mac_conflict_spotlight_state"
+printf '%s\n' 'Spotlight before conflict test' \
+  >"$mac_conflict_spotlight_state/entry"
+run_capture "$test_tmp/mac-conflict-apply.output" env \
+  HOME="$mac_conflict_home" \
+  XDG_STATE_HOME="$mac_conflict_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STATE="$mac_conflict_spotlight_state" \
+  DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_RUN_ID=mac-preference-conflict \
+  "$bootstrap" --apply --repo "$fixture_repo" --ref main
+printf '%s\n' 'Spotlight changed after bootstrap' \
+  >"$mac_conflict_spotlight_state/entry"
+run_capture "$test_tmp/mac-conflict-rollback.output" env \
+  HOME="$mac_conflict_home" \
+  XDG_STATE_HOME="$mac_conflict_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STATE="$mac_conflict_spotlight_state" \
+  "$bootstrap" --rollback mac-preference-conflict
+if [ "$run_status" -ne 0 ]; then
+  pass 'manual rollback reports a later Spotlight shortcut conflict'
+else
+  fail 'manual rollback reports a later Spotlight shortcut conflict'
+fi
+if [ "$(cat "$mac_conflict_spotlight_state/entry" 2>/dev/null || true)" = \
+    'Spotlight changed after bootstrap' ]; then
+  pass 'conflicted rollback preserves the later Spotlight shortcut'
+else
+  fail 'conflicted rollback preserves the later Spotlight shortcut'
+fi
+if [ "$(cat "$mac_conflict_state/dotfiles-bootstrap/mac-preference-conflict/status" 2>/dev/null || true)" = \
+    complete ] \
+  && [ -d "$mac_conflict_home/.cfg" ]; then
+  pass 'preference conflict stops rollback before deployed files are changed'
+else
+  fail 'preference conflict stops rollback before deployed files are changed'
 fi
 
 transaction_home=$test_tmp/transaction-home
@@ -910,12 +1033,15 @@ fi
 
 mac_lifecycle_home=$test_tmp/mac-lifecycle-home
 mac_lifecycle_state=$test_tmp/mac-lifecycle-state
+mac_lifecycle_spotlight_state=$test_tmp/mac-lifecycle-spotlight-state
+mkdir -p "$mac_lifecycle_spotlight_state"
 run_capture "$test_tmp/mac-lifecycle-apply.output" env \
   HOME="$mac_lifecycle_home" \
   XDG_STATE_HOME="$mac_lifecycle_state" \
   DOTFILES_BOOTSTRAP_TESTING=1 \
   DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
   DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STATE="$mac_lifecycle_spotlight_state" \
   DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
   DOTFILES_BOOTSTRAP_TEST_RUN_ID=lifecycle-macos \
   "$bootstrap" --apply --repo "$fixture_repo" --ref main
@@ -923,6 +1049,12 @@ if [ "$run_status" -eq 0 ]; then
   pass 'simulated macOS end-to-end sparse deployment succeeds'
 else
   fail 'simulated macOS end-to-end sparse deployment succeeds'
+fi
+if [ "$(cat "$mac_lifecycle_spotlight_state/entry" 2>/dev/null || true)" = \
+    '{"enabled":true,"value":{"parameters":[59,41,1179648],"type":"standard"}}' ]; then
+  pass 'macOS none profile configures the native Spotlight shortcut'
+else
+  fail 'macOS none profile configures the native Spotlight shortcut'
 fi
 if [ "$(cat "$mac_lifecycle_home/.config/tmux/conf/platform/macos.conf" 2>/dev/null || true)" = 'fixture macos' ] \
   && [ "$(cat "$mac_lifecycle_home/Library/Application Support/com.mitchellh.ghostty/config.ghostty" 2>/dev/null || true)" = 'fixture macos entrypoint' ]; then
