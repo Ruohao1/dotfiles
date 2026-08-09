@@ -6,6 +6,7 @@ failures=0
 warnings=0
 check_socket=""
 check_tmp=""
+nvim_bashls_parent=""
 tmux_started=false
 tmux_socket_owned=false
 tmux_move_socket=""
@@ -5123,7 +5124,7 @@ start_configured_nvim() {
   start_state_quoted=$(shell_single_quote "$XDG_STATE_HOME") || return 1
   start_cache_quoted=$(shell_single_quote "$XDG_CACHE_HOME") || return 1
   start_file_quoted=$(shell_single_quote "$start_file") || return 1
-  start_lsp_command='lua assert(vim.lsp.is_enabled("lua_ls"), "lua_ls is not enabled before checker TUI fixture"); assert(vim.bo.filetype ~= "lua", "checker TUI fixture must start without a Lua buffer"); assert(#vim.lsp.get_clients({ name = "lua_ls", _uninitialized = true }) == 0, "lua_ls client spawned before checker TUI fixture"); vim.lsp.enable("lua_ls", false); assert(not vim.lsp.is_enabled("lua_ls"), "lua_ls remained enabled for checker TUI fixture"); assert(#vim.lsp.get_clients({ name = "lua_ls", _uninitialized = true }) == 0, "lua_ls client remained after checker TUI disable"); vim.cmd.edit(vim.fn.fnameescape(vim.env.DOTFILES_NVIM_START_FILE)); assert(#vim.lsp.get_clients({ name = "lua_ls", _uninitialized = true }) == 0, "lua_ls client spawned after checker TUI fixture opened")'
+  start_lsp_command='lua local names = { "bashls", "lua_ls", "pyright" }; assert(vim.bo.filetype ~= "bash" and vim.bo.filetype ~= "sh" and vim.bo.filetype ~= "lua" and vim.bo.filetype ~= "python", "checker TUI fixture must start without an LSP-matching buffer"); for _, name in ipairs(names) do assert(vim.lsp.is_enabled(name), name .. " is not enabled before checker TUI fixture"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned before checker TUI fixture"); vim.lsp.enable(name, false); assert(not vim.lsp.is_enabled(name), name .. " remained enabled for checker TUI fixture"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client remained after checker TUI disable") end; vim.cmd.edit(vim.fn.fnameescape(vim.env.DOTFILES_NVIM_START_FILE)); for _, name in ipairs(names) do assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned after checker TUI fixture opened") end'
   start_lsp_command_quoted=$(shell_single_quote "$start_lsp_command") || return 1
   start_command="env -u NVIM_APPNAME XDG_CONFIG_HOME=$start_config_quoted XDG_DATA_HOME=$start_data_quoted XDG_STATE_HOME=$start_state_quoted XDG_CACHE_HOME=$start_cache_quoted DOTFILES_NVIM_START_FILE=$start_file_quoted TERM=tmux-256color $start_nvim_quoted -i NONE -c $start_lsp_command_quoted"
 
@@ -5303,6 +5304,17 @@ cleanup() {
     esac
   fi
 
+  if [ -n "$nvim_bashls_parent" ] && [ -d "$nvim_bashls_parent" ]; then
+    case "$nvim_bashls_parent" in
+      /var/tmp/terminal-stack-bashls.*)
+        rm -rf "$nvim_bashls_parent"
+        ;;
+      *)
+        warn "refused to remove unexpected BashLS temporary path: $nvim_bashls_parent"
+        ;;
+    esac
+  fi
+
   if [ -n "$check_tmp" ] && [ -d "$check_tmp" ]; then
     case "$check_tmp" in
       "${TMPDIR:-/tmp}"/terminal-stack-check.*)
@@ -5424,7 +5436,7 @@ printf 'Data root: %s\n\n' "$data_home"
 static_shellcheck_ready=true
 static_stylua_ready=true
 git_security_commands_ready=true
-for required_command in uname awk sed grep cmp mktemp mkfifo wc ps infocmp git env ghostty herdr tmux nvim lua-language-server pyright-langserver fzf jq shellcheck stylua cksum stat date curl tar tree-sitter; do
+for required_command in uname awk sed grep cmp mktemp mkfifo wc ps infocmp git env ghostty herdr tmux nvim bash-language-server lua-language-server pyright-langserver fzf jq shellcheck stylua cksum stat date curl tar tree-sitter; do
   if ! require_command "$required_command"; then
     case "$required_command" in
       shellcheck) static_shellcheck_ready=false ;;
@@ -5489,6 +5501,7 @@ for static_lint_file in \
   "$terminal_stack_checker" \
   "$nvim_root/.stylua.toml" \
   "$nvim_root/init.lua" \
+  "$nvim_root/lsp/bashls.lua" \
   "$nvim_root/lsp/lua_ls.lua" \
   "$nvim_root/lsp/pyright.lua" \
   "$nvim_root/lua/config/autocmds.lua" \
@@ -5507,6 +5520,7 @@ for static_lint_file in \
   "$nvim_root/lua/plugins/theme.lua" \
   "$nvim_root/lua/plugins/treesitter.lua" \
   "$nvim_root/lua/ui/statusline.lua" \
+  "$nvim_root/tests/bashls.lua" \
   "$nvim_root/tests/completion.lua" \
   "$nvim_root/tests/foundation.lua" \
   "$nvim_root/tests/lsp.lua" \
@@ -5554,7 +5568,7 @@ fi
 if [ "$static_stylua_ready" = true ] \
   && [ "$static_lint_files_ready" = true ]; then
   if stylua --check --config-path "$nvim_root/.stylua.toml" \
-    "$nvim_root/init.lua" "$nvim_root/lua" "$nvim_root/tests" \
+    "$nvim_root/init.lua" "$nvim_root/lsp" "$nvim_root/lua" "$nvim_root/tests" \
     > "$check_tmp/stylua.txt" 2>&1 \
     && [ ! -s "$check_tmp/stylua.txt" ]; then
     pass "StyLua check is exact and silent"
@@ -9629,6 +9643,7 @@ nvim_config_ready=true
 for nvim_file in \
   "$nvim_root/init.lua" \
   "$nvim_root/lazy-lock.json" \
+  "$nvim_root/lsp/bashls.lua" \
   "$nvim_root/lsp/lua_ls.lua" \
   "$nvim_root/lsp/pyright.lua" \
   "$nvim_root/lua/config/options.lua" \
@@ -9648,6 +9663,7 @@ for nvim_file in \
   "$nvim_root/lua/ui/statusline.lua" \
   "$nvim_root/lua/integrations/tmux_status.lua" \
   "$nvim_root/tests/platform.lua" \
+  "$nvim_root/tests/bashls.lua" \
   "$nvim_root/tests/completion.lua" \
   "$nvim_root/tests/foundation.lua" \
   "$nvim_root/tests/lsp.lua" \
@@ -9764,6 +9780,49 @@ fi
 
 if [ "$nvim_config_ready" = true ] \
   && command -v nvim >/dev/null 2>&1 \
+  && command -v bash-language-server >/dev/null 2>&1 \
+  && command -v shellcheck >/dev/null 2>&1; then
+  nvim_bashls_output="$check_tmp/nvim-bashls.txt"
+
+  if nvim_bashls_parent=$(umask 077 \
+    && mktemp -d /var/tmp/terminal-stack-bashls.XXXXXX) \
+    && [ -n "$nvim_bashls_parent" ] \
+    && (umask 077 && mkdir -p \
+    "$nvim_bashls_parent/home" \
+    "$nvim_bashls_parent/config" \
+    "$nvim_bashls_parent/data" \
+    "$nvim_bashls_parent/state" \
+    "$nvim_bashls_parent/cache" \
+    "$nvim_bashls_parent/runtime" \
+    "$nvim_bashls_parent/tmp"); then
+    if env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
+      HOME="$nvim_bashls_parent/home" \
+      TMPDIR="$nvim_bashls_parent/tmp" \
+      XDG_CONFIG_HOME="$nvim_bashls_parent/config" \
+      XDG_DATA_HOME="$nvim_bashls_parent/data" \
+      XDG_STATE_HOME="$nvim_bashls_parent/state" \
+      XDG_CACHE_HOME="$nvim_bashls_parent/cache" \
+      XDG_RUNTIME_DIR="$nvim_bashls_parent/runtime" \
+      DOTFILES_NVIM_ROOT="$nvim_root" \
+      DOTFILES_BASHLS_TEST_PARENT="$nvim_bashls_parent" \
+      DOTFILES_BASHLS_TEST_ROOT="$nvim_bashls_parent/workspace" \
+      nvim --clean --headless -u NONE -i NONE \
+      -l "$nvim_root/tests/bashls.lua" \
+      > "$nvim_bashls_output" 2>&1 \
+      && ! nvim_log_has_error "$nvim_bashls_output" \
+      && grep -Fqx 'Native Bash LSP assertions: ok' "$nvim_bashls_output"; then
+      pass "native Bash LSP configuration and live attachment assertions pass"
+    else
+      sed 's/^/      /' "$nvim_bashls_output" >&2
+      fail "native Bash LSP configuration or live attachment assertions failed"
+    fi
+  else
+    fail "could not create checker-owned BashLS test directories"
+  fi
+fi
+
+if [ "$nvim_config_ready" = true ] \
+  && command -v nvim >/dev/null 2>&1 \
   && command -v pyright-langserver >/dev/null 2>&1; then
   nvim_pyright_parent="$check_tmp/nvim-pyright"
   nvim_pyright_output="$check_tmp/nvim-pyright.txt"
@@ -9807,16 +9866,16 @@ if [ "$nvim_config_ready" = true ] && [ "$plugins_trusted" = true ] && command -
     XDG_CONFIG_HOME="$config_root" XDG_DATA_HOME="$data_home" TERM_PROGRAM=ghostty \
     DOTFILES_NVIM_SKIP_PARSER_INSTALL=1 \
     nvim --headless -i NONE \
-    -c 'lua assert(vim.bo.filetype ~= "lua" and vim.bo.filetype ~= "python", "configured startup assertion buffer must not match an enabled LSP"); for _, name in ipairs({ "lua_ls", "pyright" }) do assert(vim.lsp.is_enabled(name), name .. " is not enabled during configured startup"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned before a matching buffer opened") end; vim.lsp.enable("lua_ls", false); vim.lsp.enable("pyright", false)' \
+    -c 'lua local names = { "bashls", "lua_ls", "pyright" }; assert(vim.bo.filetype ~= "bash" and vim.bo.filetype ~= "sh" and vim.bo.filetype ~= "lua" and vim.bo.filetype ~= "python", "configured startup assertion buffer must not match an enabled LSP"); for _, name in ipairs(names) do assert(vim.lsp.is_enabled(name), name .. " is not enabled during configured startup"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned before a matching buffer opened"); vim.lsp.enable(name, false); assert(not vim.lsp.is_enabled(name), name .. " remained enabled after configured startup disable") end' \
     -c "luafile $nvim_root/tests/platform.lua" \
     -c "luafile $nvim_root/tests/foundation.lua" \
     -c "luafile $nvim_root/tests/completion.lua" \
     -c "luafile $nvim_root/tests/navigation.lua" \
     -c "luafile $nvim_root/tests/statusline.lua" \
-    -c 'lua for _, name in ipairs({ "lua_ls", "pyright" }) do assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned during configured foundation assertions") end' \
+    -c 'lua for _, name in ipairs({ "bashls", "lua_ls", "pyright" }) do assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned during configured foundation assertions") end' \
     -c qa > "$check_tmp/nvim-tests.txt" 2>&1 \
     && ! nvim_log_has_error "$check_tmp/nvim-tests.txt"; then
-    pass "Neovim platform, native Lua and Python LSP startup and completion, navigation, TokyoNight, Treesitter, parser, FzfLua, Oil, MiniIcons, smart-splits, and statusline assertions pass"
+    pass "Neovim platform, native Bash, Lua, and Python LSP startup and completion, navigation, TokyoNight, Treesitter, parser, FzfLua, Oil, MiniIcons, smart-splits, and statusline assertions pass"
   else
     sed 's/^/      /' "$check_tmp/nvim-tests.txt" >&2
     fail "Neovim headless foundation assertions failed"
