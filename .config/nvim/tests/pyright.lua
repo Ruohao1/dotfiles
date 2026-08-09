@@ -108,7 +108,7 @@ local ok, failure = xpcall(function()
   exact_keys(registry, { "servers", "setup" }, "LSP registry exports")
   eq(
     registry.servers(),
-    { "bashls", "jsonls", "lua_ls", "pyright" },
+    { "bashls", "jsonls", "lua_ls", "pyright", "yamlls" },
     "exact enabled-server allowlist"
   )
 
@@ -117,9 +117,10 @@ local ok, failure = xpcall(function()
   copied_servers[2] = "not_jsonls"
   copied_servers[3] = "not_lua_ls"
   copied_servers[4] = "not_pyright"
+  copied_servers[5] = "not_yamlls"
   eq(
     registry.servers(),
-    { "bashls", "jsonls", "lua_ls", "pyright" },
+    { "bashls", "jsonls", "lua_ls", "pyright", "yamlls" },
     "server allowlist defensive copy"
   )
 
@@ -134,7 +135,7 @@ local ok, failure = xpcall(function()
   assert(setup_ok, setup_failure)
   eq(
     enable_calls,
-    { { "bashls", "jsonls", "lua_ls", "pyright" } },
+    { { "bashls", "jsonls", "lua_ls", "pyright", "yamlls" } },
     "registry setup delegates exactly once"
   )
 
@@ -208,7 +209,8 @@ local ok, failure = xpcall(function()
   assert(vim.lsp.is_enabled("jsonls"), "jsonls must remain enabled")
   assert(vim.lsp.is_enabled("lua_ls"), "lua_ls must remain enabled")
   assert(vim.lsp.is_enabled("pyright"), "pyright must be enabled")
-  for _, name in ipairs({ "bashls", "jsonls", "lua_ls" }) do
+  assert(vim.lsp.is_enabled("yamlls"), "yamlls must remain enabled")
+  for _, name in ipairs({ "bashls", "jsonls", "lua_ls", "yamlls" }) do
     assert(
       #vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0,
       "Pyright test must not start " .. name
@@ -267,7 +269,7 @@ local ok, failure = xpcall(function()
     not client:supports_method("textDocument/diagnostic", bufnr),
     "Pyright must not register pull diagnostics"
   )
-  for _, name in ipairs({ "bashls", "jsonls", "lua_ls" }) do
+  for _, name in ipairs({ "bashls", "jsonls", "lua_ls", "yamlls" }) do
     assert(
       #vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0,
       "Python buffer must not start " .. name
@@ -298,7 +300,7 @@ local ok, failure = xpcall(function()
 end, debug.traceback)
 
 local clients_removed, cleanup_result = clean_fixture()
-for _, name in ipairs({ "bashls", "jsonls", "lua_ls", "pyright" }) do
+for _, name in ipairs({ "bashls", "jsonls", "lua_ls", "pyright", "yamlls" }) do
   if vim.lsp.is_enabled(name) then
     vim.lsp.enable(name, false)
   end
