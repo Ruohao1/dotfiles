@@ -1,0 +1,214 @@
+#!/bin/sh
+
+set -u
+
+LC_ALL=C
+export LC_ALL
+
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+  GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_CEILING_DIRECTORIES \
+  GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_PREFIX GIT_NAMESPACE GIT_SHALLOW_FILE \
+  GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
+
+usage() {
+  printf '%s\n' \
+    'usage: git-summary (--path ABSOLUTE_PATH | --tmux-pane %DIGITS) --profile (compact|medium|wide)' >&2
+  exit 2
+}
+
+emit_empty() {
+  printf '\n'
+  exit 0
+}
+
+sanitize_line() {
+  awk 'BEGIN { ORS = "" } { gsub(/[[:cntrl:]]/, ""); printf "%s", $0 }'
+}
+
+[ "$#" -eq 4 ] || usage
+entry=$1
+subject=$2
+[ "$3" = "--profile" ] || usage
+profile=$4
+
+case "$profile" in
+  compact) content_budget=22; count_limit=99 ;;
+  medium) content_budget=26; count_limit=999 ;;
+  wide) content_budget=36; count_limit=9999 ;;
+  *) usage ;;
+esac
+
+tmux_output=false
+case "$entry" in
+  --path)
+    case "$subject" in
+      /*) start_path=$subject ;;
+      *) usage ;;
+    esac
+    ;;
+  --tmux-pane)
+    pane_digits=${subject#%}
+    case "$subject:$pane_digits" in
+      %*:|%*:*[!0-9]*) usage ;;
+      %*:*) ;;
+      *) usage ;;
+    esac
+    command -v tmux >/dev/null 2>&1 || emit_empty
+    pane_command=$(tmux display-message -p -t "$subject" \
+      -F '#{pane_current_command}' 2>/dev/null) || emit_empty
+    pane_path=$(tmux display-message -p -t "$subject" \
+      -F '#{pane_current_path}' 2>/dev/null) || emit_empty
+    pane_active=$(tmux display-message -p -t "$subject" \
+      -F '#{@dotfiles_nvim_active}' 2>/dev/null) || emit_empty
+    pane_root=$(tmux display-message -p -t "$subject" \
+      -F '#{@dotfiles_nvim_root}' 2>/dev/null) || emit_empty
+    pane_command=${pane_command##*/}
+    case "$pane_command" in
+      ssh|mosh-client) emit_empty ;;
+    esac
+    case "$pane_active:$pane_command" in
+      1:nvim|1:nvimdiff|1:nvim-wrapped|1:nvimdiff-wrapped) start_path=$pane_root ;;
+      *) start_path=$pane_path ;;
+    esac
+    tmux_output=true
+    ;;
+  *) usage ;;
+esac
+
+case "$start_path" in
+  /*) ;;
+  *) emit_empty ;;
+esac
+[ -d "$start_path" ] || emit_empty
+command -v git >/dev/null 2>&1 || emit_empty
+
+summary_tmp=$(mktemp "${TMPDIR:-/tmp}/dotfiles-git-summary.XXXXXX") || emit_empty
+git_pid=
+git_process_group=false
+watchdog_pid=
+watchdog_process_group=false
+
+kill_git_job() {
+  [ -n "$git_pid" ] || return 0
+  if [ "$git_process_group" = true ]; then
+    kill -KILL "-$git_pid" >/dev/null 2>&1 || true
+  else
+    kill -KILL "$git_pid" >/dev/null 2>&1 || true
+  fi
+}
+
+cancel_watchdog() {
+  [ -n "$watchdog_pid" ] || return 0
+  if [ "$watchdog_process_group" = true ]; then
+    kill -TERM "-$watchdog_pid" >/dev/null 2>&1 || true
+  else
+    kill -TERM "$watchdog_pid" >/dev/null 2>&1 || true
+  fi
+  wait "$watchdog_pid" >/dev/null 2>&1 || true
+  watchdog_pid=
+  watchdog_process_group=false
+}
+
+cleanup() {
+  if [ -n "$watchdog_pid" ]; then
+    cancel_watchdog
+  fi
+  if [ -n "$git_pid" ]; then
+    kill_git_job
+  fi
+  case "$summary_tmp" in
+    "${TMPDIR:-/tmp}"/dotfiles-git-summary.*) rm -f "$summary_tmp" ;;
+  esac
+}
+trap cleanup 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if set -m 2>/dev/null; then
+  git_process_group=true
+fi
+git --no-optional-locks -C "$start_path" status \
+  --porcelain=v2 --branch --untracked-files=normal \
+  < /dev/null > "$summary_tmp" 2>/dev/null &
+git_pid=$!
+if [ "$git_process_group" = true ]; then
+  set +m 2>/dev/null || true
+fi
+if set -m 2>/dev/null; then
+  watchdog_process_group=true
+fi
+(
+  sleep 3
+  kill_git_job
+) &
+watchdog_pid=$!
+if [ "$watchdog_process_group" = true ]; then
+  set +m 2>/dev/null || true
+fi
+
+if wait "$git_pid" 2>/dev/null; then
+  git_status=0
+else
+  git_status=$?
+fi
+git_pid=
+cancel_watchdog
+[ "$git_status" -eq 0 ] || emit_empty
+
+summary=$(awk -v budget="$content_budget" -v limit="$count_limit" '
+  function capped(value) {
+    if (value > limit) return limit "+"
+    return value
+  }
+  function clean(value) {
+    gsub(/[[:cntrl:]]/, "", value)
+    return value
+  }
+  /^# branch\.oid / { oid = $3; next }
+  /^# branch\.head / {
+    branch = $0
+    sub(/^# branch\.head /, "", branch)
+    next
+  }
+  /^u / { conflicted++; next }
+  /^[12] / {
+    xy = $2
+    x = substr(xy, 1, 1)
+    y = substr(xy, 2, 1)
+    if (x != ".") staged++
+    if (y != ".") modified++
+    next
+  }
+  /^\? / { untracked++; next }
+  END {
+    branch = clean(branch)
+    if (branch == "(detached)") branch = "@" substr(oid, 1, 8)
+    if (branch == "" || branch == "(unknown)") exit
+
+    counts = ""
+    if (staged) counts = counts " +" capped(staged)
+    if (modified) counts = counts " ~" capped(modified)
+    if (untracked) counts = counts " ?" capped(untracked)
+    if (conflicted) counts = counts " !" capped(conflicted)
+
+    branch_budget = budget - length(counts)
+    if (branch_budget < 1) exit
+    if (length(branch) > branch_budget) {
+      if (branch ~ /[^ -~]/) {
+        branch = "…"
+      } else {
+        keep = branch_budget - 1
+        if (keep < 0) keep = 0
+        branch = "…" substr(branch, length(branch) - keep + 1)
+      }
+    }
+    printf "%s%s", branch, counts
+  }
+' "$summary_tmp")
+
+summary=$(printf '%s' "$summary" | sanitize_line)
+if [ "$tmux_output" = true ]; then
+  summary=$(printf '%s' "$summary" | awk '{ gsub(/#/, "##"); printf "%s", $0 }')
+fi
+printf '%s\n' "$summary"

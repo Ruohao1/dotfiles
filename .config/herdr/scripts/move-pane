@@ -1,0 +1,143 @@
+#!/bin/sh
+
+set -eu
+
+pause_for_error() {
+  printf '\nPress Enter to close the move picker. ' >&2
+  IFS= read -r _move_picker_answer || true
+}
+
+stop_with_message() {
+  printf 'move-pane: %s\n' "$1" >&2
+  pause_for_error
+  exit 1
+}
+
+herdr_bin=${HERDR_BIN_PATH:-}
+if [ -z "$herdr_bin" ]; then
+  herdr_bin=$(command -v herdr 2>/dev/null || true)
+fi
+[ -n "$herdr_bin" ] && [ -x "$herdr_bin" ] \
+  || stop_with_message 'Herdr executable is unavailable'
+
+source_pane=${HERDR_ACTIVE_PANE_ID:-}
+source_tab=${HERDR_ACTIVE_TAB_ID:-}
+[ -n "$source_pane" ] || stop_with_message 'HERDR_ACTIVE_PANE_ID is unset'
+[ -n "$source_tab" ] || stop_with_message 'HERDR_ACTIVE_TAB_ID is unset'
+command -v jq >/dev/null 2>&1 || stop_with_message 'jq is unavailable'
+command -v fzf >/dev/null 2>&1 || stop_with_message 'fzf is unavailable'
+
+if ! snapshot=$("$herdr_bin" api snapshot 2>&1); then
+  stop_with_message "could not read the Herdr session: $snapshot"
+fi
+
+if ! printf '%s\n' "$snapshot" | jq -e --arg source_tab "$source_tab" '
+  .result.type == "session_snapshot"
+  and (.result.snapshot.workspaces | type == "array")
+  and (.result.snapshot.tabs | type == "array")
+  and (
+    .result.snapshot as $snapshot
+    | all(
+        $snapshot.tabs[] | select(.tab_id != $source_tab);
+        .workspace_id as $workspace_id
+        | ([
+            $snapshot.workspaces[]
+            | select(.workspace_id == $workspace_id)
+          ] | length) == 1
+      )
+  )
+' >/dev/null 2>&1; then
+  stop_with_message 'Herdr returned malformed session data'
+fi
+
+if ! destinations=$(printf '%s\n' "$snapshot" | jq -r --arg source_tab "$source_tab" '
+  .result
+  | select(.type == "session_snapshot")
+  | .snapshot as $snapshot
+  | $snapshot.tabs[]
+  | select(.tab_id != $source_tab)
+  | . as $tab
+  | ($snapshot.workspaces[] | select(.workspace_id == $tab.workspace_id)) as $workspace
+  | def clean: tostring | gsub("[\\t\\r\\n]"; " ");
+    [
+      $tab.tab_id,
+      (("workspace " + ($workspace.number | tostring) + ": " + ($workspace.label | clean))
+       + " / tab " + ($tab.number | tostring) + ": " + ($tab.label | clean)
+       + " (" + ($tab.pane_count | tostring) + " panes)")
+    ]
+  | @tsv
+'); then
+  stop_with_message 'Herdr returned malformed session data'
+fi
+
+if [ -z "$destinations" ]; then
+  printf 'move-pane: there are no other Herdr tabs\n' >&2
+  pause_for_error
+  exit 0
+fi
+
+tab_character=$(printf '\t')
+set -- --no-multi
+if fzf --help 2>/dev/null | grep -Fq -e '--print-query'; then
+  set -- "$@" --no-print-query
+fi
+
+if selection=$(printf '%s\n' "$destinations" | fzf \
+  "$@" \
+  --delimiter="$tab_character" \
+  --with-nth=2 \
+  --layout=reverse \
+  --border \
+  --prompt='Move pane to tab > '); then
+  :
+else
+  fzf_status=$?
+  case "$fzf_status" in
+    1|130)
+      exit 0
+      ;;
+    *)
+      stop_with_message "fzf failed with exit status $fzf_status"
+      ;;
+  esac
+fi
+
+selection_line_count=$(printf '%s\n' "$selection" | awk 'END { print NR }')
+if [ "$selection_line_count" -ne 1 ]; then
+  stop_with_message 'fzf returned an invalid selection'
+fi
+
+target_tab=$(printf '%s\n' "$selection" | awk -F "$tab_character" 'NR == 1 { print $1 }')
+[ -n "$target_tab" ] || stop_with_message 'fzf returned an invalid selection'
+[ "$target_tab" != "$source_tab" ] || stop_with_message 'fzf returned an invalid selection'
+
+if ! printf '%s\n' "$destinations" | awk \
+  -F "$tab_character" \
+  -v target_tab="$target_tab" \
+  '$1 == target_tab { matches++ } END { exit matches != 1 }'; then
+  stop_with_message 'fzf returned an invalid selection'
+fi
+
+if ! move_result=$("$herdr_bin" pane move "$source_pane" \
+  --tab "$target_tab" \
+  --split right \
+  --focus 2>&1); then
+  stop_with_message "Herdr could not move the pane: $move_result"
+fi
+
+if ! changed=$(printf '%s\n' "$move_result" | jq -r '
+  if .result.type == "pane_move"
+    and (.result.move_result.changed | type == "boolean")
+  then .result.move_result.changed
+  else error("malformed pane move response")
+  end
+'); then
+  stop_with_message 'Herdr returned malformed move data'
+fi
+
+if [ "$changed" != true ]; then
+  reason=$(printf '%s\n' "$move_result" | jq -r \
+    '.result.move_result.reason // "no change"' 2>/dev/null || printf 'no change')
+  printf 'move-pane: pane was not moved: %s\n' "$reason" >&2
+  pause_for_error
+fi
