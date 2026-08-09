@@ -5124,7 +5124,7 @@ start_configured_nvim() {
   start_state_quoted=$(shell_single_quote "$XDG_STATE_HOME") || return 1
   start_cache_quoted=$(shell_single_quote "$XDG_CACHE_HOME") || return 1
   start_file_quoted=$(shell_single_quote "$start_file") || return 1
-  start_lsp_command='lua local names = { "bashls", "jsonls", "lua_ls", "pyright" }; assert(vim.bo.filetype ~= "bash" and vim.bo.filetype ~= "sh" and vim.bo.filetype ~= "json" and vim.bo.filetype ~= "jsonc" and vim.bo.filetype ~= "lua" and vim.bo.filetype ~= "python", "checker TUI fixture must start without an LSP-matching buffer"); for _, name in ipairs(names) do assert(vim.lsp.is_enabled(name), name .. " is not enabled before checker TUI fixture"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned before checker TUI fixture"); vim.lsp.enable(name, false); assert(not vim.lsp.is_enabled(name), name .. " remained enabled for checker TUI fixture"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client remained after checker TUI disable") end; vim.cmd.edit(vim.fn.fnameescape(vim.env.DOTFILES_NVIM_START_FILE)); for _, name in ipairs(names) do assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned after checker TUI fixture opened") end'
+  start_lsp_command='lua local names = { "bashls", "jsonls", "lua_ls", "pyright", "yamlls" }; assert(vim.bo.filetype ~= "bash" and vim.bo.filetype ~= "sh" and vim.bo.filetype ~= "json" and vim.bo.filetype ~= "jsonc" and vim.bo.filetype ~= "lua" and vim.bo.filetype ~= "python" and vim.bo.filetype ~= "yaml" and vim.bo.filetype ~= "yaml.docker-compose" and vim.bo.filetype ~= "yaml.gitlab" and vim.bo.filetype ~= "yaml.helm-values", "checker TUI fixture must start without an LSP-matching buffer"); for _, name in ipairs(names) do assert(vim.lsp.is_enabled(name), name .. " is not enabled before checker TUI fixture"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned before checker TUI fixture"); vim.lsp.enable(name, false); assert(not vim.lsp.is_enabled(name), name .. " remained enabled for checker TUI fixture"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client remained after checker TUI disable") end; vim.cmd.edit(vim.fn.fnameescape(vim.env.DOTFILES_NVIM_START_FILE)); for _, name in ipairs(names) do assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned after checker TUI fixture opened") end'
   start_lsp_command_quoted=$(shell_single_quote "$start_lsp_command") || return 1
   start_command="env -u NVIM_APPNAME XDG_CONFIG_HOME=$start_config_quoted XDG_DATA_HOME=$start_data_quoted XDG_STATE_HOME=$start_state_quoted XDG_CACHE_HOME=$start_cache_quoted DOTFILES_NVIM_START_FILE=$start_file_quoted TERM=tmux-256color $start_nvim_quoted -i NONE -c $start_lsp_command_quoted"
 
@@ -5436,7 +5436,7 @@ printf 'Data root: %s\n\n' "$data_home"
 static_shellcheck_ready=true
 static_stylua_ready=true
 git_security_commands_ready=true
-for required_command in uname awk sed grep cmp mktemp mkfifo wc ps infocmp git env ghostty herdr tmux nvim bash-language-server vscode-json-language-server lua-language-server pyright-langserver fzf jq shellcheck stylua cksum stat date curl tar tree-sitter; do
+for required_command in uname awk sed grep cmp mktemp mkfifo wc ps infocmp git env ghostty herdr tmux nvim bash-language-server vscode-json-language-server yaml-language-server lua-language-server pyright-langserver fzf jq shellcheck stylua cksum stat date curl tar tree-sitter; do
   if ! require_command "$required_command"; then
     case "$required_command" in
       shellcheck) static_shellcheck_ready=false ;;
@@ -5505,6 +5505,7 @@ for static_lint_file in \
   "$nvim_root/lsp/jsonls.lua" \
   "$nvim_root/lsp/lua_ls.lua" \
   "$nvim_root/lsp/pyright.lua" \
+  "$nvim_root/lsp/yamlls.lua" \
   "$nvim_root/lua/config/autocmds.lua" \
   "$nvim_root/lua/config/completion.lua" \
   "$nvim_root/lua/config/keymaps.lua" \
@@ -5531,6 +5532,7 @@ for static_lint_file in \
   "$nvim_root/tests/plugin_source.lua" \
   "$nvim_root/tests/platform.lua" \
   "$nvim_root/tests/pyright.lua" \
+  "$nvim_root/tests/yamlls.lua" \
   "$nvim_root/tests/statusline.lua" \
   "$nvim_root/tests/theme_treesitter.lua"
 do
@@ -9649,6 +9651,7 @@ for nvim_file in \
   "$nvim_root/lsp/jsonls.lua" \
   "$nvim_root/lsp/lua_ls.lua" \
   "$nvim_root/lsp/pyright.lua" \
+  "$nvim_root/lsp/yamlls.lua" \
   "$nvim_root/lua/config/options.lua" \
   "$nvim_root/lua/config/keymaps.lua" \
   "$nvim_root/lua/config/autocmds.lua" \
@@ -9675,6 +9678,7 @@ for nvim_file in \
   "$nvim_root/tests/oil_trash.lua" \
   "$nvim_root/tests/plugin_source.lua" \
   "$nvim_root/tests/pyright.lua" \
+  "$nvim_root/tests/yamlls.lua" \
   "$nvim_root/tests/statusline.lua" \
   "$nvim_root/tests/theme_treesitter.lua" \
   "$config_root/dotfiles/git-summary"
@@ -9867,6 +9871,46 @@ fi
 
 if [ "$nvim_config_ready" = true ] \
   && command -v nvim >/dev/null 2>&1 \
+  && command -v yaml-language-server >/dev/null 2>&1; then
+  nvim_yamlls_parent="$check_tmp/nvim-yamlls"
+  nvim_yamlls_output="$check_tmp/nvim-yamlls.txt"
+
+  if (umask 077 && mkdir -p \
+    "$nvim_yamlls_parent/home" \
+    "$nvim_yamlls_parent/config" \
+    "$nvim_yamlls_parent/data" \
+    "$nvim_yamlls_parent/state" \
+    "$nvim_yamlls_parent/cache" \
+    "$nvim_yamlls_parent/runtime" \
+    "$nvim_yamlls_parent/tmp"); then
+    if env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
+      HOME="$nvim_yamlls_parent/home" \
+      TMPDIR="$nvim_yamlls_parent/tmp" \
+      XDG_CONFIG_HOME="$nvim_yamlls_parent/config" \
+      XDG_DATA_HOME="$nvim_yamlls_parent/data" \
+      XDG_STATE_HOME="$nvim_yamlls_parent/state" \
+      XDG_CACHE_HOME="$nvim_yamlls_parent/cache" \
+      XDG_RUNTIME_DIR="$nvim_yamlls_parent/runtime" \
+      DOTFILES_NVIM_ROOT="$nvim_root" \
+      DOTFILES_YAMLLS_TEST_PARENT="$nvim_yamlls_parent" \
+      DOTFILES_YAMLLS_TEST_ROOT="$nvim_yamlls_parent/workspace" \
+      nvim --clean --headless -u NONE -i NONE \
+      -l "$nvim_root/tests/yamlls.lua" \
+      > "$nvim_yamlls_output" 2>&1 \
+      && ! nvim_log_has_error "$nvim_yamlls_output" \
+      && grep -Fqx 'Native YAML LSP assertions: ok' "$nvim_yamlls_output"; then
+      pass "native YAML LSP configuration and live attachment assertions pass"
+    else
+      sed 's/^/      /' "$nvim_yamlls_output" >&2
+      fail "native YAML LSP configuration or live attachment assertions failed"
+    fi
+  else
+    fail "could not create checker-owned YAMLLS test directories"
+  fi
+fi
+
+if [ "$nvim_config_ready" = true ] \
+  && command -v nvim >/dev/null 2>&1 \
   && command -v pyright-langserver >/dev/null 2>&1; then
   nvim_pyright_parent="$check_tmp/nvim-pyright"
   nvim_pyright_output="$check_tmp/nvim-pyright.txt"
@@ -9910,16 +9954,16 @@ if [ "$nvim_config_ready" = true ] && [ "$plugins_trusted" = true ] && command -
     XDG_CONFIG_HOME="$config_root" XDG_DATA_HOME="$data_home" TERM_PROGRAM=ghostty \
     DOTFILES_NVIM_SKIP_PARSER_INSTALL=1 \
     nvim --headless -i NONE \
-    -c 'lua local names = { "bashls", "jsonls", "lua_ls", "pyright" }; assert(vim.bo.filetype ~= "bash" and vim.bo.filetype ~= "sh" and vim.bo.filetype ~= "json" and vim.bo.filetype ~= "jsonc" and vim.bo.filetype ~= "lua" and vim.bo.filetype ~= "python", "configured startup assertion buffer must not match an enabled LSP"); for _, name in ipairs(names) do assert(vim.lsp.is_enabled(name), name .. " is not enabled during configured startup"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned before a matching buffer opened"); vim.lsp.enable(name, false); assert(not vim.lsp.is_enabled(name), name .. " remained enabled after configured startup disable") end' \
+    -c 'lua local names = { "bashls", "jsonls", "lua_ls", "pyright", "yamlls" }; assert(vim.bo.filetype ~= "bash" and vim.bo.filetype ~= "sh" and vim.bo.filetype ~= "json" and vim.bo.filetype ~= "jsonc" and vim.bo.filetype ~= "lua" and vim.bo.filetype ~= "python" and vim.bo.filetype ~= "yaml" and vim.bo.filetype ~= "yaml.docker-compose" and vim.bo.filetype ~= "yaml.gitlab" and vim.bo.filetype ~= "yaml.helm-values", "configured startup assertion buffer must not match an enabled LSP"); for _, name in ipairs(names) do assert(vim.lsp.is_enabled(name), name .. " is not enabled during configured startup"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned before a matching buffer opened"); vim.lsp.enable(name, false); assert(not vim.lsp.is_enabled(name), name .. " remained enabled after configured startup disable") end' \
     -c "luafile $nvim_root/tests/platform.lua" \
     -c "luafile $nvim_root/tests/foundation.lua" \
     -c "luafile $nvim_root/tests/completion.lua" \
     -c "luafile $nvim_root/tests/navigation.lua" \
     -c "luafile $nvim_root/tests/statusline.lua" \
-    -c 'lua for _, name in ipairs({ "bashls", "jsonls", "lua_ls", "pyright" }) do assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned during configured foundation assertions") end' \
+    -c 'lua for _, name in ipairs({ "bashls", "jsonls", "lua_ls", "pyright", "yamlls" }) do assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned during configured foundation assertions") end' \
     -c qa > "$check_tmp/nvim-tests.txt" 2>&1 \
     && ! nvim_log_has_error "$check_tmp/nvim-tests.txt"; then
-    pass "Neovim platform, native Bash, JSON, Lua, and Python LSP startup and completion, navigation, TokyoNight, Treesitter, parser, FzfLua, Oil, MiniIcons, smart-splits, and statusline assertions pass"
+    pass "Neovim platform, native Bash, JSON, Lua, Python, and YAML LSP startup and completion, navigation, TokyoNight, Treesitter, parser, FzfLua, Oil, MiniIcons, smart-splits, and statusline assertions pass"
   else
     sed 's/^/      /' "$check_tmp/nvim-tests.txt" >&2
     fail "Neovim headless foundation assertions failed"
