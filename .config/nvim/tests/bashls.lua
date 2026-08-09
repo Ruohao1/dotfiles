@@ -43,7 +43,7 @@ assert(vim.fn.mkdir(fixture_root, "p") == 1, "could not create BashLS fixture ro
 
 vim.opt.runtimepath:prepend(nvim_root)
 
-local server_names = { "bashls", "lua_ls", "pyright" }
+local server_names = { "bashls", "jsonls", "lua_ls", "pyright" }
 local cleanup_clients = {}
 local cleanup_buffers = {}
 
@@ -95,8 +95,9 @@ local ok, failure = xpcall(function()
 
   local copied_servers = registry.servers()
   copied_servers[1] = "not_bashls"
-  copied_servers[2] = "not_lua_ls"
-  copied_servers[3] = "not_pyright"
+  copied_servers[2] = "not_jsonls"
+  copied_servers[3] = "not_lua_ls"
+  copied_servers[4] = "not_pyright"
   eq(registry.servers(), server_names, "server allowlist defensive copy")
 
   local original_enable = vim.lsp.enable
@@ -120,7 +121,7 @@ local ok, failure = xpcall(function()
   for _, name in ipairs(server_names) do
     assert(vim.lsp.is_enabled(name), name .. " must be enabled")
   end
-  for _, name in ipairs({ "lua_ls", "pyright" }) do
+  for _, name in ipairs({ "jsonls", "lua_ls", "pyright" }) do
     assert(
       #vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0,
       "BashLS test must not start " .. name
@@ -160,7 +161,7 @@ local ok, failure = xpcall(function()
     "BashLS must support native completion"
   )
 
-  for _, name in ipairs({ "lua_ls", "pyright" }) do
+  for _, name in ipairs({ "jsonls", "lua_ls", "pyright" }) do
     assert(
       #vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0,
       "shell buffer must not start " .. name

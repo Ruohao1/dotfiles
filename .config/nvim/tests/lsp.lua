@@ -89,13 +89,22 @@ local ok, failure = xpcall(function()
   local registry = require("config.lsp")
 
   exact_keys(registry, { "servers", "setup" }, "LSP registry exports")
-  eq(registry.servers(), { "bashls", "lua_ls", "pyright" }, "exact enabled-server allowlist")
+  eq(
+    registry.servers(),
+    { "bashls", "jsonls", "lua_ls", "pyright" },
+    "exact enabled-server allowlist"
+  )
 
   local copied_servers = registry.servers()
   copied_servers[1] = "not_bashls"
-  copied_servers[2] = "not_lua_ls"
-  copied_servers[3] = "not_pyright"
-  eq(registry.servers(), { "bashls", "lua_ls", "pyright" }, "server allowlist defensive copy")
+  copied_servers[2] = "not_jsonls"
+  copied_servers[3] = "not_lua_ls"
+  copied_servers[4] = "not_pyright"
+  eq(
+    registry.servers(),
+    { "bashls", "jsonls", "lua_ls", "pyright" },
+    "server allowlist defensive copy"
+  )
 
   local original_enable = vim.lsp.enable
   local enable_calls = {}
@@ -106,7 +115,11 @@ local ok, failure = xpcall(function()
   local setup_ok, setup_failure = xpcall(registry.setup, debug.traceback)
   vim.lsp.enable = original_enable
   assert(setup_ok, setup_failure)
-  eq(enable_calls, { { "bashls", "lua_ls", "pyright" } }, "registry setup delegates exactly once")
+  eq(
+    enable_calls,
+    { { "bashls", "jsonls", "lua_ls", "pyright" } },
+    "registry setup delegates exactly once"
+  )
 
   local config = dofile(vim.fs.joinpath(nvim_root, "lsp", "lua_ls.lua"))
   exact_keys(
@@ -197,9 +210,10 @@ local ok, failure = xpcall(function()
 
   registry.setup()
   assert(vim.lsp.is_enabled("bashls"), "bashls must remain enabled")
+  assert(vim.lsp.is_enabled("jsonls"), "jsonls must remain enabled")
   assert(vim.lsp.is_enabled("lua_ls"), "lua_ls must be enabled")
   assert(vim.lsp.is_enabled("pyright"), "pyright must remain enabled")
-  for _, name in ipairs({ "bashls", "pyright" }) do
+  for _, name in ipairs({ "bashls", "jsonls", "pyright" }) do
     assert(
       #vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0,
       "LuaLS test must not start " .. name
@@ -235,7 +249,7 @@ local ok, failure = xpcall(function()
   eq(vim.fs.normalize(client.root_dir), vim.fs.normalize(live_project), "LuaLS live root")
   eq(client.config.settings, expected_neovim_settings, "LuaLS live initialized settings")
   eq(client.settings, expected_neovim_settings, "LuaLS live documented settings")
-  for _, name in ipairs({ "bashls", "pyright" }) do
+  for _, name in ipairs({ "bashls", "jsonls", "pyright" }) do
     assert(
       #vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0,
       "Lua buffer must not start " .. name
@@ -262,7 +276,7 @@ local ok, failure = xpcall(function()
 end, debug.traceback)
 
 local clients_removed, cleanup_result = clean_fixture()
-for _, name in ipairs({ "bashls", "lua_ls", "pyright" }) do
+for _, name in ipairs({ "bashls", "jsonls", "lua_ls", "pyright" }) do
   if vim.lsp.is_enabled(name) then
     vim.lsp.enable(name, false)
   end
