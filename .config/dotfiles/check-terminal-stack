@@ -5424,7 +5424,7 @@ printf 'Data root: %s\n\n' "$data_home"
 static_shellcheck_ready=true
 static_stylua_ready=true
 git_security_commands_ready=true
-for required_command in uname awk sed grep cmp mktemp mkfifo wc ps infocmp git env ghostty herdr tmux nvim lua-language-server fzf jq shellcheck stylua cksum stat date curl tar tree-sitter; do
+for required_command in uname awk sed grep cmp mktemp mkfifo wc ps infocmp git env ghostty herdr tmux nvim lua-language-server pyright-langserver fzf jq shellcheck stylua cksum stat date curl tar tree-sitter; do
   if ! require_command "$required_command"; then
     case "$required_command" in
       shellcheck) static_shellcheck_ready=false ;;
@@ -5490,6 +5490,7 @@ for static_lint_file in \
   "$nvim_root/.stylua.toml" \
   "$nvim_root/init.lua" \
   "$nvim_root/lsp/lua_ls.lua" \
+  "$nvim_root/lsp/pyright.lua" \
   "$nvim_root/lua/config/autocmds.lua" \
   "$nvim_root/lua/config/keymaps.lua" \
   "$nvim_root/lua/config/lazy.lua" \
@@ -5511,6 +5512,7 @@ for static_lint_file in \
   "$nvim_root/tests/oil_trash.lua" \
   "$nvim_root/tests/plugin_source.lua" \
   "$nvim_root/tests/platform.lua" \
+  "$nvim_root/tests/pyright.lua" \
   "$nvim_root/tests/statusline.lua" \
   "$nvim_root/tests/theme_treesitter.lua"
 do
@@ -9626,6 +9628,7 @@ for nvim_file in \
   "$nvim_root/init.lua" \
   "$nvim_root/lazy-lock.json" \
   "$nvim_root/lsp/lua_ls.lua" \
+  "$nvim_root/lsp/pyright.lua" \
   "$nvim_root/lua/config/options.lua" \
   "$nvim_root/lua/config/keymaps.lua" \
   "$nvim_root/lua/config/autocmds.lua" \
@@ -9647,6 +9650,7 @@ for nvim_file in \
   "$nvim_root/tests/navigation.lua" \
   "$nvim_root/tests/oil_trash.lua" \
   "$nvim_root/tests/plugin_source.lua" \
+  "$nvim_root/tests/pyright.lua" \
   "$nvim_root/tests/statusline.lua" \
   "$nvim_root/tests/theme_treesitter.lua" \
   "$config_root/dotfiles/git-summary"
@@ -9754,20 +9758,60 @@ if [ "$nvim_config_ready" = true ] && command -v nvim >/dev/null 2>&1; then
   fi
 fi
 
+if [ "$nvim_config_ready" = true ] \
+  && command -v nvim >/dev/null 2>&1 \
+  && command -v pyright-langserver >/dev/null 2>&1; then
+  nvim_pyright_parent="$check_tmp/nvim-pyright"
+  nvim_pyright_output="$check_tmp/nvim-pyright.txt"
+
+  if (umask 077 && mkdir -p \
+    "$nvim_pyright_parent/home" \
+    "$nvim_pyright_parent/config" \
+    "$nvim_pyright_parent/data" \
+    "$nvim_pyright_parent/state" \
+    "$nvim_pyright_parent/cache" \
+    "$nvim_pyright_parent/runtime" \
+    "$nvim_pyright_parent/tmp"); then
+    if env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
+      HOME="$nvim_pyright_parent/home" \
+      TMPDIR="$nvim_pyright_parent/tmp" \
+      XDG_CONFIG_HOME="$nvim_pyright_parent/config" \
+      XDG_DATA_HOME="$nvim_pyright_parent/data" \
+      XDG_STATE_HOME="$nvim_pyright_parent/state" \
+      XDG_CACHE_HOME="$nvim_pyright_parent/cache" \
+      XDG_RUNTIME_DIR="$nvim_pyright_parent/runtime" \
+      DOTFILES_NVIM_ROOT="$nvim_root" \
+      DOTFILES_PYRIGHT_TEST_PARENT="$nvim_pyright_parent" \
+      DOTFILES_PYRIGHT_TEST_ROOT="$nvim_pyright_parent/workspace" \
+      nvim --clean --headless -u NONE -i NONE \
+      -l "$nvim_root/tests/pyright.lua" \
+      > "$nvim_pyright_output" 2>&1 \
+      && ! nvim_log_has_error "$nvim_pyright_output" \
+      && grep -Fqx 'Native Pyright LSP assertions: ok' "$nvim_pyright_output"; then
+      pass "native Pyright configuration and live attachment assertions pass"
+    else
+      sed 's/^/      /' "$nvim_pyright_output" >&2
+      fail "native Pyright configuration or live attachment assertions failed"
+    fi
+  else
+    fail "could not create checker-owned Pyright test directories"
+  fi
+fi
+
 if [ "$nvim_config_ready" = true ] && [ "$plugins_trusted" = true ] && command -v nvim >/dev/null 2>&1; then
   if env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
     XDG_CONFIG_HOME="$config_root" XDG_DATA_HOME="$data_home" TERM_PROGRAM=ghostty \
     DOTFILES_NVIM_SKIP_PARSER_INSTALL=1 \
     nvim --headless -i NONE \
-    -c 'lua assert(vim.lsp.is_enabled("lua_ls"), "lua_ls is not enabled during configured startup"); assert(vim.bo.filetype ~= "lua", "configured startup assertion buffer must not be Lua"); assert(#vim.lsp.get_clients({ name = "lua_ls", _uninitialized = true }) == 0, "lua_ls client spawned before a Lua buffer opened"); vim.lsp.enable("lua_ls", false)' \
+    -c 'lua assert(vim.bo.filetype ~= "lua" and vim.bo.filetype ~= "python", "configured startup assertion buffer must not match an enabled LSP"); for _, name in ipairs({ "lua_ls", "pyright" }) do assert(vim.lsp.is_enabled(name), name .. " is not enabled during configured startup"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned before a matching buffer opened") end; vim.lsp.enable("lua_ls", false); vim.lsp.enable("pyright", false)' \
     -c "luafile $nvim_root/tests/platform.lua" \
     -c "luafile $nvim_root/tests/foundation.lua" \
     -c "luafile $nvim_root/tests/navigation.lua" \
     -c "luafile $nvim_root/tests/statusline.lua" \
-    -c 'lua assert(#vim.lsp.get_clients({ name = "lua_ls", _uninitialized = true }) == 0, "lua_ls client spawned during configured foundation assertions")' \
+    -c 'lua for _, name in ipairs({ "lua_ls", "pyright" }) do assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned during configured foundation assertions") end' \
     -c qa > "$check_tmp/nvim-tests.txt" 2>&1 \
     && ! nvim_log_has_error "$check_tmp/nvim-tests.txt"; then
-    pass "Neovim platform, native Lua LSP startup, navigation, TokyoNight, Treesitter, parser, FzfLua, Oil, MiniIcons, smart-splits, and statusline assertions pass"
+    pass "Neovim platform, native Lua and Python LSP startup, navigation, TokyoNight, Treesitter, parser, FzfLua, Oil, MiniIcons, smart-splits, and statusline assertions pass"
   else
     sed 's/^/      /' "$check_tmp/nvim-tests.txt" >&2
     fail "Neovim headless foundation assertions failed"
