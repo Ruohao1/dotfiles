@@ -13,6 +13,14 @@ workspace_runtime=
 lock_path=
 lock_held=0
 staging_dir=
+restore_in_progress=0
+restore_committed=0
+restore_created_file=
+restore_renumber_original=
+restore_window_map=
+restore_pane_map=
+restore_session_map=
+restore_group_map=
 
 usage() {
   destination=$1
@@ -590,11 +598,390 @@ status_snapshot() {
   printf 'Last checkpoint: %s\n' "$(jq -r '.saved_at' "$selected_manifest")"
 }
 
+append_warning() {
+  warning=$1
+  warning_file=$workspace_state/last-warning
+  printf '%s\n' "$warning" >"$warning_file"
+  chmod 0600 "$warning_file"
+}
+
+restore_path() {
+  saved_path=$1
+  if [ -d "$saved_path" ]; then
+    printf '%s\n' "$saved_path"
+  else
+    append_warning 'a saved working directory is missing; HOME was used'
+    printf '%s\n' "$HOME"
+  fi
+}
+
+map_lookup() {
+  map_file=$1
+  saved_key=$2
+  jq -s -er --arg saved "$saved_key" \
+    'map(select(.saved == $saved))[0].actual // empty' "$map_file"
+}
+
+group_lookup() {
+  group_name=$1
+  jq -s -er --arg name "$group_name" \
+    'map(select(.name == $name))[0].leader // empty' "$restore_group_map"
+}
+
+record_created_session() {
+  created_session_id=$1
+  require_identifier "$created_session_id" '^\$[0-9]+$' 'created session identifier'
+  printf '%s\n' "$created_session_id" >>"$restore_created_file"
+}
+
+restore_dimensions() {
+  saved_layout=$1
+  dimensions=${saved_layout#*,}
+  restore_width=${dimensions%%x*}
+  dimensions=${dimensions#*x}
+  restore_height=${dimensions%%,*}
+  require_positive "$restore_width" 'restored window width'
+  require_positive "$restore_height" 'restored window height'
+}
+
+prepare_restore_files() {
+  restore_prefix=$workspace_runtime/restore-$$
+  restore_created_file=$restore_prefix-created
+  restore_window_map=$restore_prefix-windows.ndjson
+  restore_pane_map=$restore_prefix-panes.ndjson
+  restore_session_map=$restore_prefix-sessions.ndjson
+  restore_group_map=$restore_prefix-groups.ndjson
+  : >"$restore_created_file"
+  : >"$restore_window_map"
+  : >"$restore_pane_map"
+  : >"$restore_session_map"
+  : >"$restore_group_map"
+  chmod 0600 "$restore_created_file" "$restore_window_map" "$restore_pane_map" \
+    "$restore_session_map" "$restore_group_map"
+}
+
+cleanup_restore_files() {
+  for restore_file in "$restore_created_file" "$restore_window_map" \
+    "$restore_pane_map" "$restore_session_map" "$restore_group_map"; do
+    [ -n "$restore_file" ] || continue
+    case $restore_file in
+      "$workspace_runtime"/restore-*) rm -f "$restore_file" ;;
+    esac
+  done
+}
+
+rollback_restore() {
+  [ "$restore_in_progress" -eq 1 ] || return 0
+  if [ -n "$restore_created_file" ] && [ -f "$restore_created_file" ]; then
+    while IFS= read -r created_session_id; do
+      require_identifier "$created_session_id" '^\$[0-9]+$' \
+        'rollback session identifier'
+      tmux_run kill-session -t "$created_session_id" >/dev/null 2>&1 || :
+    done <"$restore_created_file"
+  fi
+  if [ -n "$restore_renumber_original" ]; then
+    tmux_run set-option -g renumber-windows "$restore_renumber_original" \
+      >/dev/null 2>&1 || :
+  fi
+  cleanup_restore_files
+  restore_in_progress=0
+}
+
+build_restored_windows() {
+  restore_windows_file=$workspace_runtime/restore-$$-window-input.ndjson
+  jq -c '.windows[]' "$selected_manifest" >"$restore_windows_file"
+  chmod 0600 "$restore_windows_file"
+  first_window=1
+  staging_session_id=
+  staging_name=__dotfiles_restore_$(printf '%s' "$selected_generation" | \
+    tr '.-' '__' | cut -c 1-80)_$$
+  while jq -e --arg name "$staging_name" 'any(.sessions[]; .name == $name)' \
+    "$selected_manifest" >/dev/null; do
+    staging_name=${staging_name}_x
+  done
+  pane_base=$(jq -r '[.panes[].index] | min // 1' "$selected_manifest")
+  require_positive "$pane_base" 'pane base index'
+
+  while IFS= read -r window_json; do
+    [ -n "$window_json" ] || continue
+    saved_window_key=$(printf '%s\n' "$window_json" | jq -er '.key')
+    saved_window_name=$(printf '%s\n' "$window_json" | jq -er '.name')
+    saved_layout=$(printf '%s\n' "$window_json" | jq -er '.layout')
+    restore_dimensions "$saved_layout"
+    pane_keys_file=$workspace_runtime/restore-$$-pane-keys
+    printf '%s\n' "$window_json" | jq -r '.panes[]' >"$pane_keys_file"
+    first_saved_pane=$(sed -n '1p' "$pane_keys_file")
+    first_saved_path=$(jq -er --arg key "$first_saved_pane" \
+      '.panes[] | select(.key == $key) | .path' "$selected_manifest")
+    first_restore_path=$(restore_path "$first_saved_path")
+
+    if [ "$first_window" -eq 1 ]; then
+      creation=$(tmux_run new-session -d -P \
+        -F '#{session_id}|#{window_id}|#{pane_id}' \
+        -s "$staging_name" -n "$saved_window_name" -c "$first_restore_path" \
+        -x "$restore_width" -y "$restore_height") \
+        || die 'could not create the restore staging session' 1
+      staging_session_id=${creation%%|*}
+      creation_remainder=${creation#*|}
+      actual_window_id=${creation_remainder%%|*}
+      actual_first_pane=${creation_remainder#*|}
+      require_identifier "$staging_session_id" '^\$[0-9]+$' \
+        'staging session identifier'
+      require_identifier "$actual_window_id" '^@[0-9]+$' \
+        'restored window identifier'
+      require_identifier "$actual_first_pane" '^%[0-9]+$' \
+        'restored pane identifier'
+      record_created_session "$staging_session_id"
+      restore_renumber_original=$(tmux_run show-options -gqv renumber-windows)
+      case $restore_renumber_original in
+        on|off) ;;
+        *) die 'could not read renumber-windows' 1 ;;
+      esac
+      tmux_run set-option -g renumber-windows off
+      tmux_run set-option -gw pane-base-index "$pane_base"
+      first_window=0
+    else
+      creation=$(tmux_run new-window -d -P -F '#{window_id}|#{pane_id}' \
+        -t "$staging_session_id:" -n "$saved_window_name" -c "$first_restore_path") \
+        || die 'could not create a restored staging window' 1
+      actual_window_id=${creation%%|*}
+      actual_first_pane=${creation#*|}
+      require_identifier "$actual_window_id" '^@[0-9]+$' \
+        'restored window identifier'
+      require_identifier "$actual_first_pane" '^%[0-9]+$' \
+        'restored pane identifier'
+    fi
+
+    tmux_run resize-window -t "$actual_window_id" \
+      -x "$restore_width" -y "$restore_height"
+    jq -n --arg saved "$saved_window_key" --arg actual "$actual_window_id" \
+      '{saved:$saved,actual:$actual}' >>"$restore_window_map"
+    jq -n --arg saved "$first_saved_pane" --arg actual "$actual_first_pane" \
+      '{saved:$saved,actual:$actual}' >>"$restore_pane_map"
+
+    pane_number=0
+    while IFS= read -r saved_pane_key; do
+      [ -n "$saved_pane_key" ] || continue
+      pane_number=$((pane_number + 1))
+      if [ "$pane_number" -eq 1 ]; then
+        continue
+      fi
+      saved_pane_path=$(jq -er --arg key "$saved_pane_key" \
+        '.panes[] | select(.key == $key) | .path' "$selected_manifest")
+      pane_restore_path=$(restore_path "$saved_pane_path")
+      actual_pane_id=$(tmux_run split-window -d -P -F '#{pane_id}' \
+        -t "$actual_window_id" -c "$pane_restore_path") \
+        || die 'could not split a restored pane' 1
+      require_identifier "$actual_pane_id" '^%[0-9]+$' \
+        'restored pane identifier'
+      jq -n --arg saved "$saved_pane_key" --arg actual "$actual_pane_id" \
+        '{saved:$saved,actual:$actual}' >>"$restore_pane_map"
+    done <"$pane_keys_file"
+
+    tmux_run select-layout -t "$actual_window_id" "$saved_layout" \
+      >/dev/null || die 'could not apply a restored window layout' 1
+    tmux_run rename-window -t "$actual_window_id" "$saved_window_name"
+    saved_automatic_rename=$(printf '%s\n' "$window_json" | \
+      jq -r 'if .automatic_rename then "on" else "off" end')
+    tmux_run set-option -w -t "$actual_window_id" automatic-rename \
+      "$saved_automatic_rename"
+
+    while IFS= read -r saved_pane_key; do
+      [ -n "$saved_pane_key" ] || continue
+      actual_pane_id=$(map_lookup "$restore_pane_map" "$saved_pane_key") \
+        || die 'missing restored pane mapping' 1
+      saved_pane_title=$(jq -er --arg key "$saved_pane_key" \
+        '.panes[] | select(.key == $key) | .title' "$selected_manifest")
+      tmux_run select-pane -t "$actual_pane_id" -T "$saved_pane_title"
+    done <"$pane_keys_file"
+    rm -f "$pane_keys_file"
+  done <"$restore_windows_file"
+  rm -f "$restore_windows_file"
+}
+
+link_session_windows() {
+  saved_session_key=$1
+  actual_session_id=$2
+  link_input=$workspace_runtime/restore-$$-links
+  jq -r --arg key "$saved_session_key" '
+    .windows[] as $window
+    | $window.links[]
+    | select(.session_key == $key)
+    | [$window.key, (.index | tostring)]
+    | @tsv
+  ' "$selected_manifest" >"$link_input"
+  chmod 0600 "$link_input"
+  while IFS='	' read -r saved_window_key saved_window_index; do
+    [ -n "$saved_window_key" ] || continue
+    require_positive "$saved_window_index" 'restored window index'
+    actual_window_id=$(map_lookup "$restore_window_map" "$saved_window_key") \
+      || die 'missing restored window mapping' 1
+    tmux_run link-window -d -s "$actual_window_id" \
+      -t "$actual_session_id:$saved_window_index"
+  done <"$link_input"
+  rm -f "$link_input"
+}
+
+build_restored_sessions() {
+  restore_sessions_file=$workspace_runtime/restore-$$-session-input.ndjson
+  jq -c '.sessions[]' "$selected_manifest" >"$restore_sessions_file"
+  chmod 0600 "$restore_sessions_file"
+  disposable_index=9999
+  while jq -e --argjson index "$disposable_index" \
+    'any(.windows[].links[]; .index == $index)' "$selected_manifest" >/dev/null; do
+    disposable_index=$((disposable_index + 1))
+  done
+
+  while IFS= read -r session_json; do
+    [ -n "$session_json" ] || continue
+    saved_session_key=$(printf '%s\n' "$session_json" | jq -er '.key')
+    saved_session_name=$(printf '%s\n' "$session_json" | jq -er '.name')
+    saved_session_path=$(printf '%s\n' "$session_json" | jq -er '.path')
+    saved_session_group=$(printf '%s\n' "$session_json" | jq -r '.group // empty')
+    session_restore_path=$(restore_path "$saved_session_path")
+
+    group_leader=
+    if [ -n "$saved_session_group" ]; then
+      group_leader=$(group_lookup "$saved_session_group" 2>/dev/null || :)
+    fi
+    if [ -n "$group_leader" ]; then
+      actual_session_id=$(tmux_run new-session -d -P -F '#{session_id}' \
+        -s "$saved_session_name" -t "$saved_session_group" \
+        -c "$session_restore_path") \
+        || die 'could not create a restored grouped session' 1
+      require_identifier "$actual_session_id" '^\$[0-9]+$' \
+        'restored session identifier'
+      record_created_session "$actual_session_id"
+    else
+      if [ -n "$saved_session_group" ]; then
+        actual_session_id=$(tmux_run new-session -d -P -F '#{session_id}' \
+          -s "$saved_session_name" -t "$saved_session_group" \
+          -c "$session_restore_path") \
+          || die 'could not create a restored group leader' 1
+      else
+        actual_session_id=$(tmux_run new-session -d -P -F '#{session_id}' \
+          -s "$saved_session_name" -n __restore_disposable \
+          -c "$session_restore_path") \
+          || die 'could not create a restored session' 1
+      fi
+      require_identifier "$actual_session_id" '^\$[0-9]+$' \
+        'restored session identifier'
+      record_created_session "$actual_session_id"
+      initial_window_id=$(tmux_run display-message -p -t "$actual_session_id:" \
+        '#{window_id}')
+      tmux_run move-window -d -s "$initial_window_id" \
+        -t "$actual_session_id:$disposable_index"
+      link_session_windows "$saved_session_key" "$actual_session_id"
+      tmux_run kill-window -t "$actual_session_id:$disposable_index"
+      if [ -n "$saved_session_group" ]; then
+        jq -n --arg name "$saved_session_group" --arg leader "$actual_session_id" \
+          '{name:$name,leader:$leader}' >>"$restore_group_map"
+      fi
+    fi
+
+    jq -n \
+      --arg saved "$saved_session_key" \
+      --arg actual "$actual_session_id" \
+      --arg name "$saved_session_name" \
+      '{saved:$saved,actual:$actual,name:$name}' >>"$restore_session_map"
+  done <"$restore_sessions_file"
+  rm -f "$restore_sessions_file"
+}
+
+restore_focus_and_metadata() {
+  jq -c '.windows[]' "$selected_manifest" |
+  while IFS= read -r window_json; do
+    saved_window_key=$(printf '%s\n' "$window_json" | jq -er '.key')
+    active_pane_index=$(printf '%s\n' "$window_json" | jq -er '.active_pane_index')
+    saved_active_pane=$(jq -er \
+      --arg window "$saved_window_key" \
+      --argjson index "$active_pane_index" \
+      '.panes[] | select(.window_key == $window and .index == $index) | .key' \
+      "$selected_manifest")
+    actual_active_pane=$(map_lookup "$restore_pane_map" "$saved_active_pane") \
+      || die 'missing active pane mapping' 1
+    tmux_run select-pane -t "$actual_active_pane"
+    if [ "$(printf '%s\n' "$window_json" | jq -r '.zoomed')" = true ]; then
+      tmux_run resize-pane -Z -t "$actual_active_pane"
+    fi
+  done
+
+  jq -c '.sessions[]' "$selected_manifest" |
+  while IFS= read -r session_json; do
+    saved_session_key=$(printf '%s\n' "$session_json" | jq -er '.key')
+    actual_session_id=$(map_lookup "$restore_session_map" "$saved_session_key") \
+      || die 'missing restored session mapping' 1
+    last_window_index=$(printf '%s\n' "$session_json" | jq -er '.last_window_index')
+    active_window_index=$(printf '%s\n' "$session_json" | jq -er '.active_window_index')
+    tmux_run select-window -t "$actual_session_id:$last_window_index"
+    tmux_run select-window -t "$actual_session_id:$active_window_index"
+  done
+}
+
+publish_pane_map() {
+  pane_map_staging=$workspace_runtime/.pane-map-$$
+  jq -s --arg generation "$selected_generation" \
+    '{generation:$generation,panes:map({key:.saved,pane_id:.actual})}' \
+    "$restore_pane_map" >"$pane_map_staging"
+  chmod 0600 "$pane_map_staging"
+  mv "$pane_map_staging" "$workspace_runtime/pane-map.json"
+}
+
+record_restore() {
+  restore_record_staging=$workspace_state/.last-restore-$$
+  jq -n --arg generation "$selected_generation" --argjson restored_at "$(date '+%s')" \
+    '{generation:$generation,restored_at:$restored_at}' >"$restore_record_staging"
+  chmod 0600 "$restore_record_staging"
+  mv "$restore_record_staging" "$workspace_state/last-restore.json"
+}
+
+restore_snapshot() {
+  prepare_roots
+  if ! select_snapshot; then
+    die 'no valid snapshot' 1
+  fi
+
+  if tmux_run list-sessions >/dev/null 2>&1; then
+    live_generation=$(tmux_run show-options -gqv @dotfiles_workspace_generation 2>/dev/null || :)
+    if [ "$live_generation" = "$selected_generation" ]; then
+      return 0
+    fi
+    tmux_run set-option -g @dotfiles_workspace_adopted 1
+    append_warning 'a live tmux server was adopted without structural restore'
+    return 0
+  fi
+
+  if [ "$(jq -r '.sessions | length' "$selected_manifest")" -eq 0 ]; then
+    record_restore
+    return 0
+  fi
+
+  prepare_restore_files
+  restore_in_progress=1
+  restore_committed=0
+  build_restored_windows
+  build_restored_sessions
+  restore_focus_and_metadata
+  publish_pane_map
+
+  tmux_run kill-session -t "$staging_session_id"
+  tmux_run set-option -g renumber-windows "$restore_renumber_original"
+  tmux_run set-option -guq @dotfiles_workspace_adopted
+  tmux_run set-option -g @dotfiles_workspace_generation "$selected_generation"
+  record_restore
+  restore_committed=1
+  restore_in_progress=0
+  cleanup_restore_files
+}
+
 cleanup_on_exit() {
   if [ -n "$staging_dir" ] && [ -d "$staging_dir" ] && [ ! -L "$staging_dir" ]; then
     case $staging_dir in
       "$workspace_state"/snapshots/.staging-*) rm -rf "$staging_dir" ;;
     esac
+  fi
+  if [ "$restore_in_progress" -eq 1 ] && [ "$restore_committed" -eq 0 ]; then
+    rollback_restore || :
   fi
   release_lock || :
 }
@@ -612,6 +999,10 @@ case ${1-} in
   save)
     [ "$#" -eq 1 ] || { usage 0; exit 2; }
     save_snapshot
+    ;;
+  restore)
+    [ "$#" -eq 1 ] || { usage 0; exit 2; }
+    restore_snapshot
     ;;
   status)
     [ "$#" -eq 1 ] || { usage 0; exit 2; }
