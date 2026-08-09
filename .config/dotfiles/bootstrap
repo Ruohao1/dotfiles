@@ -1,0 +1,1559 @@
+#!/bin/sh
+
+set -u
+
+LC_ALL=C
+export LC_ALL
+umask 077
+
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+  GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_CEILING_DIRECTORIES \
+  GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_PREFIX GIT_NAMESPACE GIT_SHALLOW_FILE \
+  GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
+
+program=${0##*/}
+case "$program" in
+  sh|dash|bash|zsh) program=bootstrap ;;
+esac
+
+usage() {
+  destination=${1:-1}
+  if [ "$destination" -eq 1 ]; then
+    output=/dev/stdout
+  else
+    output=/dev/stderr
+  fi
+
+  printf '%s\n' \
+    'usage: bootstrap [--apply] [--allow-community-packages] [--repo URL] [--ref REF]' \
+    '       bootstrap --rollback (latest|RUN_ID)' \
+    '       bootstrap --help' \
+    '' \
+    'With no arguments, bootstrap prints a dry-run and makes no persistent changes.' \
+    'Use --apply to install packages and deploy the selected dotfiles.' \
+    'Use --allow-community-packages to permit the documented Ghostty Ubuntu/Debian installer.' \
+    >"$output"
+}
+
+die() {
+  printf 'bootstrap: %s\n' "$1" >&2
+  exit "${2:-1}"
+}
+
+mode=dry-run
+allow_community_packages=false
+repo_url=https://github.com/Ruohao1/dotfiles.git
+repo_ref=main
+rollback_id=
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --apply)
+      [ "$mode" = dry-run ] || die '--apply cannot be combined with --rollback' 2
+      mode=apply
+      ;;
+    --allow-community-packages)
+      allow_community_packages=true
+      ;;
+    --repo)
+      [ "$#" -ge 2 ] || die '--repo requires a URL' 2
+      repo_url=$2
+      shift
+      ;;
+    --ref)
+      [ "$#" -ge 2 ] || die '--ref requires a Git reference' 2
+      repo_ref=$2
+      shift
+      ;;
+    --rollback)
+      [ "$#" -ge 2 ] || die '--rollback requires latest or a run ID' 2
+      [ "$mode" = dry-run ] || die '--rollback cannot be combined with --apply' 2
+      mode=rollback
+      rollback_id=$2
+      shift
+      ;;
+    --help|-h)
+      usage 1
+      exit 0
+      ;;
+    --)
+      shift
+      [ "$#" -eq 0 ] || die 'positional arguments are not supported' 2
+      break
+      ;;
+    *)
+      usage 2
+      die "unknown option: $1" 2
+      ;;
+  esac
+  shift
+done
+
+case "$repo_url" in
+  ''|-*) die 'repository URL must not be empty or begin with a dash' 2 ;;
+  *"
+"*|*""*|*"	"*) die 'repository URL must not contain control characters' 2 ;;
+esac
+case "$repo_ref" in
+  ''|-*|*[!A-Za-z0-9._/-]*|*..*|*/)
+    die 'Git reference contains unsupported characters or structure' 2
+    ;;
+esac
+case "$rollback_id" in
+  *[!A-Za-z0-9._-]*) die 'rollback ID contains unsupported characters' 2 ;;
+esac
+
+script_dir=
+case "$0" in
+  */*)
+    candidate_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || candidate_dir=
+    if [ -n "$candidate_dir" ] && [ -d "$candidate_dir/manifests" ]; then
+      script_dir=$candidate_dir
+    fi
+    ;;
+esac
+
+detect_platform() {
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ -n "${DOTFILES_BOOTSTRAP_TEST_PLATFORM:-}" ]; then
+    printf '%s\n' "$DOTFILES_BOOTSTRAP_TEST_PLATFORM"
+    return
+  fi
+
+  case "$(uname -s)" in
+    Darwin) printf '%s\n' macos ;;
+    Linux) printf '%s\n' linux ;;
+    *) die "unsupported operating system: $(uname -s)" ;;
+  esac
+}
+
+detect_manager() {
+  selected_platform=$1
+
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ -n "${DOTFILES_BOOTSTRAP_TEST_MANAGER:-}" ]; then
+    printf '%s\n' "$DOTFILES_BOOTSTRAP_TEST_MANAGER"
+    return
+  fi
+
+  if [ "$selected_platform" = macos ]; then
+    printf '%s\n' homebrew
+    return
+  fi
+
+  os_release=${DOTFILES_BOOTSTRAP_OS_RELEASE:-/etc/os-release}
+  distribution=
+  if [ -r "$os_release" ]; then
+    distribution=$(sed -n 's/^ID=//p' "$os_release" | sed 's/^"//;s/"$//' | head -n 1)
+  fi
+
+  case "$distribution" in
+    arch|endeavouros|manjaro) printf '%s\n' pacman ;;
+    debian|ubuntu|linuxmint|pop) printf '%s\n' apt ;;
+    *)
+      if command -v pacman >/dev/null 2>&1; then
+        printf '%s\n' pacman
+      elif command -v apt-get >/dev/null 2>&1; then
+        printf '%s\n' apt
+      else
+        die "unsupported Linux distribution: ${distribution:-unknown}"
+      fi
+      ;;
+  esac
+}
+
+validate_manifest_path() {
+  manifest_path=$1
+  case "$manifest_path" in
+    ''|'#'*) return 1 ;;
+    /*|.|..|../*|*/../*|*/..|./*|*//*|*[?*\[]*)
+      die "unsafe manifest path: $manifest_path"
+      ;;
+  esac
+  case "$manifest_path" in
+    *"
+"*|*""*|*"	"*) die 'manifest paths must not contain control characters' ;;
+    *[!A-Za-z0-9._/@+\ -]*) die "manifest path contains unsupported characters: $manifest_path" ;;
+  esac
+  return 0
+}
+
+emit_manifest() {
+  manifest_file=$1
+  [ -r "$manifest_file" ] || die "missing manifest: $manifest_file"
+
+  while IFS= read -r manifest_path || [ -n "$manifest_path" ]; do
+    if validate_manifest_path "$manifest_path"; then
+      printf '%s\n' "$manifest_path"
+    fi
+  done <"$manifest_file"
+}
+
+emit_selected_paths() {
+  selected_platform=$1
+  manifest_root=$2
+
+  emit_manifest "$manifest_root/config-common.paths"
+  emit_manifest "$manifest_root/config-$selected_platform.paths"
+}
+
+validate_package_name() {
+  package_name=$1
+  case "$package_name" in
+    ''|'#'*) return 1 ;;
+    *[!A-Za-z0-9@+._-]*) die "unsafe package name: $package_name" ;;
+  esac
+  return 0
+}
+
+emit_package_list() {
+  package_kind=$1
+  package_file=$2
+  [ -r "$package_file" ] || die "missing package manifest: $package_file"
+
+  while IFS= read -r package_name || [ -n "$package_name" ]; do
+    if validate_package_name "$package_name"; then
+      printf '  install %s %s\n' "$package_kind" "$package_name"
+    fi
+  done <"$package_file"
+}
+
+package_arguments() {
+  package_file=$1
+  package_line=
+  while IFS= read -r package_name || [ -n "$package_name" ]; do
+    if validate_package_name "$package_name"; then
+      if [ -n "$package_line" ]; then
+        package_line="$package_line $package_name"
+      else
+        package_line=$package_name
+      fi
+    fi
+  done <"$package_file"
+  printf '%s\n' "$package_line"
+}
+
+emit_package_plan() {
+  selected_manager=$1
+  manifest_root=$2
+
+  case "$selected_manager" in
+    homebrew)
+      emit_package_list homebrew-formula "$manifest_root/packages-homebrew-formulae.list"
+      emit_package_list homebrew-cask "$manifest_root/packages-homebrew-casks.list"
+      ;;
+    apt)
+      emit_package_list apt "$manifest_root/packages-apt.list"
+      printf '%s\n' \
+        '  install upstream neovim >=0.12.0' \
+        '  install upstream stylua' \
+        '  install upstream tree-sitter-cli >=0.26.1' \
+        '  install upstream herdr' \
+        '  install upstream font-space-mono-nerd'
+      if apt_offers_ghostty; then
+        printf '%s\n' '  install apt ghostty'
+      elif [ "$allow_community_packages" = true ]; then
+        printf '%s\n' '  install community ghostty'
+      else
+        printf '%s\n' '  blocked community ghostty (requires --allow-community-packages when no official apt package exists)'
+      fi
+      ;;
+    pacman)
+      emit_package_list pacman "$manifest_root/packages-pacman.list"
+      printf '  manual sudo pacman -Syu --needed %s\n' \
+        "$(package_arguments "$manifest_root/packages-pacman.list")"
+      printf '%s\n' '  install upstream herdr'
+      ;;
+    *) die "unsupported package manager: $selected_manager" ;;
+  esac
+}
+
+record_test_command() {
+  command_log=${DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG:-}
+  [ -n "$command_log" ] || return 0
+  first_argument=true
+  for argument do
+    if [ "$first_argument" = true ]; then
+      first_argument=false
+    else
+      printf ' ' >>"$command_log"
+    fi
+    printf '%s' "$argument" >>"$command_log"
+  done
+  printf '\n' >>"$command_log"
+}
+
+start_package_tracking() {
+  package_actions_tmp=$(temporary_directory) \
+    || die 'could not create temporary package action journal'
+  package_actions_file=$package_actions_tmp/actions
+  : >"$package_actions_file" \
+    || die 'could not initialize temporary package action journal'
+}
+
+record_package_action() {
+  package_action_kind=$1
+  package_action_name=$2
+  [ -n "$package_actions_file" ] || return 0
+  case "$package_action_kind" in
+    apt|direct|homebrew-cask|homebrew-formula|installer|community) ;;
+    *) die "unsupported package action kind: $package_action_kind" ;;
+  esac
+  validate_package_name "$package_action_name" \
+    || die 'empty package action name is not allowed'
+  printf '%s %s\n' "$package_action_kind" "$package_action_name" \
+    >>"$package_actions_file" \
+    || die 'could not record a package action'
+}
+
+run_command() {
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ]; then
+    record_test_command "$@"
+    return 0
+  fi
+  "$@"
+}
+
+run_privileged_command() {
+  if [ "$(id -u)" -eq 0 ]; then
+    run_command "$@"
+    return
+  fi
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" != 1 ]; then
+    command -v sudo >/dev/null 2>&1 \
+      || die "sudo is required to run: $1"
+  fi
+  run_command sudo "$@"
+}
+
+package_is_installed() {
+  selected_manager=$1
+  package_name=$2
+
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING:-0}" = 1 ]; then
+    return 1
+  fi
+
+  case "$selected_manager" in
+    homebrew-formula) brew list --formula "$package_name" >/dev/null 2>&1 ;;
+    homebrew-cask) brew list --cask "$package_name" >/dev/null 2>&1 ;;
+    apt)
+      dpkg-query -W -f='${Status}\n' "$package_name" 2>/dev/null \
+        | grep -qx 'install ok installed'
+      ;;
+    pacman) pacman -Q "$package_name" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+version_at_least() {
+  actual_version=$1
+  required_version=$2
+
+  awk -v actual="$actual_version" -v required="$required_version" 'BEGIN {
+    actual_count = split(actual, actual_part, ".")
+    required_count = split(required, required_part, ".")
+    count = actual_count > required_count ? actual_count : required_count
+    for (part_index = 1; part_index <= count; part_index++) {
+      actual_value = actual_part[part_index] + 0
+      required_value = required_part[part_index] + 0
+      if (actual_value > required_value) exit 0
+      if (actual_value < required_value) exit 1
+    }
+    exit 0
+  }'
+}
+
+command_version() {
+  command_name=$1
+  case "$command_name" in
+    nvim) nvim --version 2>/dev/null | sed -n '1s/[^0-9]*\([0-9][0-9.]*\).*/\1/p' ;;
+    tree-sitter) tree-sitter --version 2>/dev/null | sed -n '1s/[^0-9]*\([0-9][0-9.]*\).*/\1/p' ;;
+    *) "$command_name" --version 2>/dev/null | sed -n '1s/[^0-9]*\([0-9][0-9.]*\).*/\1/p' ;;
+  esac
+}
+
+tool_is_satisfied() {
+  tool_name=$1
+  required_version=$2
+
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING:-0}" = 1 ]; then
+    return 1
+  fi
+
+  case "$tool_name" in
+    font-space-mono-nerd)
+      command -v fc-list >/dev/null 2>&1 \
+        && fc-list 2>/dev/null | grep -Fq 'SpaceMono Nerd Font Mono'
+      return
+      ;;
+  esac
+
+  command -v "$tool_name" >/dev/null 2>&1 || return 1
+  [ -n "$required_version" ] || return 0
+  installed_version=$(command_version "$tool_name")
+  [ -n "$installed_version" ] || return 1
+  version_at_least "$installed_version" "$required_version"
+}
+
+normalized_architecture() {
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ -n "${DOTFILES_BOOTSTRAP_TEST_ARCH:-}" ]; then
+    machine=$DOTFILES_BOOTSTRAP_TEST_ARCH
+  else
+    machine=$(uname -m)
+  fi
+  case "$machine" in
+    x86_64|amd64) printf '%s\n' x86_64 ;;
+    arm64|aarch64) printf '%s\n' arm64 ;;
+    *) die "unsupported architecture: $machine" ;;
+  esac
+}
+
+temporary_directory() {
+  temporary_base=${TMPDIR:-/tmp}
+  case "$temporary_base" in
+    /) die 'refusing to create bootstrap temporary data in the filesystem root' ;;
+    /*) ;;
+    *) die 'TMPDIR must be an absolute path when set' ;;
+  esac
+  temporary_base=${temporary_base%/}
+  mktemp -d "$temporary_base/dotfiles-bootstrap.XXXXXX" \
+    || die 'could not create a private temporary directory'
+}
+
+remove_temporary_directory() {
+  temporary_path=$1
+  cleanup_temporary_base=${TMPDIR:-/tmp}
+  cleanup_temporary_base=${cleanup_temporary_base%/}
+  case "$temporary_path" in
+    "$cleanup_temporary_base"/dotfiles-bootstrap.*) rm -rf "$temporary_path" ;;
+    *) die "refusing to remove unexpected temporary path: $temporary_path" ;;
+  esac
+}
+
+file_sha256() {
+  checksum_path=$1
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$checksum_path" | awk '{ print $1 }'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$checksum_path" | awk '{ print $1 }'
+  else
+    die 'sha256sum or shasum is required to verify downloads'
+  fi
+}
+
+download_verified() {
+  download_url=$1
+  expected_sha256=$2
+  destination=$3
+
+  case "$expected_sha256" in
+    *[!0-9a-f]*|'') die "invalid SHA-256 for $download_url" ;;
+  esac
+  [ "${#expected_sha256}" -eq 64 ] || die "invalid SHA-256 length for $download_url"
+
+  curl --fail --location --show-error --silent --output "$destination" -- "$download_url" \
+    || die "download failed: $download_url"
+  actual_sha256=$(file_sha256 "$destination")
+  [ "$actual_sha256" = "$expected_sha256" ] \
+    || die "checksum mismatch for $download_url"
+}
+
+installer_record() {
+  installer_name=$1
+  manifest_file=$2
+  awk -F '\t' -v name="$installer_name" '
+    $0 !~ /^#/ && $1 == name { print $2 "\t" $3 "\t" $4; found = 1 }
+    END { if (!found) exit 1 }
+  ' "$manifest_file" || die "missing installer manifest entry: $installer_name"
+}
+
+run_pinned_installer() {
+  installer_name=$1
+  manifest_file=$2
+  installer_data=$(installer_record "$installer_name" "$manifest_file")
+  old_ifs=$IFS
+  tab_character=$(printf '\t')
+  IFS=$tab_character
+  set -f
+  # shellcheck disable=SC2086 # Intentional split on the verified manifest tab delimiter.
+  set -- $installer_data
+  set +f
+  IFS=$old_ifs
+  [ "$#" -eq 3 ] || die "malformed installer manifest entry: $installer_name"
+  installer_revision=$1
+  installer_url=$2
+  installer_sha256=$3
+  case "$installer_revision" in
+    *[!0-9a-f]*|'') die "invalid installer revision: $installer_name" ;;
+  esac
+  [ "${#installer_revision}" -eq 40 ] \
+    || die "installer revision must be a full commit: $installer_name"
+  case "$installer_url" in
+    https://*) ;;
+    *) die "installer URL must use HTTPS: $installer_name" ;;
+  esac
+
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ]; then
+    record_test_command pinned-installer "$installer_name" "$installer_revision"
+    return 0
+  fi
+
+  installer_tmp=$(temporary_directory) \
+    || die 'could not create temporary installer storage'
+  active_package_tmp=$installer_tmp
+  installer_path=$installer_tmp/install.sh
+  download_verified "$installer_url" "$installer_sha256" "$installer_path"
+  if [ "$installer_name" = homebrew ]; then
+    NONINTERACTIVE=1 /bin/bash "$installer_path"
+  else
+    /bin/bash "$installer_path"
+  fi || {
+    installer_status=$?
+    remove_temporary_directory "$installer_tmp"
+    active_package_tmp=
+    return "$installer_status"
+  }
+  remove_temporary_directory "$installer_tmp"
+  active_package_tmp=
+}
+
+direct_asset_record() {
+  tool_name=$1
+  selected_platform=$2
+  selected_arch=$3
+  manifest_file=$4
+
+  awk -F '\t' -v tool="$tool_name" -v platform="$selected_platform" -v architecture="$selected_arch" '
+    $0 !~ /^#/ && $1 == tool && $2 == platform && ($3 == architecture || $3 == "any") {
+      print $4 "\t" $5 "\t" $6 "\t" $7
+      found = 1
+    }
+    END { if (!found) exit 1 }
+  ' "$manifest_file" || die "missing direct asset for $tool_name/$selected_platform/$selected_arch"
+}
+
+install_direct_tool() {
+  tool_name=$1
+  required_version=$2
+  manifest_root=$3
+
+  if tool_is_satisfied "$tool_name" "$required_version"; then
+    printf '  skip package %s (already satisfied)\n' "$tool_name"
+    return 0
+  fi
+
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ]; then
+    record_test_command direct-install "$tool_name"
+    record_package_action direct "$tool_name"
+    return 0
+  fi
+
+  selected_arch=$(normalized_architecture)
+  asset_data=$(direct_asset_record "$tool_name" linux "$selected_arch" "$manifest_root/packages-direct.tsv")
+  old_ifs=$IFS
+  tab_character=$(printf '\t')
+  IFS=$tab_character
+  set -f
+  # shellcheck disable=SC2086 # Intentional split on the verified manifest tab delimiter.
+  set -- $asset_data
+  set +f
+  IFS=$old_ifs
+  [ "$#" -eq 4 ] || die "malformed direct asset entry: $tool_name"
+  asset_version=$1
+  asset_format=$2
+  asset_url=$3
+  asset_sha256=$4
+  case "$asset_version" in
+    ''|*[!A-Za-z0-9._-]*) die "invalid direct asset version: $tool_name" ;;
+  esac
+  case "$asset_url" in
+    https://*) ;;
+    *) die "direct asset URL must use HTTPS: $tool_name" ;;
+  esac
+
+  install_tmp=$(temporary_directory) \
+    || die "could not create temporary direct asset storage: $tool_name"
+  active_package_tmp=$install_tmp
+  asset_path=$install_tmp/asset
+  download_verified "$asset_url" "$asset_sha256" "$asset_path"
+  local_bin=$HOME/.local/bin
+  local_opt=$HOME/.local/opt
+  mkdir -p "$local_bin" "$local_opt"
+
+  case "$tool_name:$asset_format" in
+    neovim:tar.gz)
+      target_dir=$local_opt/nvim-$asset_version-$selected_arch
+      target_link=$local_bin/nvim
+      if [ -e "$target_link" ] || [ -L "$target_link" ]; then
+        remove_temporary_directory "$install_tmp"
+        die "refusing to replace existing direct-tool target: $target_link"
+      fi
+      if [ ! -d "$target_dir" ]; then
+        mkdir "$install_tmp/extract"
+        tar -xzf "$asset_path" -C "$install_tmp/extract" \
+          || die 'could not extract the verified Neovim archive'
+        extracted_dir=$install_tmp/extract/nvim-linux-$selected_arch
+        [ -x "$extracted_dir/bin/nvim" ] || die 'verified Neovim archive has an unexpected layout'
+        mv "$extracted_dir" "$target_dir"
+      fi
+      ln -s "$target_dir/bin/nvim" "$target_link"
+      ;;
+    stylua:zip)
+      target_link=$local_bin/stylua
+      [ ! -e "$target_link" ] && [ ! -L "$target_link" ] \
+        || die "refusing to replace existing direct-tool target: $target_link"
+      mkdir "$install_tmp/extract"
+      unzip -q "$asset_path" -d "$install_tmp/extract" \
+        || die 'could not extract the verified StyLua archive'
+      [ -f "$install_tmp/extract/stylua" ] || die 'verified StyLua archive has an unexpected layout'
+      install -m 0755 "$install_tmp/extract/stylua" "$target_link"
+      ;;
+    tree-sitter:gzip)
+      target_link=$local_bin/tree-sitter
+      [ ! -e "$target_link" ] && [ ! -L "$target_link" ] \
+        || die "refusing to replace existing direct-tool target: $target_link"
+      gzip -dc "$asset_path" >"$install_tmp/tree-sitter" \
+        || die 'could not extract the verified tree-sitter binary'
+      install -m 0755 "$install_tmp/tree-sitter" "$target_link"
+      ;;
+    herdr:binary)
+      target_link=$local_bin/herdr
+      [ ! -e "$target_link" ] && [ ! -L "$target_link" ] \
+        || die "refusing to replace existing direct-tool target: $target_link"
+      install -m 0755 "$asset_path" "$target_link"
+      ;;
+    font-space-mono-nerd:tar.xz)
+      target_dir=$HOME/.local/share/fonts/SpaceMonoNerdFont-$asset_version
+      [ ! -e "$target_dir" ] && [ ! -L "$target_dir" ] \
+        || die "refusing to replace existing direct-tool target: $target_dir"
+      mkdir -p "$target_dir"
+      tar -xJf "$asset_path" -C "$target_dir" \
+        || die 'could not extract the verified SpaceMono Nerd Font archive'
+      if command -v fc-cache >/dev/null 2>&1; then
+        fc-cache -f "$target_dir" >/dev/null 2>&1 || true
+      fi
+      ;;
+    *)
+      remove_temporary_directory "$install_tmp"
+      die "unsupported direct asset: $tool_name/$asset_format"
+      ;;
+  esac
+
+  remove_temporary_directory "$install_tmp"
+  active_package_tmp=
+  record_package_action direct "$tool_name"
+  printf '  installed package %s %s\n' "$tool_name" "$asset_version"
+}
+
+apt_offers_ghostty() {
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ -n "${DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL:-}" ]; then
+    [ "$DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL" = 1 ]
+    return
+  fi
+  apt-cache show ghostty >/dev/null 2>&1
+}
+
+activate_homebrew_path() {
+  for brew_candidate in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    if [ -x "$brew_candidate" ]; then
+      PATH=${brew_candidate%/bin/brew}/bin:${brew_candidate%/bin/brew}/sbin:$PATH
+      export PATH
+      break
+    fi
+  done
+  command -v brew >/dev/null 2>&1
+}
+
+install_homebrew_packages() {
+  manifest_root=$1
+  brew_missing=false
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_BREW_MISSING:-0}" = 1 ]; then
+    brew_missing=true
+  elif ! command -v brew >/dev/null 2>&1; then
+    brew_missing=true
+  fi
+
+  if [ "$brew_missing" = true ]; then
+    run_pinned_installer homebrew "$manifest_root/installers.tsv" \
+      || die 'Homebrew installation failed'
+    record_package_action installer homebrew
+    if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" != 1 ]; then
+      activate_homebrew_path \
+        || die 'Homebrew installed but is unavailable on PATH'
+    fi
+  fi
+
+  while IFS= read -r package_name || [ -n "$package_name" ]; do
+    validate_package_name "$package_name" || continue
+    if package_is_installed homebrew-formula "$package_name"; then
+      printf '  skip package %s (already installed)\n' "$package_name"
+    else
+      run_command brew install "$package_name" || die "Homebrew formula failed: $package_name"
+      record_package_action homebrew-formula "$package_name"
+    fi
+  done <"$manifest_root/packages-homebrew-formulae.list"
+
+  while IFS= read -r package_name || [ -n "$package_name" ]; do
+    validate_package_name "$package_name" || continue
+    if package_is_installed homebrew-cask "$package_name"; then
+      printf '  skip package %s (already installed)\n' "$package_name"
+    else
+      run_command brew install --cask "$package_name" || die "Homebrew cask failed: $package_name"
+      record_package_action homebrew-cask "$package_name"
+    fi
+  done <"$manifest_root/packages-homebrew-casks.list"
+}
+
+install_apt_packages() {
+  manifest_root=$1
+  ghostty_installed=false
+  package_is_installed apt ghostty && ghostty_installed=true
+  ghostty_official=false
+  if [ "$ghostty_installed" = false ] && apt_offers_ghostty; then
+    ghostty_official=true
+  fi
+  if [ "$ghostty_installed" = false ] \
+    && [ "$ghostty_official" = false ] \
+    && [ "$allow_community_packages" != true ]; then
+    die 'Ghostty is unavailable from configured apt repositories; rerun with --allow-community-packages to use the pinned documented community installer' 4
+  fi
+
+  set --
+  while IFS= read -r package_name || [ -n "$package_name" ]; do
+    validate_package_name "$package_name" || continue
+    if ! package_is_installed apt "$package_name"; then
+      set -- "$@" "$package_name"
+    fi
+  done <"$manifest_root/packages-apt.list"
+  if [ "$ghostty_installed" = false ] && [ "$ghostty_official" = true ]; then
+    set -- "$@" ghostty
+  fi
+
+  if [ "$#" -gt 0 ]; then
+    run_privileged_command apt-get update || die 'apt index refresh failed'
+    run_privileged_command apt-get install -y --no-install-recommends --no-remove "$@" \
+      || die 'apt package installation failed'
+    for installed_apt_package do
+      record_package_action apt "$installed_apt_package"
+    done
+  fi
+
+  install_direct_tool neovim 0.12.0 "$manifest_root"
+  install_direct_tool stylua 2.5.0 "$manifest_root"
+  install_direct_tool tree-sitter 0.26.1 "$manifest_root"
+  install_direct_tool herdr 0.8.0 "$manifest_root"
+  install_direct_tool font-space-mono-nerd '' "$manifest_root"
+
+  if [ "$ghostty_installed" = false ] && [ "$ghostty_official" = false ]; then
+    if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ]; then
+      record_test_command community-installer ghostty
+    else
+      run_pinned_installer ghostty-community "$manifest_root/installers.tsv" \
+        || die 'community Ghostty installation failed'
+    fi
+    record_package_action community ghostty
+  fi
+}
+
+install_pacman_packages() {
+  manifest_root=$1
+  missing_packages=
+  while IFS= read -r package_name || [ -n "$package_name" ]; do
+    validate_package_name "$package_name" || continue
+    if ! package_is_installed pacman "$package_name"; then
+      if [ -n "$missing_packages" ]; then
+        missing_packages="$missing_packages $package_name"
+      else
+        missing_packages=$package_name
+      fi
+    fi
+  done <"$manifest_root/packages-pacman.list"
+
+  if [ -n "$missing_packages" ]; then
+    printf 'bootstrap: Arch packages are missing. Run this command, then rerun bootstrap:\n' >&2
+    printf '  sudo pacman -Syu --needed %s\n' "$missing_packages" >&2
+    exit 4
+  fi
+
+  install_direct_tool herdr 0.8.0 "$manifest_root"
+}
+
+install_packages() {
+  selected_manager=$1
+  manifest_root=$2
+  printf '%s\n' 'Applying packages:'
+  case "$selected_manager" in
+    homebrew) install_homebrew_packages "$manifest_root" ;;
+    apt) install_apt_packages "$manifest_root" ;;
+    pacman) install_pacman_packages "$manifest_root" ;;
+    *) die "unsupported package manager: $selected_manager" ;;
+  esac
+}
+
+path_exists() {
+  [ -e "$1" ] || [ -L "$1" ]
+}
+
+validate_home_directory() {
+  case ${HOME:-} in
+    /) die 'refusing to use the filesystem root as HOME' ;;
+    /*) ;;
+    *) die 'HOME must be an absolute path' ;;
+  esac
+}
+
+state_root_path() {
+  state_base=${XDG_STATE_HOME:-$HOME/.local/state}
+  case "$state_base" in
+    /) die 'refusing to use the filesystem root as XDG_STATE_HOME' ;;
+    /*) ;;
+    *) die 'XDG_STATE_HOME must be an absolute path when set' ;;
+  esac
+  printf '%s\n' "$state_base/dotfiles-bootstrap"
+}
+
+append_journal_path() {
+  journal_file=$1
+  journal_path=$2
+  validate_manifest_path "$journal_path" \
+    || die 'empty journal path is not allowed'
+  printf '%s\n' "$journal_path" >>"$journal_file" \
+    || die "could not append transaction journal: $journal_file"
+}
+
+git_is_ready() {
+  command -v git >/dev/null 2>&1 \
+    && git --version </dev/null >/dev/null 2>&1
+}
+
+require_git_capabilities() {
+  git_is_ready || die 'Git is required to prepare the dotfiles repository'
+  available_git_version=$(command_version git)
+  [ -n "$available_git_version" ] \
+    || die 'could not determine the installed Git version'
+  version_at_least "$available_git_version" 2.34.0 \
+    || die "Git 2.34.0 or newer is required; found $available_git_version"
+}
+
+install_standalone_git() {
+  standalone_manager=$1
+  printf '%s\n' 'Bootstrapping Git for the standalone installer:'
+  case "$standalone_manager" in
+    apt)
+      if ! apt_offers_ghostty \
+        && [ "$allow_community_packages" != true ]; then
+        die 'Ghostty is unavailable from configured apt repositories; rerun with --allow-community-packages before the standalone installer changes packages' 4
+      fi
+      run_privileged_command apt-get update \
+        || die 'apt index refresh failed while bootstrapping Git'
+      run_privileged_command apt-get install -y --no-install-recommends --no-remove \
+        ca-certificates curl git \
+        || die 'apt could not bootstrap Git'
+      for standalone_apt_package in ca-certificates curl git; do
+        record_package_action apt "$standalone_apt_package"
+      done
+      ;;
+    pacman)
+      printf '%s\n' \
+        'bootstrap: Git is required. Run this command, then rerun bootstrap:' \
+        '  sudo pacman -Syu --needed ca-certificates curl git' >&2
+      exit 4
+      ;;
+    homebrew)
+      if ! command -v brew >/dev/null 2>&1; then
+        standalone_brew_tmp=$(temporary_directory) \
+          || die 'could not create temporary standalone Homebrew storage'
+        active_package_tmp=$standalone_brew_tmp
+        standalone_brew_installer=$standalone_brew_tmp/install.sh
+        download_verified \
+          'https://raw.githubusercontent.com/Homebrew/install/a34ae4ee9151cbce4c3b33bca7043a972b7ae9a5/install.sh' \
+          '12479a24be3f5307eecac7cde670fad7118640f031229e964f544b1367b52a41' \
+          "$standalone_brew_installer"
+        NONINTERACTIVE=1 /bin/bash "$standalone_brew_installer" \
+          || die 'Homebrew installation failed while bootstrapping Git'
+        record_package_action installer homebrew
+        remove_temporary_directory "$standalone_brew_tmp"
+        active_package_tmp=
+        activate_homebrew_path \
+          || die 'Homebrew installed but is unavailable on PATH'
+      fi
+      run_command brew install git \
+        || die 'Homebrew could not bootstrap Git'
+      record_package_action homebrew-formula git
+      ;;
+    *) die "unsupported standalone Git bootstrap manager: $standalone_manager" ;;
+  esac
+  git_is_ready || die 'Git installation completed but Git is still unavailable'
+}
+
+load_remote_manifests() {
+  require_git_capabilities
+  manifest_temp_root=$(temporary_directory) \
+    || die 'could not create temporary standalone manifest storage'
+  manifest_gitdir=$manifest_temp_root/source.git
+  manifest_source=$manifest_temp_root/bootstrap-source
+  manifest_destination=$manifest_source/manifests
+  mkdir -p "$manifest_destination" \
+    || die 'could not create temporary standalone manifest storage'
+
+  git init --quiet --bare "$manifest_gitdir" \
+    || die 'could not initialize standalone manifest repository'
+  git --git-dir="$manifest_gitdir" remote add origin "$repo_url" \
+    || die 'could not configure standalone manifest remote'
+  git --git-dir="$manifest_gitdir" config remote.origin.fetch \
+    '+refs/heads/*:refs/remotes/origin/*' \
+    || die 'could not configure standalone manifest fetch mapping'
+  git --git-dir="$manifest_gitdir" fetch --quiet --no-tags origin "$repo_ref" \
+    || die "could not fetch manifests from repository reference: $repo_ref"
+  manifest_commit=$(git --git-dir="$manifest_gitdir" \
+    rev-parse --verify 'FETCH_HEAD^{commit}') \
+    || die "standalone repository reference is not a commit: $repo_ref"
+
+  for manifest_name in \
+    config-common.paths \
+    config-excluded.paths \
+    config-linux.paths \
+    config-macos.paths \
+    installers.tsv \
+    packages-apt.list \
+    packages-direct.tsv \
+    packages-homebrew-casks.list \
+    packages-homebrew-formulae.list \
+    packages-pacman.list
+  do
+    git --git-dir="$manifest_gitdir" show \
+      "$manifest_commit:.config/dotfiles/manifests/$manifest_name" \
+      >"$manifest_destination/$manifest_name" \
+      || die "repository is missing standalone manifest: $manifest_name"
+  done
+  script_dir=$manifest_source
+}
+
+prepare_repository() {
+  selected_platform=$1
+  manifest_root=$2
+  require_git_capabilities
+
+  prepared_root=$(temporary_directory) \
+    || die 'could not create temporary repository preparation storage'
+  prepared_gitdir=$prepared_root/repository.git
+  prepared_worktree=$prepared_root/worktree
+  prepared_selected_paths=$prepared_root/selected.paths
+  prepared_patterns=$prepared_root/sparse.paths
+  prepared_tree_paths=$prepared_root/tree.paths
+  mkdir "$prepared_worktree" || die 'could not create the repository staging worktree'
+
+  if [ -n "$manifest_gitdir" ] && [ -d "$manifest_gitdir" ]; then
+    mv "$manifest_gitdir" "$prepared_gitdir" \
+      || die 'could not reuse the standalone repository fetch'
+    manifest_gitdir=
+    prepared_commit=$manifest_commit
+  else
+    git init --quiet --bare "$prepared_gitdir" \
+      || die 'could not initialize temporary repository metadata'
+    git --git-dir="$prepared_gitdir" remote add origin "$repo_url" \
+      || die 'could not configure the dotfiles repository remote'
+    git --git-dir="$prepared_gitdir" fetch --quiet --no-tags origin "$repo_ref" \
+      || die "could not fetch repository reference: $repo_ref"
+    prepared_commit=$(git --git-dir="$prepared_gitdir" rev-parse --verify 'FETCH_HEAD^{commit}') \
+      || die "repository reference is not a commit: $repo_ref"
+  fi
+  git --git-dir="$prepared_gitdir" config remote.origin.fetch \
+    '+refs/heads/*:refs/remotes/origin/*' \
+    || die 'could not configure the repository fetch mapping'
+
+  prepared_upstream=
+  case "$repo_ref" in
+    refs/heads/*)
+      prepared_branch=${repo_ref#refs/heads/}
+      prepared_upstream=refs/heads/$prepared_branch
+      ;;
+    *)
+      prepared_branch=$repo_ref
+      if git --git-dir="$prepared_gitdir" show-ref --verify --quiet \
+        "refs/remotes/origin/$prepared_branch"; then
+        prepared_upstream=refs/heads/$prepared_branch
+      else
+        prepared_branch=dotfiles-bootstrap
+      fi
+      ;;
+  esac
+  if ! git check-ref-format --branch "$prepared_branch" >/dev/null 2>&1; then
+    prepared_branch=dotfiles-bootstrap
+    prepared_upstream=
+  fi
+  git --git-dir="$prepared_gitdir" update-ref "refs/heads/$prepared_branch" "$prepared_commit" \
+    || die 'could not create the local dotfiles branch'
+  git --git-dir="$prepared_gitdir" symbolic-ref HEAD "refs/heads/$prepared_branch" \
+    || die 'could not select the local dotfiles branch'
+  if [ -n "$prepared_upstream" ]; then
+    git --git-dir="$prepared_gitdir" config "branch.$prepared_branch.remote" origin \
+      || die 'could not configure the local branch remote'
+    git --git-dir="$prepared_gitdir" config "branch.$prepared_branch.merge" "$prepared_upstream" \
+      || die 'could not configure the local branch upstream'
+  fi
+
+  emit_selected_paths "$selected_platform" "$manifest_root" >"$prepared_patterns" \
+    || die 'could not write sparse checkout patterns'
+  git --git-dir="$prepared_gitdir" --work-tree="$prepared_worktree" \
+    checkout --quiet --force "$prepared_branch" \
+    || die 'could not materialize the selected repository configuration'
+  git --git-dir="$prepared_gitdir" --work-tree="$prepared_worktree" \
+    sparse-checkout set --no-cone --no-sparse-index --stdin <"$prepared_patterns" \
+    || die 'could not configure the exact-file sparse checkout'
+  git --git-dir="$prepared_gitdir" ls-tree -r --name-only "$prepared_commit" \
+    >"$prepared_tree_paths" \
+    || die 'could not enumerate repository paths'
+  : >"$prepared_selected_paths" \
+    || die 'could not initialize selected repository path list'
+  while IFS= read -r tree_path || [ -n "$tree_path" ]; do
+    validate_manifest_path "$tree_path" \
+      || die 'empty repository path is not allowed'
+    tree_path_selected=false
+    while IFS= read -r allowed_path || [ -n "$allowed_path" ]; do
+      validate_manifest_path "$allowed_path" || continue
+      case "$tree_path" in
+        "$allowed_path"|"$allowed_path"/*)
+          tree_path_selected=true
+          break
+          ;;
+      esac
+    done <"$prepared_patterns"
+    if [ "$tree_path_selected" = true ]; then
+      printf '%s\n' "$tree_path" >>"$prepared_selected_paths" \
+        || die 'could not record a selected repository path'
+    fi
+  done <"$prepared_tree_paths"
+  [ -s "$prepared_selected_paths" ] \
+    || die 'the selected platform manifest matched no tracked files'
+
+  while IFS= read -r required_path || [ -n "$required_path" ]; do
+    validate_manifest_path "$required_path" || continue
+    required_path_matched=false
+    while IFS= read -r selected_match || [ -n "$selected_match" ]; do
+      case "$selected_match" in
+        "$required_path"|"$required_path"/*)
+          required_path_matched=true
+          break
+          ;;
+      esac
+    done <"$prepared_selected_paths"
+    [ "$required_path_matched" = true ] \
+      || die "platform manifest path matches no tracked file: $required_path"
+  done <"$prepared_patterns"
+
+  while IFS= read -r selected_path || [ -n "$selected_path" ]; do
+    validate_manifest_path "$selected_path" \
+      || die 'empty selected repository path is not allowed'
+    while IFS= read -r excluded_path || [ -n "$excluded_path" ]; do
+      validate_manifest_path "$excluded_path" || continue
+      case "$selected_path" in
+        "$excluded_path"|"$excluded_path"/*)
+          die "excluded path was selected by the sparse checkout: $selected_path"
+          ;;
+      esac
+    done <"$manifest_root/config-excluded.paths"
+  done <"$prepared_selected_paths"
+
+  for required_bootstrap_path in \
+    .config/dotfiles/bootstrap \
+    .config/dotfiles/dotfiles
+  do
+    grep -Fqx "$required_bootstrap_path" "$prepared_selected_paths" \
+      || die "repository is missing required bootstrap file: $required_bootstrap_path"
+  done
+}
+
+emit_conflict_once() {
+  conflict_relative=$1
+  if grep -Fqx "$conflict_relative" "$prepared_conflicts" 2>/dev/null; then
+    return 0
+  fi
+  printf '%s\n' "$conflict_relative" >>"$prepared_conflicts" \
+    || die 'could not record a dry-run conflict'
+  printf '  conflict %s\n' "$conflict_relative"
+}
+
+scan_selected_conflict() {
+  scan_relative=$1
+  scan_parent=$(dirname "$scan_relative")
+  if [ "$scan_parent" != . ]; then
+    scan_old_ifs=$IFS
+    IFS=/
+    set -f
+    # shellcheck disable=SC2086 # Intentional split on validated path separators.
+    set -- $scan_parent
+    set +f
+    IFS=$scan_old_ifs
+    scan_current=
+    for scan_component do
+      if [ -n "$scan_current" ]; then
+        scan_current=$scan_current/$scan_component
+      else
+        scan_current=$scan_component
+      fi
+      scan_target=$HOME/$scan_current
+      if path_exists "$scan_target" \
+        && { [ ! -d "$scan_target" ] || [ -L "$scan_target" ]; }; then
+        emit_conflict_once "$scan_current"
+        return 0
+      fi
+    done
+  fi
+  if path_exists "$HOME/$scan_relative"; then
+    emit_conflict_once "$scan_relative"
+  fi
+}
+
+emit_conflict_plan() {
+  validate_home_directory
+  prepared_conflicts=$prepared_root/conflicts.paths
+  : >"$prepared_conflicts" \
+    || die 'could not initialize dry-run conflict list'
+  printf '%s\n' 'Conflicts to back up during apply:'
+  scan_selected_conflict .cfg
+  scan_selected_conflict .local/bin/dotfiles
+  while IFS= read -r conflict_candidate || [ -n "$conflict_candidate" ]; do
+    scan_selected_conflict "$conflict_candidate"
+  done <"$prepared_selected_paths"
+  if [ ! -s "$prepared_conflicts" ]; then
+    printf '%s\n' '  none'
+  fi
+}
+
+begin_transaction() {
+  selected_platform=$1
+  selected_manager=$2
+  validate_home_directory
+  mkdir -p "$HOME" || die "could not create HOME: $HOME"
+
+  transaction_state_root=$(state_root_path)
+  mkdir -p "$transaction_state_root" \
+    || die "could not create transaction state: $transaction_state_root"
+
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ -n "${DOTFILES_BOOTSTRAP_TEST_RUN_ID:-}" ]; then
+    transaction_id=$DOTFILES_BOOTSTRAP_TEST_RUN_ID
+  else
+    transaction_id=$(date -u '+%Y%m%dT%H%M%SZ')-$$
+  fi
+  case "$transaction_id" in
+    ''|*[!A-Za-z0-9._-]*) die 'generated transaction ID contains unsupported characters' ;;
+  esac
+
+  transaction_run=$transaction_state_root/$transaction_id
+  [ ! -e "$transaction_run" ] \
+    || die "transaction already exists: $transaction_id"
+  mkdir -p \
+    "$transaction_run/backup" \
+    "$transaction_run/rollback-current" \
+    || die 'could not create the transaction journal'
+  {
+    : >"$transaction_run/backed-up.paths" \
+      && : >"$transaction_run/managed.paths" \
+      && : >"$transaction_run/created-directories.paths" \
+      && printf '%s\n' active >"$transaction_run/status" \
+      && printf '%s\n' "$repo_url" >"$transaction_run/repository" \
+      && printf '%s\n' "$repo_ref" >"$transaction_run/reference" \
+      && printf '%s\n' "$prepared_commit" >"$transaction_run/commit" \
+      && printf '%s\n' "$selected_platform" >"$transaction_run/platform" \
+      && printf '%s\n' "$selected_manager" >"$transaction_run/package-manager"
+  } || die 'could not initialize transaction metadata'
+  printf '%s\n' \
+    'Package changes are retained during rollback.' \
+    "Package manager: $selected_manager" \
+    'Retained package actions:' \
+    >"$transaction_run/packages-retained.txt" \
+    || die 'could not initialize retained package report'
+  if [ -s "$package_actions_file" ]; then
+    while IFS= read -r retained_action || [ -n "$retained_action" ]; do
+      printf '%s\n' "$retained_action" >>"$transaction_run/packages-retained.txt" \
+        || die 'could not write retained package report'
+    done <"$package_actions_file"
+  else
+    printf '%s\n' none >>"$transaction_run/packages-retained.txt" \
+      || die 'could not write retained package report'
+  fi
+  transaction_active=true
+}
+
+backup_existing_path() {
+  backup_relative=$1
+  backup_target=$HOME/$backup_relative
+  path_exists "$backup_target" || return 0
+  if grep -Fqx "$backup_relative" "$transaction_run/backed-up.paths" 2>/dev/null; then
+    return 0
+  fi
+
+  backup_destination=$transaction_run/backup/$backup_relative
+  mkdir -p "$(dirname "$backup_destination")" \
+    || die "could not create backup parent for: $backup_relative"
+  append_journal_path "$transaction_run/backed-up.paths" "$backup_relative"
+  mv "$backup_target" "$backup_destination" \
+    || die "could not back up conflicting path: $backup_relative"
+  printf '  backed up %s\n' "$backup_relative"
+}
+
+ensure_target_parents() {
+  parents_path=$1
+  parents_relative=$(dirname "$parents_path")
+  [ "$parents_relative" != . ] || return 0
+
+  parents_old_ifs=$IFS
+  IFS=/
+  set -f
+  # shellcheck disable=SC2086 # Intentional split on validated path separators.
+  set -- $parents_relative
+  set +f
+  IFS=$parents_old_ifs
+  parents_current=
+  for parents_component do
+    if [ -n "$parents_current" ]; then
+      parents_current=$parents_current/$parents_component
+    else
+      parents_current=$parents_component
+    fi
+    parents_target=$HOME/$parents_current
+    if path_exists "$parents_target"; then
+      if [ -d "$parents_target" ] && [ ! -L "$parents_target" ]; then
+        continue
+      fi
+      backup_existing_path "$parents_current"
+    fi
+    if ! path_exists "$parents_target"; then
+      append_journal_path "$transaction_run/created-directories.paths" "$parents_current"
+      mkdir "$parents_target" \
+        || die "could not create configuration directory: $parents_current"
+    fi
+  done
+}
+
+deploy_selected_file() {
+  deploy_relative=$1
+  deploy_source=$prepared_worktree/$deploy_relative
+  deploy_target=$HOME/$deploy_relative
+  ensure_target_parents "$deploy_relative"
+  backup_existing_path "$deploy_relative"
+  append_journal_path "$transaction_run/managed.paths" "$deploy_relative"
+
+  if [ -L "$deploy_source" ]; then
+    deploy_link=$(readlink "$deploy_source") \
+      || die "could not read repository symlink: $deploy_relative"
+    ln -s "$deploy_link" "$deploy_target" \
+      || die "could not deploy repository symlink: $deploy_relative"
+  elif [ -f "$deploy_source" ]; then
+    cp -p "$deploy_source" "$deploy_target" \
+      || die "could not deploy repository file: $deploy_relative"
+  else
+    die "repository path is not a regular file or symlink: $deploy_relative"
+  fi
+}
+
+install_repository_metadata() {
+  backup_existing_path .cfg
+  append_journal_path "$transaction_run/managed.paths" .cfg
+  mv "$prepared_gitdir" "$HOME/.cfg" \
+    || die 'could not install bare repository metadata at ~/.cfg'
+  prepared_gitdir=
+  git --git-dir="$HOME/.cfg" config status.showUntrackedFiles no \
+    || die 'could not configure concise dotfiles status output'
+}
+
+install_dotfiles_wrapper() {
+  wrapper_path=.local/bin/dotfiles
+  ensure_target_parents "$wrapper_path"
+  backup_existing_path "$wrapper_path"
+  append_journal_path "$transaction_run/managed.paths" "$wrapper_path"
+  [ -x "$HOME/.config/dotfiles/dotfiles" ] \
+    || die 'deployed dotfiles wrapper is missing or not executable'
+  ln -s "$HOME/.config/dotfiles/dotfiles" "$HOME/$wrapper_path" \
+    || die 'could not install ~/.local/bin/dotfiles'
+}
+
+complete_transaction() {
+  git_status=$(git --git-dir="$HOME/.cfg" --work-tree="$HOME" \
+    status --porcelain=v1 --untracked-files=no) \
+    || die 'could not verify the deployed dotfiles repository'
+  [ -z "$git_status" ] \
+    || die 'deployed dotfiles do not match the selected repository commit'
+
+  printf '%s\n' complete >"$transaction_run/status" \
+    || die 'could not mark the transaction complete'
+  latest_tmp=$transaction_state_root/.latest.$transaction_id
+  printf '%s\n' "$transaction_id" >"$latest_tmp" \
+    || die 'could not stage the latest transaction marker'
+  mv "$latest_tmp" "$transaction_state_root/latest" \
+    || die 'could not update the latest transaction marker'
+  transaction_active=false
+  printf 'Configuration installed from %s\n' "$prepared_commit"
+  printf 'Backup and rollback journal: %s\n' "$transaction_run"
+}
+
+deploy_configuration() {
+  selected_platform=$1
+  selected_manager=$2
+  begin_transaction "$selected_platform" "$selected_manager"
+  printf '%s\n' 'Applying configuration:'
+  install_repository_metadata
+
+  while IFS= read -r selected_path || [ -n "$selected_path" ]; do
+    deploy_selected_file "$selected_path"
+  done <"$prepared_selected_paths"
+  install_dotfiles_wrapper
+
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_FAIL_AFTER_CHECKOUT:-0}" = 1 ]; then
+    die 'forced failure after configuration deployment'
+  fi
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_SIGNAL_AFTER_CHECKOUT:-}" = TERM ]; then
+    kill -TERM "$$"
+  fi
+  complete_transaction
+}
+
+reverse_journal() {
+  sed '1!G;h;$!d' "$1"
+}
+
+archive_current_path() {
+  archive_relative=$1
+  archive_current=$HOME/$archive_relative
+  path_exists "$archive_current" || return 0
+  archive_destination=$transaction_run/rollback-current/$archive_relative
+  mkdir -p "$(dirname "$archive_destination")" || return 1
+  if path_exists "$archive_destination"; then
+    archive_destination=$archive_destination.retry-$$
+  fi
+  mv "$archive_current" "$archive_destination"
+}
+
+prune_created_directories() {
+  created_journal=$transaction_run/created-directories.paths
+  [ -r "$created_journal" ] || return 0
+  awk '{ print length($0) "\t" $0 }' "$created_journal" \
+    | sort -rn \
+    | cut -f 2- \
+    | while IFS= read -r prune_relative || [ -n "$prune_relative" ]; do
+        rmdir "$HOME/$prune_relative" >/dev/null 2>&1 || true
+      done
+}
+
+restore_backups() {
+  backup_journal=$transaction_run/backed-up.paths
+  [ -r "$backup_journal" ] || return 0
+  while IFS= read -r restore_relative || [ -n "$restore_relative" ]; do
+    restore_source=$transaction_run/backup/$restore_relative
+    path_exists "$restore_source" || continue
+    if path_exists "$HOME/$restore_relative"; then
+      archive_current_path "$restore_relative" || return 1
+    fi
+    mkdir -p "$(dirname "$HOME/$restore_relative")" || return 1
+    mv "$restore_source" "$HOME/$restore_relative" || return 1
+  done <"$backup_journal"
+}
+
+report_retained_packages() {
+  printf '%s\n' 'Packages are not uninstalled by rollback.'
+  retained_report=$transaction_run/packages-retained.txt
+  [ -r "$retained_report" ] || return 0
+  sed -n '/^Retained package actions:$/,$p' "$retained_report"
+}
+
+rollback_transaction() {
+  transaction_run=$1
+  rollback_status=$(cat "$transaction_run/status" 2>/dev/null || true)
+  if [ "$rollback_status" = rolled-back ]; then
+    printf 'Transaction is already rolled back: %s\n' "${transaction_run##*/}"
+    report_retained_packages
+    return 0
+  fi
+  case "$rollback_status" in
+    active|complete|rolling-back) ;;
+    *)
+      printf 'bootstrap: transaction journal has invalid status: %s\n' \
+        "${rollback_status:-missing}" >&2
+      return 1
+      ;;
+  esac
+
+  printf '%s\n' rolling-back >"$transaction_run/status" || return 1
+  managed_journal=$transaction_run/managed.paths
+  if [ -r "$managed_journal" ]; then
+    reverse_journal "$managed_journal" \
+      | while IFS= read -r rollback_relative || [ -n "$rollback_relative" ]; do
+          archive_current_path "$rollback_relative" || exit 1
+        done \
+      || return 1
+  fi
+  prune_created_directories || return 1
+  restore_backups || return 1
+  printf '%s\n' rolled-back >"$transaction_run/status" || return 1
+  printf 'Rolled back transaction: %s\n' "${transaction_run##*/}"
+  report_retained_packages
+}
+
+run_manual_rollback() {
+  validate_home_directory
+  transaction_state_root=$(state_root_path)
+  requested_id=$rollback_id
+  if [ "$requested_id" = latest ]; then
+    [ -r "$transaction_state_root/latest" ] \
+      || die 'no latest dotfiles transaction is available'
+    requested_id=$(cat "$transaction_state_root/latest")
+  fi
+  case "$requested_id" in
+    ''|*[!A-Za-z0-9._-]*) die 'resolved rollback ID contains unsupported characters' ;;
+  esac
+  requested_run=$transaction_state_root/$requested_id
+  [ -d "$requested_run" ] || die "transaction does not exist: $requested_id"
+  rollback_transaction "$requested_run" \
+    || die "rollback failed for transaction: $requested_id"
+}
+
+handle_transaction_signal() {
+  signal_name=$1
+  signal_code=$2
+  if [ "$transaction_active" = true ]; then
+    printf 'bootstrap: received %s; rolling back configuration\n' "$signal_name" >&2
+  else
+    printf 'bootstrap: received %s; stopping safely\n' "$signal_name" >&2
+  fi
+  exit "$signal_code"
+}
+
+handle_process_exit() {
+  process_status=$?
+  trap - 0 HUP INT TERM
+  if [ "$transaction_active" = true ]; then
+    printf '%s\n' 'bootstrap: configuration failed; restoring the transaction backup' >&2
+    if ! rollback_transaction "$transaction_run"; then
+      printf 'bootstrap: automatic rollback failed; inspect %s\n' "$transaction_run" >&2
+    fi
+  fi
+  if [ -n "$prepared_root" ] && [ -d "$prepared_root" ]; then
+    remove_temporary_directory "$prepared_root"
+  fi
+  if [ -n "$active_package_tmp" ] && [ -d "$active_package_tmp" ]; then
+    remove_temporary_directory "$active_package_tmp"
+  fi
+  if [ -n "$manifest_temp_root" ] && [ -d "$manifest_temp_root" ]; then
+    remove_temporary_directory "$manifest_temp_root"
+  fi
+  if [ -n "$package_actions_tmp" ] && [ -d "$package_actions_tmp" ]; then
+    remove_temporary_directory "$package_actions_tmp"
+  fi
+  exit "$process_status"
+}
+
+transaction_active=false
+transaction_run=
+transaction_state_root=
+transaction_id=
+prepared_root=
+prepared_gitdir=
+prepared_worktree=
+prepared_selected_paths=
+prepared_patterns=
+prepared_commit=
+active_package_tmp=
+manifest_temp_root=
+manifest_gitdir=
+manifest_commit=
+package_actions_tmp=
+package_actions_file=
+
+trap handle_process_exit 0
+trap 'handle_transaction_signal HUP 129' HUP
+trap 'handle_transaction_signal INT 130' INT
+trap 'handle_transaction_signal TERM 143' TERM
+
+platform=$(detect_platform)
+case "$platform" in
+  macos|linux) ;;
+  *) die "invalid platform selection: $platform" ;;
+esac
+manager=$(detect_manager "$platform")
+case "$platform:$manager" in
+  macos:homebrew|linux:apt|linux:pacman) ;;
+  *) die "package manager $manager is invalid for $platform" ;;
+esac
+
+if [ "$mode" = rollback ]; then
+  run_manual_rollback
+  exit 0
+fi
+
+if [ "$mode" = apply ]; then
+  start_package_tracking
+fi
+
+if [ -z "$script_dir" ]; then
+  if ! git_is_ready; then
+    if [ "$mode" = dry-run ]; then
+      printf 'Mode: %s\n' "$mode"
+      printf 'Platform: %s\n' "$platform"
+      printf 'Package manager: %s\n' "$manager"
+      printf 'Repository: %s\n' "$repo_url"
+      printf 'Reference: %s\n' "$repo_ref"
+      printf '%s\n' \
+        'Git is not installed, so the standalone dry-run cannot fetch its manifests.' \
+        'Run with --apply to bootstrap Git, or install Git and rerun the dry-run.'
+      exit 0
+    fi
+    install_standalone_git "$manager"
+  fi
+  load_remote_manifests
+fi
+
+[ -n "$script_dir" ] || die 'cannot locate bootstrap manifests'
+
+printf 'Mode: %s\n' "$mode"
+printf 'Platform: %s\n' "$platform"
+printf 'Package manager: %s\n' "$manager"
+printf 'Repository: %s\n' "$repo_url"
+printf 'Reference: %s\n' "$repo_ref"
+printf 'Community packages: %s\n' "$allow_community_packages"
+printf '%s\n' 'Configuration paths:'
+emit_selected_paths "$platform" "$script_dir/manifests" | sed 's/^/  install /'
+printf '%s\n' 'Packages:'
+emit_package_plan "$manager" "$script_dir/manifests"
+
+if [ "$mode" = dry-run ]; then
+  prepare_dry_run=true
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_PREPARE_DRY_RUN:-0}" != 1 ]; then
+    prepare_dry_run=false
+  fi
+  if [ "$prepare_dry_run" = true ]; then
+    if command -v git >/dev/null 2>&1; then
+      prepare_repository "$platform" "$script_dir/manifests"
+      emit_conflict_plan
+    else
+      printf '%s\n' 'Conflict scan deferred until Git is installed.'
+    fi
+  fi
+  exit 0
+fi
+
+if [ "$mode" = apply ]; then
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES:-0}" = 1 ]; then
+    printf '%s\n' 'Applying packages: skipped by test harness'
+  else
+    install_packages "$manager" "$script_dir/manifests"
+  fi
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES:-0}" = 1 ]; then
+    exit 0
+  fi
+  prepare_repository "$platform" "$script_dir/manifests"
+  deploy_configuration "$platform" "$manager"
+  exit 0
+fi

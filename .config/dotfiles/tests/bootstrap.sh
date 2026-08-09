@@ -1,0 +1,774 @@
+#!/bin/sh
+
+set -eu
+
+LC_ALL=C
+export LC_ALL
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+dotfiles_dir=$(CDPATH='' cd -- "$script_dir/.." && pwd)
+workspace_root=$(CDPATH='' cd -- "$dotfiles_dir/../.." && pwd)
+bootstrap=$dotfiles_dir/bootstrap
+
+failures=0
+tests=0
+
+pass() {
+  tests=$((tests + 1))
+  printf 'ok %d - %s\n' "$tests" "$1"
+}
+
+fail() {
+  tests=$((tests + 1))
+  failures=$((failures + 1))
+  printf 'not ok %d - %s\n' "$tests" "$1" >&2
+}
+
+require_contains() {
+  haystack=$1
+  needle=$2
+  label=$3
+
+  case "$haystack" in
+    *"$needle"*) pass "$label" ;;
+    *)
+      fail "$label"
+      printf '  missing: %s\n' "$needle" >&2
+      ;;
+  esac
+}
+
+require_excludes() {
+  haystack=$1
+  needle=$2
+  label=$3
+
+  case "$haystack" in
+    *"$needle"*)
+      fail "$label"
+      printf '  unexpected: %s\n' "$needle" >&2
+      ;;
+    *) pass "$label" ;;
+  esac
+}
+
+run_capture() {
+  output_file=$1
+  shift
+  set +e
+  "$@" >"$output_file" 2>&1
+  run_status=$?
+  set -e
+}
+
+test_tmp=$(mktemp -d "${TMPDIR:-/tmp}/dotfiles-bootstrap-test.XXXXXX")
+cleanup() {
+  case "$test_tmp" in
+    "${TMPDIR:-/tmp}"/dotfiles-bootstrap-test.*) rm -rf "$test_tmp" ;;
+  esac
+}
+trap cleanup 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+printf '1..89\n'
+
+if [ -x "$bootstrap" ]; then
+  pass 'bootstrap is executable'
+else
+  fail 'bootstrap is executable'
+fi
+
+run_capture "$test_tmp/help" "$bootstrap" --help
+if [ "$run_status" -eq 0 ]; then
+  pass '--help exits successfully'
+else
+  fail '--help exits successfully'
+fi
+help_output=$(cat "$test_tmp/help")
+require_contains "$help_output" 'bootstrap [--apply]' '--help documents apply mode'
+require_contains "$help_output" '--rollback (latest|RUN_ID)' '--help documents rollback mode'
+require_contains "$help_output" '--allow-community-packages' '--help documents community package gate'
+
+run_capture "$test_tmp/invalid" "$bootstrap" --unknown-option
+if [ "$run_status" -eq 2 ]; then
+  pass 'unknown options use the usage exit status'
+else
+  fail 'unknown options use the usage exit status'
+fi
+
+linux_output=$(
+  HOME="$test_tmp/linux-home" \
+    XDG_STATE_HOME="$test_tmp/linux-state" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=pacman \
+    "$bootstrap"
+)
+require_contains "$linux_output" 'Mode: dry-run' 'no arguments select dry-run mode'
+require_contains "$linux_output" 'Platform: linux' 'Linux platform is reported'
+require_contains "$linux_output" 'Package manager: pacman' 'pacman backend is reported'
+require_contains "$linux_output" '.config/tmux/conf/platform/linux.conf' 'Linux plan includes Linux tmux adapter'
+require_excludes "$linux_output" '.config/tmux/conf/platform/macos.conf' 'Linux plan excludes macOS tmux adapter'
+require_excludes "$linux_output" 'Library/Application Support/com.mitchellh.ghostty/config.ghostty' 'Linux plan excludes macOS Ghostty entrypoint'
+
+require_contains "$linux_output" 'install pacman neovim' 'pacman plan includes Neovim'
+require_contains "$linux_output" 'install pacman ghostty' 'pacman plan includes Ghostty'
+require_contains "$linux_output" 'install pacman ttf-space-mono-nerd' 'pacman plan includes the configured font'
+require_contains "$linux_output" 'manual sudo pacman -Syu --needed' 'pacman plan requires an explicit full upgrade'
+require_contains "$linux_output" 'install upstream herdr' 'pacman plan uses the official Herdr installer'
+
+apt_output=$(
+  HOME="$test_tmp/apt-home" \
+    XDG_STATE_HOME="$test_tmp/apt-state" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+    DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=0 \
+    "$bootstrap"
+)
+require_contains "$apt_output" 'install apt git' 'apt plan includes Git'
+require_contains "$apt_output" 'install upstream neovim >=0.12.0' 'apt plan preserves the Neovim version floor'
+require_contains "$apt_output" 'install upstream herdr' 'apt plan uses the official Herdr installer'
+require_contains "$apt_output" 'blocked community ghostty' 'apt plan blocks community Ghostty without consent'
+
+apt_community_output=$(
+  HOME="$test_tmp/apt-community-home" \
+    XDG_STATE_HOME="$test_tmp/apt-community-state" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+    DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=0 \
+    "$bootstrap" --allow-community-packages
+)
+require_contains "$apt_community_output" 'install community ghostty' 'apt plan includes community Ghostty after explicit consent'
+
+apt_official_output=$(
+  HOME="$test_tmp/apt-official-home" \
+    XDG_STATE_HOME="$test_tmp/apt-official-state" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+    DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+    "$bootstrap"
+)
+if printf '%s\n' "$apt_official_output" | grep -Fq 'install apt ghostty' \
+  && ! printf '%s\n' "$apt_official_output" | grep -Fq 'blocked community ghostty'; then
+  pass 'apt plan prefers an available official Ghostty package'
+else
+  fail 'apt plan prefers an available official Ghostty package'
+fi
+
+macos_output=$(
+  HOME="$test_tmp/macos-home" \
+    XDG_STATE_HOME="$test_tmp/macos-state" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+    "$bootstrap"
+)
+require_contains "$macos_output" '.config/tmux/conf/platform/macos.conf' 'macOS plan includes macOS tmux adapter'
+require_contains "$macos_output" 'install homebrew-formula neovim' 'Homebrew plan includes Neovim formula'
+require_contains "$macos_output" 'install homebrew-cask ghostty' 'Homebrew plan includes Ghostty cask'
+require_excludes "$macos_output" '.config/tmux/conf/platform/linux.conf' 'macOS plan excludes Linux tmux adapter'
+
+if [ ! -e "$test_tmp/linux-home" ] && [ ! -e "$test_tmp/linux-state" ]; then
+  pass 'dry-run creates no persistent home or state paths'
+else
+  fail 'dry-run creates no persistent home or state paths'
+fi
+
+apt_blocked_log=$test_tmp/apt-blocked.commands
+run_capture "$test_tmp/apt-blocked.output" env \
+  HOME="$test_tmp/apt-blocked-home" \
+  XDG_STATE_HOME="$test_tmp/apt-blocked-state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+  DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=0 \
+  DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$apt_blocked_log" \
+  "$bootstrap" --apply
+if [ "$run_status" -eq 4 ]; then
+  pass 'apt apply blocks before changes when community consent is missing'
+else
+  fail 'apt apply blocks before changes when community consent is missing'
+fi
+apt_blocked_output=$(cat "$test_tmp/apt-blocked.output")
+require_contains "$apt_blocked_output" '--allow-community-packages' 'apt block explains the community package flag'
+if [ ! -e "$apt_blocked_log" ]; then
+  pass 'blocked apt apply executes no package commands'
+else
+  fail 'blocked apt apply executes no package commands'
+fi
+
+apt_apply_log=$test_tmp/apt-apply.commands
+run_capture "$test_tmp/apt-apply.output" env \
+  HOME="$test_tmp/apt-apply-home" \
+  XDG_STATE_HOME="$test_tmp/apt-apply-state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+  DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=0 \
+  DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$apt_apply_log" \
+  "$bootstrap" --apply --allow-community-packages
+if [ "$run_status" -eq 0 ]; then
+  pass 'apt package phase succeeds with explicit community consent'
+else
+  fail 'apt package phase succeeds with explicit community consent'
+fi
+apt_apply_commands=$(cat "$apt_apply_log" 2>/dev/null || true)
+require_contains "$apt_apply_commands" 'sudo apt-get update' 'apt package phase refreshes indexes only during apply'
+require_contains "$apt_apply_commands" 'sudo apt-get install -y --no-install-recommends --no-remove' 'apt package install refuses removals'
+require_contains "$apt_apply_commands" 'direct-install neovim' 'apt package phase installs supported Neovim upstream'
+require_contains "$apt_apply_commands" 'community-installer ghostty' 'apt package phase records the consented Ghostty installer'
+
+pacman_apply_log=$test_tmp/pacman-apply.commands
+run_capture "$test_tmp/pacman-apply.output" env \
+  HOME="$test_tmp/pacman-apply-home" \
+  XDG_STATE_HOME="$test_tmp/pacman-apply-state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=pacman \
+  DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+  DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$pacman_apply_log" \
+  "$bootstrap" --apply
+if [ "$run_status" -eq 4 ]; then
+  pass 'pacman apply stops for the user-managed full upgrade'
+else
+  fail 'pacman apply stops for the user-managed full upgrade'
+fi
+if [ ! -e "$pacman_apply_log" ]; then
+  pass 'pacman policy stop executes no package command'
+else
+  fail 'pacman policy stop executes no package command'
+fi
+
+brew_apply_log=$test_tmp/brew-apply.commands
+run_capture "$test_tmp/brew-apply.output" env \
+  HOME="$test_tmp/brew-apply-home" \
+  XDG_STATE_HOME="$test_tmp/brew-apply-state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+  DOTFILES_BOOTSTRAP_TEST_BREW_MISSING=1 \
+  DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$brew_apply_log" \
+  "$bootstrap" --apply
+if [ "$run_status" -eq 0 ]; then
+  pass 'Homebrew package phase succeeds in the command harness'
+else
+  fail 'Homebrew package phase succeeds in the command harness'
+fi
+brew_apply_commands=$(cat "$brew_apply_log" 2>/dev/null || true)
+require_contains "$brew_apply_commands" 'pinned-installer homebrew a34ae4ee9151cbce4c3b33bca7043a972b7ae9a5' 'Homebrew bootstrap uses the pinned installer revision'
+require_contains "$brew_apply_commands" 'brew install neovim' 'Homebrew package phase installs missing formulae'
+require_contains "$brew_apply_commands" 'brew install --cask ghostty' 'Homebrew package phase installs missing casks'
+
+fixture_work=$test_tmp/fixture-work
+fixture_repo=$test_tmp/fixture.git
+mkdir -p "$fixture_work/.config" "$fixture_work/Library/Application Support/com.mitchellh.ghostty"
+mkdir -p "$fixture_work/.local/bin"
+cp -R "$dotfiles_dir" "$fixture_work/.config/dotfiles"
+cp "$workspace_root/.local/bin/t" "$fixture_work/.local/bin/t"
+cp -R \
+  "$workspace_root/.config/ghostty" \
+  "$workspace_root/.config/herdr" \
+  "$workspace_root/.config/nvim" \
+  "$workspace_root/.config/tmux" \
+  "$fixture_work/.config/"
+cp "$workspace_root/Library/Application Support/com.mitchellh.ghostty/config.ghostty" \
+  "$fixture_work/Library/Application Support/com.mitchellh.ghostty/config.ghostty"
+printf '%s\n' 'fixture nvim' >"$fixture_work/.config/nvim/init.lua"
+printf '%s\n' 'fixture tmux' >"$fixture_work/.config/tmux/tmux.conf"
+printf '%s\n' 'fixture linux' >"$fixture_work/.config/tmux/conf/platform/linux.conf"
+printf '%s\n' 'fixture macos' >"$fixture_work/.config/tmux/conf/platform/macos.conf"
+printf '%s\n' 'fixture shared ghostty' >"$fixture_work/.config/ghostty/config.ghostty"
+printf '%s\n' 'fixture linux ghostty' >"$fixture_work/.config/ghostty/platform-linux.ghostty"
+printf '%s\n' 'fixture macos ghostty' >"$fixture_work/.config/ghostty/platform-macos.ghostty"
+printf '%s\n' 'fixture macos entrypoint' \
+  >"$fixture_work/Library/Application Support/com.mitchellh.ghostty/config.ghostty"
+printf '%s\n' 'excluded fixture documentation' >"$fixture_work/README.md"
+git -C "$fixture_work" init -q -b main
+git -C "$fixture_work" config user.name 'Bootstrap Test'
+git -C "$fixture_work" config user.email bootstrap-test@example.invalid
+git -C "$fixture_work" add .
+git -C "$fixture_work" commit -qm fixture
+git clone -q --bare "$fixture_work" "$fixture_repo"
+
+transaction_home=$test_tmp/transaction-home
+transaction_state=$test_tmp/transaction-state
+mkdir -p "$transaction_home/.config/nvim" "$transaction_home/.config/tmux" "$transaction_home/.local/share"
+printf '%s\n' 'original nvim' >"$transaction_home/.config/nvim/init.lua"
+printf '%s\n' 'keep local-only' >"$transaction_home/.config/nvim/local-only.lua"
+printf '%s\n' 'original tmux target' >"$transaction_home/.local/share/original-tmux.conf"
+ln -s "$transaction_home/.local/share/original-tmux.conf" "$transaction_home/.config/tmux/tmux.conf"
+run_capture "$test_tmp/transaction-apply.output" env \
+  HOME="$transaction_home" \
+  XDG_STATE_HOME="$transaction_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_RUN_ID=transaction-success \
+  "$bootstrap" --apply --repo "$fixture_repo" --ref main
+if [ "$run_status" -eq 0 ]; then
+  pass 'transactional configuration apply succeeds'
+else
+  fail 'transactional configuration apply succeeds'
+  sed 's/^/  /' "$test_tmp/transaction-apply.output" >&2
+fi
+transaction_run=$transaction_state/dotfiles-bootstrap/transaction-success
+if [ "$(cat "$transaction_run/backup/.config/nvim/init.lua" 2>/dev/null || true)" = 'original nvim' ]; then
+  pass 'conflicting file is automatically backed up'
+else
+  fail 'conflicting file is automatically backed up'
+fi
+if [ -L "$transaction_run/backup/.config/tmux/tmux.conf" ]; then
+  pass 'conflicting symlink is backed up without dereferencing it'
+else
+  fail 'conflicting symlink is backed up without dereferencing it'
+fi
+if [ "$(cat "$transaction_home/.config/nvim/init.lua" 2>/dev/null || true)" = 'fixture nvim' ] \
+  && [ ! -L "$transaction_home/.config/tmux/tmux.conf" ]; then
+  pass 'selected repository configuration replaces conflicts'
+else
+  fail 'selected repository configuration replaces conflicts'
+fi
+if [ "$(cat "$transaction_home/.config/nvim/local-only.lua" 2>/dev/null || true)" = 'keep local-only' ]; then
+  pass 'untracked local files under selected directories are preserved'
+else
+  fail 'untracked local files under selected directories are preserved'
+fi
+if [ "$(cat "$transaction_run/status" 2>/dev/null || true)" = complete ] \
+  && [ "$(cat "$transaction_state/dotfiles-bootstrap/latest" 2>/dev/null || true)" = transaction-success ]; then
+  pass 'completed transaction and latest run are journaled'
+else
+  fail 'completed transaction and latest run are journaled'
+fi
+
+run_capture "$test_tmp/transaction-rollback.output" env \
+  HOME="$transaction_home" \
+  XDG_STATE_HOME="$transaction_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  "$bootstrap" --rollback transaction-success
+if [ "$run_status" -eq 0 ]; then
+  pass 'manual rollback by run ID succeeds'
+else
+  fail 'manual rollback by run ID succeeds'
+fi
+if [ "$(cat "$transaction_home/.config/nvim/init.lua" 2>/dev/null || true)" = 'original nvim' ]; then
+  pass 'rollback restores the original conflicting file'
+else
+  fail 'rollback restores the original conflicting file'
+fi
+if [ -L "$transaction_home/.config/tmux/tmux.conf" ] \
+  && [ "$(readlink "$transaction_home/.config/tmux/tmux.conf")" = "$transaction_home/.local/share/original-tmux.conf" ]; then
+  pass 'rollback restores the original symlink'
+else
+  fail 'rollback restores the original symlink'
+fi
+if [ ! -e "$transaction_home/.config/tmux/conf/platform/linux.conf" ] \
+  && [ ! -e "$transaction_home/.cfg" ]; then
+  pass 'rollback removes newly deployed files and repository metadata'
+else
+  fail 'rollback removes newly deployed files and repository metadata'
+fi
+if [ "$(cat "$transaction_home/.config/nvim/local-only.lua" 2>/dev/null || true)" = 'keep local-only' ]; then
+  pass 'rollback preserves unrelated local files'
+else
+  fail 'rollback preserves unrelated local files'
+fi
+rollback_output=$(cat "$test_tmp/transaction-rollback.output")
+require_contains "$rollback_output" 'Packages are not uninstalled' 'rollback reports that package changes are retained'
+
+run_capture "$test_tmp/transaction-rollback-again.output" env \
+  HOME="$transaction_home" \
+  XDG_STATE_HOME="$transaction_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  "$bootstrap" --rollback transaction-success
+if [ "$run_status" -eq 0 ]; then
+  pass 'repeating a completed rollback is idempotent'
+else
+  fail 'repeating a completed rollback is idempotent'
+fi
+
+latest_home=$test_tmp/latest-home
+latest_state=$test_tmp/latest-state
+run_capture "$test_tmp/latest-apply.output" env \
+  HOME="$latest_home" \
+  XDG_STATE_HOME="$latest_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_RUN_ID=latest-success \
+  "$bootstrap" --apply --repo "$fixture_repo" --ref main
+run_capture "$test_tmp/latest-rollback.output" env \
+  HOME="$latest_home" \
+  XDG_STATE_HOME="$latest_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  "$bootstrap" --rollback latest
+if [ "$run_status" -eq 0 ]; then
+  pass 'rollback latest resolves and restores the newest run'
+else
+  fail 'rollback latest resolves and restores the newest run'
+fi
+if [ ! -e "$latest_home/.cfg" ] && [ ! -e "$latest_home/.config/nvim/init.lua" ]; then
+  pass 'latest rollback removes files created in a fresh home'
+else
+  fail 'latest rollback removes files created in a fresh home'
+fi
+
+parent_home=$test_tmp/parent-home
+parent_state=$test_tmp/parent-state
+mkdir -p "$parent_home/.config"
+printf '%s\n' 'original blocking parent' >"$parent_home/.config/tmux"
+run_capture "$test_tmp/parent-apply.output" env \
+  HOME="$parent_home" \
+  XDG_STATE_HOME="$parent_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_RUN_ID=parent-conflict \
+  "$bootstrap" --apply --repo "$fixture_repo" --ref main
+if [ "$run_status" -eq 0 ]; then
+  pass 'apply backs up a non-directory parent blocking selected files'
+else
+  fail 'apply backs up a non-directory parent blocking selected files'
+fi
+if [ "$(cat "$parent_state/dotfiles-bootstrap/parent-conflict/backup/.config/tmux" 2>/dev/null || true)" = 'original blocking parent' ]; then
+  pass 'blocking parent is retained in the transaction backup'
+else
+  fail 'blocking parent is retained in the transaction backup'
+fi
+run_capture "$test_tmp/parent-rollback.output" env \
+  HOME="$parent_home" \
+  XDG_STATE_HOME="$parent_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  "$bootstrap" --rollback parent-conflict
+if [ "$(cat "$parent_home/.config/tmux" 2>/dev/null || true)" = 'original blocking parent' ]; then
+  pass 'rollback restores a blocking parent conflict'
+else
+  fail 'rollback restores a blocking parent conflict'
+fi
+
+failure_home=$test_tmp/failure-home
+failure_state=$test_tmp/failure-state
+mkdir -p "$failure_home/.config/nvim"
+printf '%s\n' 'failure original' >"$failure_home/.config/nvim/init.lua"
+run_capture "$test_tmp/failure-apply.output" env \
+  HOME="$failure_home" \
+  XDG_STATE_HOME="$failure_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_RUN_ID=forced-failure \
+  DOTFILES_BOOTSTRAP_TEST_FAIL_AFTER_CHECKOUT=1 \
+  "$bootstrap" --apply --repo "$fixture_repo" --ref main
+if [ "$run_status" -ne 0 ]; then
+  pass 'a forced post-checkout failure exits unsuccessfully'
+else
+  fail 'a forced post-checkout failure exits unsuccessfully'
+fi
+if [ "$(cat "$failure_home/.config/nvim/init.lua" 2>/dev/null || true)" = 'failure original' ] \
+  && [ ! -e "$failure_home/.cfg" ]; then
+  pass 'failure trap automatically restores configuration and metadata'
+else
+  fail 'failure trap automatically restores configuration and metadata'
+fi
+if [ "$(cat "$failure_state/dotfiles-bootstrap/forced-failure/status" 2>/dev/null || true)" = rolled-back ]; then
+  pass 'automatic rollback is recorded in the transaction journal'
+else
+  fail 'automatic rollback is recorded in the transaction journal'
+fi
+
+signal_home=$test_tmp/signal-home
+signal_state=$test_tmp/signal-state
+mkdir -p "$signal_home/.config/nvim"
+printf '%s\n' 'signal original' >"$signal_home/.config/nvim/init.lua"
+run_capture "$test_tmp/signal-apply.output" env \
+  HOME="$signal_home" \
+  XDG_STATE_HOME="$signal_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_RUN_ID=forced-signal \
+  DOTFILES_BOOTSTRAP_TEST_SIGNAL_AFTER_CHECKOUT=TERM \
+  "$bootstrap" --apply --repo "$fixture_repo" --ref main
+if [ "$run_status" -eq 143 ]; then
+  pass 'termination signal preserves the conventional exit status'
+else
+  fail 'termination signal preserves the conventional exit status'
+fi
+if [ "$(cat "$signal_home/.config/nvim/init.lua" 2>/dev/null || true)" = 'signal original' ] \
+  && [ ! -e "$signal_home/.cfg" ]; then
+  pass 'termination trap automatically restores configuration and metadata'
+else
+  fail 'termination trap automatically restores configuration and metadata'
+fi
+
+dry_conflict_home=$test_tmp/dry-conflict-home
+dry_conflict_state=$test_tmp/dry-conflict-state
+mkdir -p "$dry_conflict_home/.config/nvim"
+printf '%s\n' 'dry-run conflict' >"$dry_conflict_home/.config/nvim/init.lua"
+run_capture "$test_tmp/dry-conflict.output" env \
+  HOME="$dry_conflict_home" \
+  XDG_STATE_HOME="$dry_conflict_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_PREPARE_DRY_RUN=1 \
+  "$bootstrap" --repo "$fixture_repo" --ref main
+if [ "$run_status" -eq 0 ]; then
+  pass 'repository-aware dry-run succeeds'
+else
+  fail 'repository-aware dry-run succeeds'
+fi
+dry_conflict_output=$(cat "$test_tmp/dry-conflict.output")
+require_contains "$dry_conflict_output" 'conflict .config/nvim/init.lua' 'dry-run reports an existing selected-file conflict'
+if [ ! -e "$dry_conflict_home/.cfg" ] && [ ! -e "$dry_conflict_state" ]; then
+  pass 'repository-aware dry-run creates no persistent repository or state data'
+else
+  fail 'repository-aware dry-run creates no persistent repository or state data'
+fi
+
+lifecycle_home=$test_tmp/lifecycle-home
+lifecycle_state=$test_tmp/lifecycle-state
+run_capture "$test_tmp/lifecycle-apply.output" env \
+  HOME="$lifecycle_home" \
+  XDG_STATE_HOME="$lifecycle_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_RUN_ID=lifecycle-linux \
+  "$bootstrap" --apply --repo "$fixture_repo" --ref main
+if [ "$run_status" -eq 0 ]; then
+  pass 'Linux end-to-end sparse deployment succeeds'
+else
+  fail 'Linux end-to-end sparse deployment succeeds'
+fi
+if [ ! -e "$lifecycle_home/.config/tmux/conf/platform/macos.conf" ] \
+  && [ ! -e "$lifecycle_home/Library/Application Support/com.mitchellh.ghostty/config.ghostty" ] \
+  && [ ! -e "$lifecycle_home/.config/tmux/tests/project-session.sh" ] \
+  && [ ! -e "$lifecycle_home/README.md" ]; then
+  pass 'Linux deployment excludes macOS-only configuration and documentation'
+else
+  fail 'Linux deployment excludes macOS-only configuration and documentation'
+fi
+if [ -L "$lifecycle_home/.local/bin/dotfiles" ] \
+  && [ -x "$lifecycle_home/.config/dotfiles/dotfiles" ]; then
+  pass 'deployment installs the executable dotfiles command link'
+else
+  fail 'deployment installs the executable dotfiles command link'
+fi
+if [ -x "$lifecycle_home/.local/bin/t" ]; then
+  pass 'deployment includes the cross-platform project launcher'
+else
+  fail 'deployment includes the cross-platform project launcher'
+fi
+run_capture "$test_tmp/lifecycle-status.output" env \
+  HOME="$lifecycle_home" \
+  "$lifecycle_home/.local/bin/dotfiles" status --porcelain=v1 --untracked-files=no
+if [ "$run_status" -eq 0 ] && [ ! -s "$test_tmp/lifecycle-status.output" ]; then
+  pass 'installed bare repository reports a clean tracked status'
+else
+  fail 'installed bare repository reports a clean tracked status'
+fi
+lifecycle_sparse_config=$(cat "$lifecycle_home/.cfg/config.worktree" 2>/dev/null || true)
+lifecycle_sparse_paths=$(cat "$lifecycle_home/.cfg/info/sparse-checkout" 2>/dev/null || true)
+if printf '%s\n' "$lifecycle_sparse_config" | grep -Fq 'sparseCheckoutCone = false' \
+  && ! printf '%s\n' "$lifecycle_sparse_paths" | grep -Fq '.config/tmux/conf/platform/macos.conf'; then
+  pass 'installed repository retains exact-file non-cone sparse selection'
+else
+  fail 'installed repository retains exact-file non-cone sparse selection'
+fi
+run_capture "$test_tmp/lifecycle-remote.output" env \
+  HOME="$lifecycle_home" \
+  "$lifecycle_home/.local/bin/dotfiles" remote get-url origin
+if [ "$run_status" -eq 0 ] \
+  && [ "$(cat "$test_tmp/lifecycle-remote.output")" = "$fixture_repo" ]; then
+  pass 'installed repository retains the requested origin URL'
+else
+  fail 'installed repository retains the requested origin URL'
+fi
+
+mac_lifecycle_home=$test_tmp/mac-lifecycle-home
+mac_lifecycle_state=$test_tmp/mac-lifecycle-state
+run_capture "$test_tmp/mac-lifecycle-apply.output" env \
+  HOME="$mac_lifecycle_home" \
+  XDG_STATE_HOME="$mac_lifecycle_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_RUN_ID=lifecycle-macos \
+  "$bootstrap" --apply --repo "$fixture_repo" --ref main
+if [ "$run_status" -eq 0 ]; then
+  pass 'simulated macOS end-to-end sparse deployment succeeds'
+else
+  fail 'simulated macOS end-to-end sparse deployment succeeds'
+fi
+if [ "$(cat "$mac_lifecycle_home/.config/tmux/conf/platform/macos.conf" 2>/dev/null || true)" = 'fixture macos' ] \
+  && [ "$(cat "$mac_lifecycle_home/Library/Application Support/com.mitchellh.ghostty/config.ghostty" 2>/dev/null || true)" = 'fixture macos entrypoint' ]; then
+  pass 'macOS deployment includes macOS-only configuration'
+else
+  fail 'macOS deployment includes macOS-only configuration'
+fi
+if [ ! -e "$mac_lifecycle_home/.config/tmux/conf/platform/linux.conf" ] \
+  && [ ! -e "$mac_lifecycle_home/.config/tmux/tests/project-session.sh" ] \
+  && [ ! -e "$mac_lifecycle_home/README.md" ]; then
+  pass 'macOS deployment excludes Linux-only configuration and documentation'
+else
+  fail 'macOS deployment excludes Linux-only configuration and documentation'
+fi
+run_capture "$test_tmp/mac-lifecycle-status.output" env \
+  HOME="$mac_lifecycle_home" \
+  "$mac_lifecycle_home/.local/bin/dotfiles" status --porcelain=v1 --untracked-files=no
+if [ "$run_status" -eq 0 ] && [ ! -s "$test_tmp/mac-lifecycle-status.output" ]; then
+  pass 'simulated macOS bare repository reports a clean tracked status'
+else
+  fail 'simulated macOS bare repository reports a clean tracked status'
+fi
+
+printf '%s\n' 'fixture nvim updated' >"$fixture_work/.config/nvim/init.lua"
+git -C "$fixture_work" add .config/nvim/init.lua
+git -C "$fixture_work" commit -qm update
+git -C "$fixture_work" remote add fixture-origin "$fixture_repo"
+git -C "$fixture_work" push -q fixture-origin main
+run_capture "$test_tmp/lifecycle-pull.output" env \
+  HOME="$lifecycle_home" \
+  "$lifecycle_home/.local/bin/dotfiles" pull --ff-only
+if [ "$run_status" -eq 0 ]; then
+  pass 'installed bare repository supports a standard fast-forward pull'
+else
+  fail 'installed bare repository supports a standard fast-forward pull'
+fi
+if [ "$(cat "$lifecycle_home/.config/nvim/init.lua" 2>/dev/null || true)" = 'fixture nvim updated' ]; then
+  pass 'fast-forward pull updates selected configuration'
+else
+  fail 'fast-forward pull updates selected configuration'
+fi
+if [ ! -e "$lifecycle_home/.config/tmux/conf/platform/macos.conf" ] \
+  && [ ! -e "$lifecycle_home/README.md" ]; then
+  pass 'fast-forward pull preserves Linux platform isolation'
+else
+  fail 'fast-forward pull preserves Linux platform isolation'
+fi
+
+standalone_bootstrap=$test_tmp/standalone-bootstrap
+cp "$bootstrap" "$standalone_bootstrap"
+standalone_dry_home=$test_tmp/standalone-dry-home
+standalone_dry_state=$test_tmp/standalone-dry-state
+run_capture "$test_tmp/standalone-dry.output" env \
+  HOME="$standalone_dry_home" \
+  XDG_STATE_HOME="$standalone_dry_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  /bin/sh "$standalone_bootstrap" --repo "$fixture_repo" --ref main
+if [ "$run_status" -eq 0 ]; then
+  pass 'standalone downloaded bootstrap supports dry-run'
+else
+  fail 'standalone downloaded bootstrap supports dry-run'
+fi
+standalone_dry_output=$(cat "$test_tmp/standalone-dry.output")
+if printf '%s\n' "$standalone_dry_output" | grep -Fq '.config/tmux/conf/platform/linux.conf' \
+  && printf '%s\n' "$standalone_dry_output" | grep -Fq 'install apt git'; then
+  pass 'standalone bootstrap fetches platform and package manifests'
+else
+  fail 'standalone bootstrap fetches platform and package manifests'
+fi
+
+standalone_home=$test_tmp/standalone-home
+standalone_state=$test_tmp/standalone-state
+run_capture "$test_tmp/standalone-apply.output" env \
+  HOME="$standalone_home" \
+  XDG_STATE_HOME="$standalone_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_RUN_ID=standalone-linux \
+  /bin/sh "$standalone_bootstrap" --apply --repo "$fixture_repo" --ref main
+if [ "$run_status" -eq 0 ]; then
+  pass 'standalone downloaded bootstrap completes a bare deployment'
+else
+  fail 'standalone downloaded bootstrap completes a bare deployment'
+fi
+if [ -d "$standalone_home/.cfg" ] \
+  && [ -x "$standalone_home/.local/bin/dotfiles" ] \
+  && [ ! -e "$standalone_home/.config/tmux/conf/platform/macos.conf" ] \
+  && [ ! -e "$standalone_home/README.md" ]; then
+  pass 'standalone deployment preserves Linux platform isolation'
+else
+  fail 'standalone deployment preserves Linux platform isolation'
+fi
+
+package_report_home=$test_tmp/package-report-home
+package_report_state=$test_tmp/package-report-state
+package_report_log=$test_tmp/package-report.commands
+run_capture "$test_tmp/package-report-apply.output" env \
+  HOME="$package_report_home" \
+  XDG_STATE_HOME="$package_report_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+  DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=0 \
+  DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$package_report_log" \
+  DOTFILES_BOOTSTRAP_TEST_RUN_ID=package-report \
+  "$bootstrap" --apply --allow-community-packages --repo "$fixture_repo" --ref main
+if [ "$run_status" -eq 0 ]; then
+  pass 'configuration transaction succeeds after simulated package installation'
+else
+  fail 'configuration transaction succeeds after simulated package installation'
+fi
+package_report=$(cat "$package_report_state/dotfiles-bootstrap/package-report/packages-retained.txt" 2>/dev/null || true)
+if printf '%s\n' "$package_report" | grep -Fq 'apt git' \
+  && printf '%s\n' "$package_report" | grep -Fq 'direct neovim' \
+  && printf '%s\n' "$package_report" | grep -Fq 'community ghostty'; then
+  pass 'transaction journals every package installation path'
+else
+  fail 'transaction journals every package installation path'
+fi
+run_capture "$test_tmp/package-report-rollback.output" env \
+  HOME="$package_report_home" \
+  XDG_STATE_HOME="$package_report_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  "$bootstrap" --rollback package-report
+package_rollback_output=$(cat "$test_tmp/package-report-rollback.output")
+if [ "$run_status" -eq 0 ] \
+  && printf '%s\n' "$package_rollback_output" | grep -Fq 'apt git' \
+  && printf '%s\n' "$package_rollback_output" | grep -Fq 'community ghostty'; then
+  pass 'rollback reports the retained package actions by name'
+else
+  fail 'rollback reports the retained package actions by name'
+fi
+
+if [ "$failures" -ne 0 ]; then
+  printf '# %d test(s) failed\n' "$failures" >&2
+  exit 1
+fi
+
+printf '# all %d tests passed\n' "$tests"

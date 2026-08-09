@@ -1,0 +1,10 @@
+# tool platform architecture version archive URL sha256
+neovim	linux	x86_64	0.12.4	tar.gz	https://github.com/neovim/neovim/releases/download/v0.12.4/nvim-linux-x86_64.tar.gz	012bf3fcac5ade43914df3f174668bf64d05e049a4f032a388c027b1ebd78628
+neovim	linux	arm64	0.12.4	tar.gz	https://github.com/neovim/neovim/releases/download/v0.12.4/nvim-linux-arm64.tar.gz	ceb7e88c6b681f0515d135dcdfad54f5eb4373b25ce6172197cd9a69c758063f
+stylua	linux	x86_64	2.5.2	zip	https://github.com/JohnnyMorganz/StyLua/releases/download/v2.5.2/stylua-linux-x86_64-musl.zip	ca6f1cf52eaf69e6632b81acef9c197aa24b85eb30d2455a35e7dbe28ae77c72
+stylua	linux	arm64	2.5.2	zip	https://github.com/JohnnyMorganz/StyLua/releases/download/v2.5.2/stylua-linux-aarch64-musl.zip	b948df6b4bae41af9a70948174372f96a3c14d44e3e017288701539f3db8fb75
+tree-sitter	linux	x86_64	0.26.9	gzip	https://github.com/tree-sitter/tree-sitter/releases/download/v0.26.9/tree-sitter-linux-x64.gz	9ce82137caa65864e7ca8b869fd391cef88c9bd2a01c4371b9c4dd26c2585efb
+tree-sitter	linux	arm64	0.26.9	gzip	https://github.com/tree-sitter/tree-sitter/releases/download/v0.26.9/tree-sitter-linux-arm64.gz	c8feeb32115958cb44442ca4d68f6d66cf7605dbd65681e62342181ebdd6db3b
+herdr	linux	x86_64	0.8.0	binary	https://github.com/herdrdev/herdr/releases/download/v0.8.0/herdr-linux-x86_64	b872ea7e40fa2cb17e857ac9b62b1bf26db7b403c622f5d2f3f5b35f6e9acd28
+herdr	linux	arm64	0.8.0	binary	https://github.com/herdrdev/herdr/releases/download/v0.8.0/herdr-linux-aarch64	f647ac66468d9efbc642fe534fb284468f0aea60641606fc008dfc0d82a3ca87
+font-space-mono-nerd	linux	any	3.5.0	tar.xz	https://github.com/ryanoasis/nerd-fonts/releases/download/v3.5.0/SpaceMono.tar.xz	19695ebda56e17762a08e50de3fb6a1ee03a9b7658abe37e7ff33f0a9862e845

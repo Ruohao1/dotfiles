@@ -1,0 +1,13 @@
+ca-certificates
+curl
+git
+tmux
+fzf
+ripgrep
+jq
+shellcheck
+build-essential
+wl-clipboard
+fontconfig
+unzip
+xz-utils

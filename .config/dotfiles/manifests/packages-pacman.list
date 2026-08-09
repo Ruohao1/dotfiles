@@ -1,0 +1,16 @@
+ca-certificates
+curl
+git
+neovim
+tmux
+fzf
+ripgrep
+jq
+shellcheck
+stylua
+tree-sitter-cli
+ghostty
+base-devel
+wl-clipboard
+ttf-space-mono-nerd
+fontconfig

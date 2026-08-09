@@ -1,0 +1,11 @@
+.config/dotfiles
+.config/ghostty/config.ghostty
+.config/ghostty/platform-linux.ghostty
+.config/herdr
+.config/nvim
+.config/tmux/conf/keys.conf
+.config/tmux/conf/options.conf
+.config/tmux/conf/status.conf
+.config/tmux/scripts
+.config/tmux/tmux.conf
+.local/bin/t
