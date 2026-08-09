@@ -98,6 +98,46 @@ local function new(dependencies)
       end
       dependencies.fzf().helptags()
     end,
+    lsp_locations = function()
+      if not check_fzf() then
+        return
+      end
+      dependencies.fzf().lsp_finder({
+        async = true,
+        silent = true,
+        includeDeclaration = false,
+        providers = {
+          { "definitions", prefix = "def " },
+          { "implementations", prefix = "impl" },
+          { "typedefs", prefix = "type" },
+          { "references", prefix = "ref " },
+        },
+      })
+    end,
+    document_symbols = function()
+      if not check_fzf() then
+        return
+      end
+      dependencies.fzf().lsp_document_symbols()
+    end,
+    workspace_symbols = function()
+      if not check_fzf() then
+        return
+      end
+      dependencies.fzf().lsp_live_workspace_symbols()
+    end,
+    document_diagnostics = function()
+      if not check_fzf() then
+        return
+      end
+      dependencies.fzf().diagnostics_document()
+    end,
+    all_diagnostics = function()
+      if not check_fzf() then
+        return
+      end
+      dependencies.fzf().diagnostics_workspace()
+    end,
   }
 end
 
@@ -124,6 +164,11 @@ M.grep = runtime.grep
 M.buffers = runtime.buffers
 M.recent = runtime.recent
 M.help = runtime.help
+M.lsp_locations = runtime.lsp_locations
+M.document_symbols = runtime.document_symbols
+M.workspace_symbols = runtime.workspace_symbols
+M.document_diagnostics = runtime.document_diagnostics
+M.all_diagnostics = runtime.all_diagnostics
 M._test = { new = new }
 
 return M

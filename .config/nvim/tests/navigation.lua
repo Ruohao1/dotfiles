@@ -336,7 +336,18 @@ local function picker_harness(options)
   local root_calls = 0
   local api = {}
 
-  for _, name in ipairs({ "files", "live_grep", "buffers", "oldfiles", "helptags" }) do
+  for _, name in ipairs({
+    "files",
+    "live_grep",
+    "buffers",
+    "oldfiles",
+    "helptags",
+    "lsp_finder",
+    "lsp_document_symbols",
+    "lsp_live_workspace_symbols",
+    "diagnostics_document",
+    "diagnostics_workspace",
+  }) do
     api[name] = function(call_options)
       if options.error_method == name then
         error(options.error_message or "picker exploded")
@@ -386,18 +397,48 @@ local function picker_harness(options)
   }
 end
 
+local expected_lsp_finder_options = {
+  async = true,
+  silent = true,
+  includeDeclaration = false,
+  providers = {
+    { "definitions", prefix = "def " },
+    { "implementations", prefix = "impl" },
+    { "typedefs", prefix = "type" },
+    { "references", prefix = "ref " },
+  },
+}
+
+local function invoke_lsp_pickers(controller)
+  controller.lsp_locations()
+  controller.document_symbols()
+  controller.workspace_symbols()
+  controller.document_diagnostics()
+  controller.all_diagnostics()
+end
+
 local dispatch = picker_harness()
 dispatch.controller.files()
 dispatch.controller.grep()
 dispatch.controller.buffers()
 dispatch.controller.recent()
 dispatch.controller.help()
+invoke_lsp_pickers(dispatch.controller)
 eq(dispatch.calls[1], { name = "files", options = { cwd = "/project" } }, "files dispatch")
 eq(dispatch.calls[2], { name = "live_grep", options = { cwd = "/project" } }, "grep dispatch")
 eq(dispatch.calls[3], { name = "buffers" }, "buffer dispatch has no cwd")
 eq(dispatch.calls[4], { name = "oldfiles" }, "recent dispatch has no cwd")
 eq(dispatch.calls[5], { name = "helptags" }, "help dispatch has no cwd")
-eq(dispatch.counts(), { system = 1, fzf = 5, root = 2 }, "successful dispatch counts")
+eq(
+  dispatch.calls[6],
+  { name = "lsp_finder", options = expected_lsp_finder_options },
+  "LSP locations dispatch"
+)
+eq(dispatch.calls[7], { name = "lsp_document_symbols" }, "document symbols dispatch")
+eq(dispatch.calls[8], { name = "lsp_live_workspace_symbols" }, "workspace symbols dispatch")
+eq(dispatch.calls[9], { name = "diagnostics_document" }, "document diagnostics dispatch")
+eq(dispatch.calls[10], { name = "diagnostics_workspace" }, "all diagnostics dispatch")
+eq(dispatch.counts(), { system = 1, fzf = 10, root = 2 }, "successful dispatch counts")
 
 for _, version_case in ipairs({
   { version = "0.36.0", accepted = true },
@@ -416,8 +457,10 @@ end
 local function assert_guard(options, expected_message, label)
   local harness = picker_harness(options)
   harness.controller.buffers()
+  invoke_lsp_pickers(harness.controller)
   harness.controller.buffers()
-  eq(#harness.calls, 0, label .. " blocks picker")
+  invoke_lsp_pickers(harness.controller)
+  eq(#harness.calls, 0, label .. " blocks pickers")
   eq(#harness.notifications, 1, label .. " notifies once")
   eq(harness.notifications[1].message, expected_message, label .. " message")
   eq(harness.notifications[1].level, vim.log.levels.ERROR, label .. " level")
@@ -499,17 +542,46 @@ no_grep.controller.help()
 eq(no_grep.calls, { { name = "helptags" } }, "missing grep provider blocks only grep")
 eq(no_grep.notifications[1].message, "Live grep requires rg or grep", "missing grep message")
 
+local lsp_only = picker_harness({ available = { fzf = true } })
+invoke_lsp_pickers(lsp_only.controller)
+eq(#lsp_only.calls, 5, "LSP pickers do not require file or grep providers")
+eq(#lsp_only.notifications, 0, "LSP pickers do not emit provider notifications")
+eq(lsp_only.counts(), { system = 1, fzf = 5, root = 0 }, "LSP-only dispatch counts")
+
 local exploding = picker_harness({ error_method = "buffers", error_message = "picker exploded" })
 local picker_ok, picker_error = pcall(exploding.controller.buffers)
 assert(not picker_ok, "unexpected picker error must propagate")
 assert(tostring(picker_error):find("picker exploded", 1, true), "propagated picker error changed")
 
-for _, method in ipairs({ "files", "grep", "buffers", "recent", "help" }) do
-  assert(type(pickers[method]) == "function", "missing public picker " .. method)
+local exploding_lsp = picker_harness({
+  error_method = "lsp_finder",
+  error_message = "LSP picker exploded",
+})
+local lsp_ok, lsp_error = pcall(exploding_lsp.controller.lsp_locations)
+assert(not lsp_ok, "unexpected LSP picker error must propagate")
+assert(tostring(lsp_error):find("LSP picker exploded", 1, true), "LSP picker error changed")
+
+local expected_public_pickers = {
+  "files",
+  "grep",
+  "buffers",
+  "recent",
+  "help",
+  "lsp_locations",
+  "document_symbols",
+  "workspace_symbols",
+  "document_diagnostics",
+  "all_diagnostics",
+  "_test",
+}
+for _, method in ipairs(expected_public_pickers) do
+  if method ~= "_test" then
+    assert(type(pickers[method]) == "function", "missing public picker " .. method)
+  end
 end
 for public_name in pairs(pickers) do
   assert(
-    contains({ "files", "grep", "buffers", "recent", "help", "_test" }, public_name),
+    contains(expected_public_pickers, public_name),
     "unexpected public picker surface " .. tostring(public_name)
   )
 end
@@ -543,13 +615,110 @@ local fzf_keys = {}
 for _, mapping in ipairs(fzf_spec.keys) do
   table.insert(fzf_keys, mapping[1])
 end
-eq(
-  fzf_keys,
-  { "<leader>ff", "<leader>fg", "<leader>fb", "<leader>fr", "<leader>fh" },
-  "FzfLua mapping surface"
-)
+eq(fzf_keys, {
+  "<leader>ff",
+  "<leader>fg",
+  "<leader>fb",
+  "<leader>fr",
+  "<leader>fh",
+  "<leader>fl",
+  "<leader>fs",
+  "<leader>fS",
+  "<leader>fd",
+  "<leader>fD",
+}, "FzfLua mapping surface")
 assert(not contains(fzf_keys, "<leader>fk"), "keymap picker must remain absent")
 assert(not contains(fzf_keys, "<leader>fR"), "resume picker must remain absent")
+
+local expected_fzf_lsp_mappings = {
+  {
+    lhs = "<leader>fl",
+    desc = "LSP locations",
+    picker = "lsp_locations",
+    api = "lsp_finder",
+  },
+  {
+    lhs = "<leader>fs",
+    desc = "Document symbols",
+    picker = "document_symbols",
+    api = "lsp_document_symbols",
+  },
+  {
+    lhs = "<leader>fS",
+    desc = "Workspace symbols",
+    picker = "workspace_symbols",
+    api = "lsp_live_workspace_symbols",
+  },
+  {
+    lhs = "<leader>fd",
+    desc = "Document diagnostics",
+    picker = "document_diagnostics",
+    api = "diagnostics_document",
+  },
+  {
+    lhs = "<leader>fD",
+    desc = "All diagnostics",
+    picker = "all_diagnostics",
+    api = "diagnostics_workspace",
+  },
+}
+
+local fzf_lsp_callbacks = {}
+for _, expected in ipairs(expected_fzf_lsp_mappings) do
+  local matches = {}
+  for _, mapping in ipairs(fzf_spec.keys) do
+    if mapping[1] == expected.lhs then
+      table.insert(matches, mapping)
+    end
+  end
+  eq(#matches, 1, "mapping count for " .. expected.lhs)
+  assert(type(matches[1][2]) == "function", "mapping callback missing for " .. expected.lhs)
+  eq(matches[1].desc, expected.desc, "mapping description for " .. expected.lhs)
+  table.insert(fzf_lsp_callbacks, matches[1][2])
+end
+
+local previous_picker_module = package.loaded["navigation.pickers"]
+local callback_calls = {}
+local fake_picker_module = {}
+for _, expected in ipairs(expected_fzf_lsp_mappings) do
+  local picker_name = expected.picker
+  fake_picker_module[picker_name] = function()
+    table.insert(callback_calls, picker_name)
+  end
+end
+
+package.loaded["navigation.pickers"] = fake_picker_module
+local callbacks_ok, callbacks_error = xpcall(function()
+  for _, callback in ipairs(fzf_lsp_callbacks) do
+    callback()
+  end
+end, debug.traceback)
+package.loaded["navigation.pickers"] = previous_picker_module
+if not callbacks_ok then
+  error(callbacks_error, 0)
+end
+
+eq(callback_calls, {
+  "lsp_locations",
+  "document_symbols",
+  "workspace_symbols",
+  "document_diagnostics",
+  "all_diagnostics",
+}, "FzfLua LSP mapping callbacks")
+
+if package.loaded["lazy"] ~= nil then
+  local installed_fzf = require("fzf-lua")
+  for _, expected in ipairs(expected_fzf_lsp_mappings) do
+    assert(type(installed_fzf[expected.api]) == "function", "missing FzfLua API " .. expected.api)
+    local mapping = vim.fn.maparg(expected.lhs, "n", false, true)
+    assert(
+      type(mapping) == "table" and next(mapping) ~= nil,
+      "missing live mapping " .. expected.lhs
+    )
+    eq(mapping.desc, expected.desc, "live mapping description for " .. expected.lhs)
+  end
+end
+
 eq(fzf_spec.dependencies, { "nvim-mini/mini.icons" }, "FzfLua MiniIcons dependency")
 
 local action_stubs = {

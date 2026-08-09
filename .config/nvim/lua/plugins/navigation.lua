@@ -27,6 +27,11 @@ return {
       { "<leader>fb", picker("buffers"), desc = "Find buffers" },
       { "<leader>fr", picker("recent"), desc = "Recent files" },
       { "<leader>fh", picker("help"), desc = "Help tags" },
+      { "<leader>fl", picker("lsp_locations"), desc = "LSP locations" },
+      { "<leader>fs", picker("document_symbols"), desc = "Document symbols" },
+      { "<leader>fS", picker("workspace_symbols"), desc = "Workspace symbols" },
+      { "<leader>fd", picker("document_diagnostics"), desc = "Document diagnostics" },
+      { "<leader>fD", picker("all_diagnostics"), desc = "All diagnostics" },
     },
     opts = function()
       local actions = require("fzf-lua.actions")
