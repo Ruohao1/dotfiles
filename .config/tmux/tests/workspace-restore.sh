@@ -318,11 +318,23 @@ private_tmux split-window -d -t '=codex-work:1' \
   -c "$test_root/projects/alpha" 'codex 300'
 codex_alpha_pane=$(private_tmux display-message -p -t '=codex-work:1.1' '#{pane_id}')
 codex_beta_pane=$(private_tmux display-message -p -t '=codex-work:1.2' '#{pane_id}')
+wait_attempt=0
+alpha_command=
+beta_command=
+while [ "$wait_attempt" -lt 200 ]; do
+  alpha_command=$(private_tmux display-message -p \
+    -t "$codex_alpha_pane" '#{pane_current_command}')
+  beta_command=$(private_tmux display-message -p \
+    -t "$codex_beta_pane" '#{pane_current_command}')
+  [ "$alpha_command" = codex ] && [ "$beta_command" = codex ] && break
+  sleep 0.01
+  wait_attempt=$((wait_attempt + 1))
+done
 assert_equal codex \
-  "$(private_tmux display-message -p -t "$codex_alpha_pane" '#{pane_current_command}')" \
+  "$alpha_command" \
   "alpha pane command"
 assert_equal codex \
-  "$(private_tmux display-message -p -t "$codex_beta_pane" '#{pane_current_command}')" \
+  "$beta_command" \
   "beta pane command"
 
 alpha_payload='{"session_id":"thr_alpha","transcript_path":"/ignored/a.jsonl","cwd":"/same","hook_event_name":"SessionStart","model":"gpt-5.6-sol","source":"startup"}'

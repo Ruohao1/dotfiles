@@ -227,6 +227,7 @@ mkdir -p "$test_root/projects/alpha" "$test_root/projects/beta"
 "$real_tmux" -S "$socket" link-window -d -s '=alpha:2' -t '=linked:2'
 "$real_tmux" -S "$socket" select-pane -t '=alpha:1.2'
 "$real_tmux" -S "$socket" select-window -t '=alpha:2'
+"$real_tmux" -S "$socket" set-option -wu -t '=alpha:1' automatic-rename
 
 run_workspace save
 if [ "$status" -ne 0 ]; then

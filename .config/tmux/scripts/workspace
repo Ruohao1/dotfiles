@@ -467,7 +467,7 @@ capture_snapshot() {
       1) window_zoomed_json=true ;;
       *) die 'invalid window zoom flag in tmux state' 1 ;;
     esac
-    automatic_rename=$(tmux_run show-options -wqv -t "$window_key" automatic-rename) \
+    automatic_rename=$(tmux_run show-options -Awqv -t "$window_key" automatic-rename) \
       || die 'could not read automatic-rename from tmux' 1
     case $automatic_rename in
       on) automatic_rename_json=true ;;
