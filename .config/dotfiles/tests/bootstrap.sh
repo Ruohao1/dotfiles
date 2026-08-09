@@ -9,6 +9,8 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 dotfiles_dir=$(CDPATH='' cd -- "$script_dir/.." && pwd)
 workspace_root=$(CDPATH='' cd -- "$dotfiles_dir/../.." && pwd)
 bootstrap=$dotfiles_dir/bootstrap
+DOTFILES_BOOTSTRAP_TEST_WINDOW_MANAGER=none
+export DOTFILES_BOOTSTRAP_TEST_WINDOW_MANAGER
 
 failures=0
 tests=0
@@ -72,7 +74,7 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-printf '1..89\n'
+printf '1..115\n'
 
 if [ -x "$bootstrap" ]; then
   pass 'bootstrap is executable'
@@ -271,6 +273,66 @@ require_contains "$brew_apply_commands" 'pinned-installer homebrew a34ae4ee9151c
 require_contains "$brew_apply_commands" 'brew install neovim' 'Homebrew package phase installs missing formulae'
 require_contains "$brew_apply_commands" 'brew install --cask ghostty' 'Homebrew package phase installs missing casks'
 
+i3_apt_apply_log=$test_tmp/i3-apt-apply.commands
+run_capture "$test_tmp/i3-apt-apply.output" env \
+  HOME="$test_tmp/i3-apt-apply-home" \
+  XDG_STATE_HOME="$test_tmp/i3-apt-apply-state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+  DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+  DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$i3_apt_apply_log" \
+  "$bootstrap" --apply --window-manager i3
+if [ "$run_status" -eq 0 ]; then
+  pass 'i3 apt package phase succeeds in the command harness'
+else
+  fail 'i3 apt package phase succeeds in the command harness'
+fi
+i3_apt_apply_commands=$(cat "$i3_apt_apply_log" 2>/dev/null || true)
+require_contains "$i3_apt_apply_commands" 'i3-wm' \
+  'i3 apt profile installs i3-wm in the guarded apt transaction'
+
+hypr_pacman_output=$test_tmp/hypr-pacman-apply.output
+run_capture "$hypr_pacman_output" env \
+  HOME="$test_tmp/hypr-pacman-apply-home" \
+  XDG_STATE_HOME="$test_tmp/hypr-pacman-apply-state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=pacman \
+  DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+  DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+  "$bootstrap" --apply --window-manager hypr
+if [ "$run_status" -eq 4 ]; then
+  pass 'Hyprland pacman profile stops for the user-managed full upgrade'
+else
+  fail 'Hyprland pacman profile stops for the user-managed full upgrade'
+fi
+require_contains "$(cat "$hypr_pacman_output")" 'hyprland' \
+  'Hyprland is included in the single pacman full-upgrade command'
+
+aerospace_brew_apply_log=$test_tmp/aerospace-brew-apply.commands
+run_capture "$test_tmp/aerospace-brew-apply.output" env \
+  HOME="$test_tmp/aerospace-brew-apply-home" \
+  XDG_STATE_HOME="$test_tmp/aerospace-brew-apply-state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+  DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$aerospace_brew_apply_log" \
+  "$bootstrap" --apply --window-manager aerospace
+if [ "$run_status" -eq 0 ]; then
+  pass 'Aerospace Homebrew package phase succeeds in the command harness'
+else
+  fail 'Aerospace Homebrew package phase succeeds in the command harness'
+fi
+aerospace_brew_apply_commands=$(cat "$aerospace_brew_apply_log" 2>/dev/null || true)
+require_contains "$aerospace_brew_apply_commands" \
+  'brew install --cask nikitabobko/tap/aerospace' \
+  'Aerospace profile installs the official tap cask'
+
 fixture_work=$test_tmp/fixture-work
 fixture_repo=$test_tmp/fixture.git
 mkdir -p "$fixture_work/.config" "$fixture_work/Library/Application Support/com.mitchellh.ghostty"
@@ -278,8 +340,11 @@ mkdir -p "$fixture_work/.local/bin"
 cp -R "$dotfiles_dir" "$fixture_work/.config/dotfiles"
 cp "$workspace_root/.local/bin/t" "$fixture_work/.local/bin/t"
 cp -R \
+  "$workspace_root/.config/aerospace" \
   "$workspace_root/.config/ghostty" \
   "$workspace_root/.config/herdr" \
+  "$workspace_root/.config/hypr" \
+  "$workspace_root/.config/i3" \
   "$workspace_root/.config/nvim" \
   "$fixture_work/.config/"
 mkdir -p \
@@ -317,6 +382,210 @@ git -C "$fixture_work" config user.email bootstrap-test@example.invalid
 git -C "$fixture_work" add .
 git -C "$fixture_work" commit -qm fixture
 git clone -q --bare "$fixture_work" "$fixture_repo"
+
+hypr_home=$test_tmp/hypr-home
+hypr_state=$test_tmp/hypr-state
+mkdir -p "$hypr_home/.config/hypr"
+printf '%s\n' 'legacy hypr config' >"$hypr_home/.config/hypr/hyprland.conf"
+printf '%s\n' 'local hypr overrides' >"$hypr_home/.config/hypr/local.lua"
+run_capture "$test_tmp/hypr-dry-run.output" env \
+  HOME="$hypr_home" \
+  XDG_STATE_HOME="$hypr_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=pacman \
+  DOTFILES_BOOTSTRAP_TEST_PREPARE_DRY_RUN=1 \
+  "$bootstrap" --window-manager hypr --repo "$fixture_repo" --ref main
+if [ "$run_status" -eq 0 ]; then
+  pass 'Hyprland repository-aware dry-run succeeds'
+else
+  fail 'Hyprland repository-aware dry-run succeeds'
+fi
+hypr_dry_output=$(cat "$test_tmp/hypr-dry-run.output")
+require_contains "$hypr_dry_output" 'conflict .config/hypr/hyprland.conf' \
+  'Hyprland dry-run reports the legacy entrypoint migration'
+if [ "$(cat "$hypr_home/.config/hypr/hyprland.conf")" = 'legacy hypr config' ] \
+  && [ ! -e "$hypr_home/.cfg" ] \
+  && [ ! -e "$hypr_state" ]; then
+  pass 'Hyprland dry-run leaves the legacy config and state untouched'
+else
+  fail 'Hyprland dry-run leaves the legacy config and state untouched'
+fi
+
+run_capture "$test_tmp/hypr-apply.output" env \
+  HOME="$hypr_home" \
+  XDG_STATE_HOME="$hypr_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=pacman \
+  DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_RUN_ID=window-manager-hypr \
+  "$bootstrap" --apply --window-manager hypr \
+  --repo "$fixture_repo" --ref main
+if [ "$run_status" -eq 0 ]; then
+  pass 'Hyprland transactional profile apply succeeds'
+else
+  fail 'Hyprland transactional profile apply succeeds'
+  sed 's/^/  /' "$test_tmp/hypr-apply.output" >&2
+fi
+hypr_run=$hypr_state/dotfiles-bootstrap/window-manager-hypr
+if cmp -s "$fixture_work/.config/hypr/hyprland.lua" \
+  "$hypr_home/.config/hypr/hyprland.lua" \
+  && [ ! -e "$hypr_home/.config/i3/config" ] \
+  && [ ! -e "$hypr_home/.config/aerospace/aerospace.toml" ]; then
+  pass 'Hyprland apply deploys only the selected manager config'
+else
+  fail 'Hyprland apply deploys only the selected manager config'
+fi
+if [ ! -e "$hypr_home/.config/hypr/hyprland.conf" ] \
+  && [ "$(cat "$hypr_run/backup/.config/hypr/hyprland.conf" 2>/dev/null || true)" = \
+    'legacy hypr config' ]; then
+  pass 'Hyprland apply automatically backs up the legacy entrypoint'
+else
+  fail 'Hyprland apply automatically backs up the legacy entrypoint'
+fi
+if [ "$(cat "$hypr_home/.config/hypr/local.lua")" = 'local hypr overrides' ]; then
+  pass 'Hyprland apply preserves a preexisting machine-local override'
+else
+  fail 'Hyprland apply preserves a preexisting machine-local override'
+fi
+if [ "$(cat "$hypr_run/window-manager" 2>/dev/null || true)" = hypr ]; then
+  pass 'Hyprland transaction records the selected profile'
+else
+  fail 'Hyprland transaction records the selected profile'
+fi
+run_capture "$test_tmp/hypr-rollback.output" env \
+  HOME="$hypr_home" \
+  XDG_STATE_HOME="$hypr_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=pacman \
+  "$bootstrap" --rollback window-manager-hypr
+if [ "$run_status" -eq 0 ]; then
+  pass 'Hyprland profile rollback succeeds'
+else
+  fail 'Hyprland profile rollback succeeds'
+fi
+if [ "$(cat "$hypr_home/.config/hypr/hyprland.conf" 2>/dev/null || true)" = \
+    'legacy hypr config' ] \
+  && [ ! -e "$hypr_home/.config/hypr/hyprland.lua" ] \
+  && [ "$(cat "$hypr_home/.config/hypr/local.lua")" = 'local hypr overrides' ]; then
+  pass 'Hyprland rollback restores legacy config and preserves local overrides'
+else
+  fail 'Hyprland rollback restores legacy config and preserves local overrides'
+fi
+
+i3_home=$test_tmp/i3-home
+i3_state=$test_tmp/i3-state
+run_capture "$test_tmp/i3-apply.output" env \
+  HOME="$i3_home" \
+  XDG_STATE_HOME="$i3_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_RUN_ID=window-manager-i3 \
+  "$bootstrap" --apply --window-manager i3 \
+  --repo "$fixture_repo" --ref main
+if [ "$run_status" -eq 0 ]; then
+  pass 'i3 transactional profile apply succeeds'
+else
+  fail 'i3 transactional profile apply succeeds'
+  sed 's/^/  /' "$test_tmp/i3-apply.output" >&2
+fi
+if cmp -s "$fixture_work/.config/i3/config" "$i3_home/.config/i3/config" \
+  && [ -f "$i3_home/.config/i3/local.conf" ] \
+  && [ ! -e "$i3_home/.config/hypr/hyprland.lua" ] \
+  && [ ! -e "$i3_home/.config/aerospace/aerospace.toml" ]; then
+  pass 'i3 apply creates its config and untracked local override only'
+else
+  fail 'i3 apply creates its config and untracked local override only'
+fi
+run_capture "$test_tmp/i3-rollback.output" env \
+  HOME="$i3_home" \
+  XDG_STATE_HOME="$i3_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  "$bootstrap" --rollback window-manager-i3
+if [ "$run_status" -eq 0 ]; then
+  pass 'i3 profile rollback succeeds'
+else
+  fail 'i3 profile rollback succeeds'
+fi
+if [ ! -e "$i3_home/.config/i3/config" ] \
+  && [ ! -e "$i3_home/.config/i3/local.conf" ]; then
+  pass 'i3 rollback removes the deployed config and generated local override'
+else
+  fail 'i3 rollback removes the deployed config and generated local override'
+fi
+
+aerospace_home=$test_tmp/aerospace-home
+aerospace_state=$test_tmp/aerospace-state
+mkdir -p "$aerospace_home/.config/aerospace"
+printf '%s\n' 'legacy aerospace config' >"$aerospace_home/.aerospace.toml"
+printf '%s\n' '#!/bin/sh' 'echo local aerospace' \
+  >"$aerospace_home/.config/aerospace/local.sh"
+chmod 0700 "$aerospace_home/.config/aerospace/local.sh"
+run_capture "$test_tmp/aerospace-apply.output" env \
+  HOME="$aerospace_home" \
+  XDG_STATE_HOME="$aerospace_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_RUN_ID=window-manager-aerospace \
+  "$bootstrap" --apply --window-manager aerospace \
+  --repo "$fixture_repo" --ref main
+if [ "$run_status" -eq 0 ]; then
+  pass 'Aerospace transactional profile apply succeeds in the macOS simulation'
+else
+  fail 'Aerospace transactional profile apply succeeds in the macOS simulation'
+  sed 's/^/  /' "$test_tmp/aerospace-apply.output" >&2
+fi
+aerospace_run=$aerospace_state/dotfiles-bootstrap/window-manager-aerospace
+if cmp -s "$fixture_work/.config/aerospace/aerospace.toml" \
+  "$aerospace_home/.config/aerospace/aerospace.toml" \
+  && [ ! -e "$aerospace_home/.config/hypr/hyprland.lua" ] \
+  && [ ! -e "$aerospace_home/.config/i3/config" ]; then
+  pass 'Aerospace apply deploys only the selected manager config'
+else
+  fail 'Aerospace apply deploys only the selected manager config'
+fi
+if [ ! -e "$aerospace_home/.aerospace.toml" ] \
+  && [ "$(cat "$aerospace_run/backup/.aerospace.toml" 2>/dev/null || true)" = \
+    'legacy aerospace config' ]; then
+  pass 'Aerospace apply automatically backs up the legacy config location'
+else
+  fail 'Aerospace apply automatically backs up the legacy config location'
+fi
+if grep -Fq 'echo local aerospace' \
+  "$aerospace_home/.config/aerospace/local.sh"; then
+  pass 'Aerospace apply preserves a preexisting machine-local hook'
+else
+  fail 'Aerospace apply preserves a preexisting machine-local hook'
+fi
+run_capture "$test_tmp/aerospace-rollback.output" env \
+  HOME="$aerospace_home" \
+  XDG_STATE_HOME="$aerospace_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  "$bootstrap" --rollback window-manager-aerospace
+if [ "$run_status" -eq 0 ]; then
+  pass 'Aerospace profile rollback succeeds in the macOS simulation'
+else
+  fail 'Aerospace profile rollback succeeds in the macOS simulation'
+fi
+if [ "$(cat "$aerospace_home/.aerospace.toml" 2>/dev/null || true)" = \
+    'legacy aerospace config' ] \
+  && [ ! -e "$aerospace_home/.config/aerospace/aerospace.toml" ] \
+  && grep -Fq 'echo local aerospace' \
+    "$aerospace_home/.config/aerospace/local.sh"; then
+  pass 'Aerospace rollback restores legacy config and preserves its local hook'
+else
+  fail 'Aerospace rollback restores legacy config and preserves its local hook'
+fi
 
 transaction_home=$test_tmp/transaction-home
 transaction_state=$test_tmp/transaction-state
@@ -752,7 +1021,8 @@ run_capture "$test_tmp/package-report-apply.output" env \
   DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=0 \
   DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$package_report_log" \
   DOTFILES_BOOTSTRAP_TEST_RUN_ID=package-report \
-  "$bootstrap" --apply --allow-community-packages --repo "$fixture_repo" --ref main
+  "$bootstrap" --apply --allow-community-packages --window-manager i3 \
+  --repo "$fixture_repo" --ref main
 if [ "$run_status" -eq 0 ]; then
   pass 'configuration transaction succeeds after simulated package installation'
 else
@@ -760,6 +1030,7 @@ else
 fi
 package_report=$(cat "$package_report_state/dotfiles-bootstrap/package-report/packages-retained.txt" 2>/dev/null || true)
 if printf '%s\n' "$package_report" | grep -Fq 'apt git' \
+  && printf '%s\n' "$package_report" | grep -Fq 'apt i3-wm' \
   && printf '%s\n' "$package_report" | grep -Fq 'direct neovim' \
   && printf '%s\n' "$package_report" | grep -Fq 'community ghostty'; then
   pass 'transaction journals every package installation path'
@@ -776,6 +1047,7 @@ run_capture "$test_tmp/package-report-rollback.output" env \
 package_rollback_output=$(cat "$test_tmp/package-report-rollback.output")
 if [ "$run_status" -eq 0 ] \
   && printf '%s\n' "$package_rollback_output" | grep -Fq 'apt git' \
+  && printf '%s\n' "$package_rollback_output" | grep -Fq 'apt i3-wm' \
   && printf '%s\n' "$package_rollback_output" | grep -Fq 'community ghostty'; then
   pass 'rollback reports the retained package actions by name'
 else

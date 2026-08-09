@@ -25,12 +25,14 @@ usage() {
   fi
 
   printf '%s\n' \
-    'usage: bootstrap [--apply] [--allow-community-packages] [--repo URL] [--ref REF]' \
+    'usage: bootstrap [--apply] --window-manager (hypr|i3|aerospace|none)' \
+    '                 [--allow-community-packages] [--repo URL] [--ref REF]' \
     '       bootstrap --rollback (latest|RUN_ID)' \
     '       bootstrap --help' \
     '' \
-    'With no arguments, bootstrap prints a dry-run and makes no persistent changes.' \
+    'Without --apply, bootstrap prints a dry-run and makes no persistent changes.' \
     'Use --apply to install packages and deploy the selected dotfiles.' \
+    'Use --window-manager to make the platform-specific manager choice explicit.' \
     'Use --allow-community-packages to permit the documented Ghostty Ubuntu/Debian installer.' \
     >"$output"
 }
@@ -45,6 +47,7 @@ allow_community_packages=false
 repo_url=https://github.com/Ruohao1/dotfiles.git
 repo_ref=main
 rollback_id=
+window_manager=
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -54,6 +57,11 @@ while [ "$#" -gt 0 ]; do
       ;;
     --allow-community-packages)
       allow_community_packages=true
+      ;;
+    --window-manager)
+      [ "$#" -ge 2 ] || die '--window-manager requires a profile' 2
+      window_manager=$2
+      shift
       ;;
     --repo)
       [ "$#" -ge 2 ] || die '--repo requires a URL' 2
@@ -162,6 +170,40 @@ detect_manager() {
   esac
 }
 
+select_window_manager() {
+  selected_platform=$1
+  selected_manager=$2
+  selected_window_manager=$3
+
+  if [ -z "$selected_window_manager" ] \
+    && [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_WINDOW_MANAGER+set}" = set ]; then
+    selected_window_manager=$DOTFILES_BOOTSTRAP_TEST_WINDOW_MANAGER
+  fi
+
+  [ -n "$selected_window_manager" ] \
+    || die '--window-manager is required: choose hypr, i3, aerospace, or none' 2
+  case "$selected_window_manager" in
+    hypr|i3|aerospace|none) ;;
+    *) die "unsupported window-manager profile: $selected_window_manager" 2 ;;
+  esac
+
+  case "$selected_platform:$selected_manager:$selected_window_manager" in
+    linux:pacman:hypr|linux:pacman:i3|linux:pacman:none|\
+    linux:apt:i3|linux:apt:none|\
+    macos:homebrew:aerospace|macos:homebrew:none)
+      ;;
+    linux:apt:hypr)
+      die 'Hyprland is unsupported through apt; choose i3 or none on apt systems' 2
+      ;;
+    *)
+      die "window-manager $selected_window_manager is invalid for $selected_platform/$selected_manager" 2
+      ;;
+  esac
+
+  window_manager=$selected_window_manager
+}
+
 validate_manifest_path() {
   manifest_path=$1
   case "$manifest_path" in
@@ -191,17 +233,57 @@ emit_manifest() {
 
 emit_selected_paths() {
   selected_platform=$1
-  manifest_root=$2
+  selected_window_manager=$2
+  manifest_root=$3
 
   emit_manifest "$manifest_root/config-common.paths"
   emit_manifest "$manifest_root/config-$selected_platform.paths"
+  window_manager_manifest=$(window_manager_config_manifest \
+    "$selected_window_manager" "$manifest_root")
+  if [ -n "$window_manager_manifest" ]; then
+    emit_manifest "$window_manager_manifest"
+  fi
+}
+
+window_manager_config_manifest() {
+  selected_window_manager=$1
+  manifest_root=$2
+
+  case "$selected_window_manager" in
+    hypr) printf '%s\n' "$manifest_root/config-linux-hypr.paths" ;;
+    i3) printf '%s\n' "$manifest_root/config-linux-i3.paths" ;;
+    aerospace) printf '%s\n' "$manifest_root/config-macos-aerospace.paths" ;;
+    none) ;;
+    *) die "unsupported window-manager config profile: $selected_window_manager" ;;
+  esac
+}
+
+window_manager_package_manifest() {
+  selected_manager=$1
+  selected_window_manager=$2
+  manifest_root=$3
+
+  case "$selected_manager:$selected_window_manager" in
+    pacman:hypr) printf '%s\n' "$manifest_root/packages-pacman-hypr.list" ;;
+    pacman:i3) printf '%s\n' "$manifest_root/packages-pacman-i3.list" ;;
+    apt:i3) printf '%s\n' "$manifest_root/packages-apt-i3.list" ;;
+    homebrew:aerospace)
+      printf '%s\n' "$manifest_root/packages-homebrew-aerospace-casks.list"
+      ;;
+    pacman:none|apt:none|homebrew:none) ;;
+    *)
+      die "unsupported window-manager package profile: $selected_manager/$selected_window_manager"
+      ;;
+  esac
 }
 
 validate_package_name() {
   package_name=$1
   case "$package_name" in
     ''|'#'*) return 1 ;;
-    *[!A-Za-z0-9@+._-]*) die "unsafe package name: $package_name" ;;
+    -*|/*|*/|*..*|*//*|*/./*|*/.|*"
+"*|*""*|*"	"*) die "unsafe package name: $package_name" ;;
+    *[!A-Za-z0-9@+._/-]*) die "unsafe package name: $package_name" ;;
   esac
   return 0
 }
@@ -219,31 +301,43 @@ emit_package_list() {
 }
 
 package_arguments() {
-  package_file=$1
   package_line=
-  while IFS= read -r package_name || [ -n "$package_name" ]; do
-    if validate_package_name "$package_name"; then
-      if [ -n "$package_line" ]; then
-        package_line="$package_line $package_name"
-      else
-        package_line=$package_name
+  for package_file do
+    [ -n "$package_file" ] || continue
+    [ -r "$package_file" ] || die "missing package manifest: $package_file"
+    while IFS= read -r package_name || [ -n "$package_name" ]; do
+      if validate_package_name "$package_name"; then
+        if [ -n "$package_line" ]; then
+          package_line="$package_line $package_name"
+        else
+          package_line=$package_name
+        fi
       fi
-    fi
-  done <"$package_file"
+    done <"$package_file"
+  done
   printf '%s\n' "$package_line"
 }
 
 emit_package_plan() {
   selected_manager=$1
-  manifest_root=$2
+  selected_window_manager=$2
+  manifest_root=$3
+  window_manager_packages=$(window_manager_package_manifest \
+    "$selected_manager" "$selected_window_manager" "$manifest_root")
 
   case "$selected_manager" in
     homebrew)
       emit_package_list homebrew-formula "$manifest_root/packages-homebrew-formulae.list"
       emit_package_list homebrew-cask "$manifest_root/packages-homebrew-casks.list"
+      if [ -n "$window_manager_packages" ]; then
+        emit_package_list homebrew-cask "$window_manager_packages"
+      fi
       ;;
     apt)
       emit_package_list apt "$manifest_root/packages-apt.list"
+      if [ -n "$window_manager_packages" ]; then
+        emit_package_list apt "$window_manager_packages"
+      fi
       printf '%s\n' \
         '  install upstream neovim >=0.12.0' \
         '  install upstream stylua' \
@@ -260,8 +354,12 @@ emit_package_plan() {
       ;;
     pacman)
       emit_package_list pacman "$manifest_root/packages-pacman.list"
+      if [ -n "$window_manager_packages" ]; then
+        emit_package_list pacman "$window_manager_packages"
+      fi
       printf '  manual sudo pacman -Syu --needed %s\n' \
-        "$(package_arguments "$manifest_root/packages-pacman.list")"
+        "$(package_arguments \
+          "$manifest_root/packages-pacman.list" "$window_manager_packages")"
       printf '%s\n' '  install upstream herdr'
       ;;
     *) die "unsupported package manager: $selected_manager" ;;
@@ -671,6 +769,9 @@ activate_homebrew_path() {
 
 install_homebrew_packages() {
   manifest_root=$1
+  selected_window_manager=$2
+  window_manager_packages=$(window_manager_package_manifest \
+    homebrew "$selected_window_manager" "$manifest_root")
   brew_missing=false
   if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
     && [ "${DOTFILES_BOOTSTRAP_TEST_BREW_MISSING:-0}" = 1 ]; then
@@ -699,19 +800,29 @@ install_homebrew_packages() {
     fi
   done <"$manifest_root/packages-homebrew-formulae.list"
 
-  while IFS= read -r package_name || [ -n "$package_name" ]; do
-    validate_package_name "$package_name" || continue
-    if package_is_installed homebrew-cask "$package_name"; then
-      printf '  skip package %s (already installed)\n' "$package_name"
-    else
-      run_command brew install --cask "$package_name" || die "Homebrew cask failed: $package_name"
-      record_package_action homebrew-cask "$package_name"
-    fi
-  done <"$manifest_root/packages-homebrew-casks.list"
+  for homebrew_cask_manifest in \
+    "$manifest_root/packages-homebrew-casks.list" \
+    "$window_manager_packages"
+  do
+    [ -n "$homebrew_cask_manifest" ] || continue
+    while IFS= read -r package_name || [ -n "$package_name" ]; do
+      validate_package_name "$package_name" || continue
+      if package_is_installed homebrew-cask "$package_name"; then
+        printf '  skip package %s (already installed)\n' "$package_name"
+      else
+        run_command brew install --cask "$package_name" \
+          || die "Homebrew cask failed: $package_name"
+        record_package_action homebrew-cask "$package_name"
+      fi
+    done <"$homebrew_cask_manifest"
+  done
 }
 
 install_apt_packages() {
   manifest_root=$1
+  selected_window_manager=$2
+  window_manager_packages=$(window_manager_package_manifest \
+    apt "$selected_window_manager" "$manifest_root")
   ghostty_installed=false
   package_is_installed apt ghostty && ghostty_installed=true
   ghostty_official=false
@@ -725,12 +836,15 @@ install_apt_packages() {
   fi
 
   set --
-  while IFS= read -r package_name || [ -n "$package_name" ]; do
-    validate_package_name "$package_name" || continue
-    if ! package_is_installed apt "$package_name"; then
-      set -- "$@" "$package_name"
-    fi
-  done <"$manifest_root/packages-apt.list"
+  for apt_manifest in "$manifest_root/packages-apt.list" "$window_manager_packages"; do
+    [ -n "$apt_manifest" ] || continue
+    while IFS= read -r package_name || [ -n "$package_name" ]; do
+      validate_package_name "$package_name" || continue
+      if ! package_is_installed apt "$package_name"; then
+        set -- "$@" "$package_name"
+      fi
+    done <"$apt_manifest"
+  done
   if [ "$ghostty_installed" = false ] && [ "$ghostty_official" = true ]; then
     set -- "$@" ghostty
   fi
@@ -763,17 +877,26 @@ install_apt_packages() {
 
 install_pacman_packages() {
   manifest_root=$1
+  selected_window_manager=$2
+  window_manager_packages=$(window_manager_package_manifest \
+    pacman "$selected_window_manager" "$manifest_root")
   missing_packages=
-  while IFS= read -r package_name || [ -n "$package_name" ]; do
-    validate_package_name "$package_name" || continue
-    if ! package_is_installed pacman "$package_name"; then
-      if [ -n "$missing_packages" ]; then
-        missing_packages="$missing_packages $package_name"
-      else
-        missing_packages=$package_name
+  for pacman_manifest in \
+    "$manifest_root/packages-pacman.list" \
+    "$window_manager_packages"
+  do
+    [ -n "$pacman_manifest" ] || continue
+    while IFS= read -r package_name || [ -n "$package_name" ]; do
+      validate_package_name "$package_name" || continue
+      if ! package_is_installed pacman "$package_name"; then
+        if [ -n "$missing_packages" ]; then
+          missing_packages="$missing_packages $package_name"
+        else
+          missing_packages=$package_name
+        fi
       fi
-    fi
-  done <"$manifest_root/packages-pacman.list"
+    done <"$pacman_manifest"
+  done
 
   if [ -n "$missing_packages" ]; then
     printf 'bootstrap: Arch packages are missing. Run this command, then rerun bootstrap:\n' >&2
@@ -786,12 +909,13 @@ install_pacman_packages() {
 
 install_packages() {
   selected_manager=$1
-  manifest_root=$2
+  selected_window_manager=$2
+  manifest_root=$3
   printf '%s\n' 'Applying packages:'
   case "$selected_manager" in
-    homebrew) install_homebrew_packages "$manifest_root" ;;
-    apt) install_apt_packages "$manifest_root" ;;
-    pacman) install_pacman_packages "$manifest_root" ;;
+    homebrew) install_homebrew_packages "$manifest_root" "$selected_window_manager" ;;
+    apt) install_apt_packages "$manifest_root" "$selected_window_manager" ;;
+    pacman) install_pacman_packages "$manifest_root" "$selected_window_manager" ;;
     *) die "unsupported package manager: $selected_manager" ;;
   esac
 }
@@ -918,14 +1042,22 @@ load_remote_manifests() {
   for manifest_name in \
     config-common.paths \
     config-excluded.paths \
+    config-linux-hypr.paths \
+    config-linux-i3.paths \
     config-linux.paths \
+    config-macos-aerospace.paths \
     config-macos.paths \
     installers.tsv \
+    packages-apt-i3.list \
     packages-apt.list \
     packages-direct.tsv \
+    packages-homebrew-aerospace-casks.list \
     packages-homebrew-casks.list \
     packages-homebrew-formulae.list \
-    packages-pacman.list
+    packages-pacman-hypr.list \
+    packages-pacman-i3.list \
+    packages-pacman.list \
+    window-manager-bindings.tsv
   do
     git --git-dir="$manifest_gitdir" show \
       "$manifest_commit:.config/dotfiles/manifests/$manifest_name" \
@@ -937,7 +1069,8 @@ load_remote_manifests() {
 
 prepare_repository() {
   selected_platform=$1
-  manifest_root=$2
+  selected_window_manager=$2
+  manifest_root=$3
   require_git_capabilities
 
   prepared_root=$(temporary_directory) \
@@ -999,7 +1132,9 @@ prepare_repository() {
       || die 'could not configure the local branch upstream'
   fi
 
-  emit_selected_paths "$selected_platform" "$manifest_root" >"$prepared_patterns" \
+  emit_selected_paths \
+    "$selected_platform" "$selected_window_manager" "$manifest_root" \
+    >"$prepared_patterns" \
     || die 'could not write sparse checkout patterns'
   git --git-dir="$prepared_gitdir" --work-tree="$prepared_worktree" \
     checkout --quiet --force "$prepared_branch" \
@@ -1112,6 +1247,7 @@ scan_selected_conflict() {
 }
 
 emit_conflict_plan() {
+  selected_window_manager=$1
   validate_home_directory
   prepared_conflicts=$prepared_root/conflicts.paths
   : >"$prepared_conflicts" \
@@ -1119,6 +1255,10 @@ emit_conflict_plan() {
   printf '%s\n' 'Conflicts to back up during apply:'
   scan_selected_conflict .cfg
   scan_selected_conflict .local/bin/dotfiles
+  case "$selected_window_manager" in
+    hypr) scan_selected_conflict .config/hypr/hyprland.conf ;;
+    aerospace) scan_selected_conflict .aerospace.toml ;;
+  esac
   while IFS= read -r conflict_candidate || [ -n "$conflict_candidate" ]; do
     scan_selected_conflict "$conflict_candidate"
   done <"$prepared_selected_paths"
@@ -1130,6 +1270,7 @@ emit_conflict_plan() {
 begin_transaction() {
   selected_platform=$1
   selected_manager=$2
+  selected_window_manager=$3
   validate_home_directory
   mkdir -p "$HOME" || die "could not create HOME: $HOME"
 
@@ -1163,7 +1304,8 @@ begin_transaction() {
       && printf '%s\n' "$repo_ref" >"$transaction_run/reference" \
       && printf '%s\n' "$prepared_commit" >"$transaction_run/commit" \
       && printf '%s\n' "$selected_platform" >"$transaction_run/platform" \
-      && printf '%s\n' "$selected_manager" >"$transaction_run/package-manager"
+      && printf '%s\n' "$selected_manager" >"$transaction_run/package-manager" \
+      && printf '%s\n' "$selected_window_manager" >"$transaction_run/window-manager"
   } || die 'could not initialize transaction metadata'
   printf '%s\n' \
     'Package changes are retained during rollback.' \
@@ -1276,6 +1418,57 @@ install_dotfiles_wrapper() {
     || die 'could not install ~/.local/bin/dotfiles'
 }
 
+migrate_window_manager_entrypoint() {
+  selected_window_manager=$1
+  case "$selected_window_manager" in
+    hypr) backup_existing_path .config/hypr/hyprland.conf ;;
+    aerospace) backup_existing_path .aerospace.toml ;;
+  esac
+}
+
+create_window_manager_local_override() {
+  selected_window_manager=$1
+  case "$selected_window_manager" in
+    hypr)
+      local_override=.config/hypr/local.lua
+      local_override_kind=hypr
+      ;;
+    i3)
+      local_override=.config/i3/local.conf
+      local_override_kind=i3
+      ;;
+    aerospace)
+      local_override=.config/aerospace/local.sh
+      local_override_kind=aerospace
+      ;;
+    none) return 0 ;;
+  esac
+
+  path_exists "$HOME/$local_override" && return 0
+  ensure_target_parents "$local_override"
+  append_journal_path "$transaction_run/managed.paths" "$local_override"
+  case "$local_override_kind" in
+    hypr)
+      printf '%s\n' '-- Machine-local monitor and device overrides.' \
+        >"$HOME/$local_override"
+      ;;
+    i3)
+      printf '%s\n' '# Machine-local monitor and device overrides.' \
+        >"$HOME/$local_override"
+      ;;
+    aerospace)
+      printf '%s\n' \
+        '#!/bin/sh' \
+        '# Machine-local monitor commands.' \
+        'exit 0' \
+        >"$HOME/$local_override"
+      chmod 0700 "$HOME/$local_override" \
+        || die 'could not make the Aerospace local override executable'
+      ;;
+  esac
+  printf '  created local override %s\n' "$local_override"
+}
+
 complete_transaction() {
   git_status=$(git --git-dir="$HOME/.cfg" --work-tree="$HOME" \
     status --porcelain=v1 --untracked-files=no) \
@@ -1298,13 +1491,17 @@ complete_transaction() {
 deploy_configuration() {
   selected_platform=$1
   selected_manager=$2
-  begin_transaction "$selected_platform" "$selected_manager"
+  selected_window_manager=$3
+  begin_transaction \
+    "$selected_platform" "$selected_manager" "$selected_window_manager"
   printf '%s\n' 'Applying configuration:'
   install_repository_metadata
+  migrate_window_manager_entrypoint "$selected_window_manager"
 
   while IFS= read -r selected_path || [ -n "$selected_path" ]; do
     deploy_selected_file "$selected_path"
   done <"$prepared_selected_paths"
+  create_window_manager_local_override "$selected_window_manager"
   install_dotfiles_wrapper
 
   if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
@@ -1316,6 +1513,14 @@ deploy_configuration() {
     kill -TERM "$$"
   fi
   complete_transaction
+  case "$selected_window_manager" in
+    none) ;;
+    *)
+      printf '%s\n' \
+        "Window-manager profile installed: $selected_window_manager" \
+        'Reload the manager or start a new session when ready.'
+      ;;
+  esac
 }
 
 reverse_journal() {
@@ -1490,6 +1695,8 @@ if [ "$mode" = rollback ]; then
   exit 0
 fi
 
+select_window_manager "$platform" "$manager" "$window_manager"
+
 if [ "$mode" = apply ]; then
   start_package_tracking
 fi
@@ -1500,6 +1707,7 @@ if [ -z "$script_dir" ]; then
       printf 'Mode: %s\n' "$mode"
       printf 'Platform: %s\n' "$platform"
       printf 'Package manager: %s\n' "$manager"
+      printf 'Window manager: %s\n' "$window_manager"
       printf 'Repository: %s\n' "$repo_url"
       printf 'Reference: %s\n' "$repo_ref"
       printf '%s\n' \
@@ -1517,13 +1725,15 @@ fi
 printf 'Mode: %s\n' "$mode"
 printf 'Platform: %s\n' "$platform"
 printf 'Package manager: %s\n' "$manager"
+printf 'Window manager: %s\n' "$window_manager"
 printf 'Repository: %s\n' "$repo_url"
 printf 'Reference: %s\n' "$repo_ref"
 printf 'Community packages: %s\n' "$allow_community_packages"
 printf '%s\n' 'Configuration paths:'
-emit_selected_paths "$platform" "$script_dir/manifests" | sed 's/^/  install /'
+emit_selected_paths "$platform" "$window_manager" "$script_dir/manifests" \
+  | sed 's/^/  install /'
 printf '%s\n' 'Packages:'
-emit_package_plan "$manager" "$script_dir/manifests"
+emit_package_plan "$manager" "$window_manager" "$script_dir/manifests"
 
 if [ "$mode" = dry-run ]; then
   prepare_dry_run=true
@@ -1533,8 +1743,8 @@ if [ "$mode" = dry-run ]; then
   fi
   if [ "$prepare_dry_run" = true ]; then
     if command -v git >/dev/null 2>&1; then
-      prepare_repository "$platform" "$script_dir/manifests"
-      emit_conflict_plan
+      prepare_repository "$platform" "$window_manager" "$script_dir/manifests"
+      emit_conflict_plan "$window_manager"
     else
       printf '%s\n' 'Conflict scan deferred until Git is installed.'
     fi
@@ -1547,13 +1757,13 @@ if [ "$mode" = apply ]; then
     && [ "${DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES:-0}" = 1 ]; then
     printf '%s\n' 'Applying packages: skipped by test harness'
   else
-    install_packages "$manager" "$script_dir/manifests"
+    install_packages "$manager" "$window_manager" "$script_dir/manifests"
   fi
   if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
     && [ "${DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES:-0}" = 1 ]; then
     exit 0
   fi
-  prepare_repository "$platform" "$script_dir/manifests"
-  deploy_configuration "$platform" "$manager"
+  prepare_repository "$platform" "$window_manager" "$script_dir/manifests"
+  deploy_configuration "$platform" "$manager" "$window_manager"
   exit 0
 fi

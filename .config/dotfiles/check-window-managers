@@ -1,0 +1,265 @@
+#!/bin/sh
+
+set -eu
+
+LC_ALL=C
+export LC_ALL
+
+program=${0##*/}
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
+
+usage() {
+  printf 'usage: %s [--root PATH]\n' "$program"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --root)
+      [ "$#" -ge 2 ] || {
+        usage >&2
+        exit 2
+      }
+      root=$2
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+case "$root" in
+  /*) ;;
+  *)
+    printf '%s: root must be an absolute path\n' "$program" >&2
+    exit 2
+    ;;
+esac
+
+manifest=$root/.config/dotfiles/manifests/window-manager-bindings.tsv
+hypr_config=$root/.config/hypr/hyprland.lua
+i3_config=$root/.config/i3/config
+aerospace_config=$root/.config/aerospace/aerospace.toml
+
+failures=0
+checks=0
+
+pass() {
+  checks=$((checks + 1))
+  printf 'PASS  %s\n' "$1"
+}
+
+fail() {
+  checks=$((checks + 1))
+  failures=$((failures + 1))
+  printf 'FAIL  %s\n' "$1" >&2
+}
+
+for required_file in "$manifest" "$hypr_config" "$i3_config" "$aerospace_config"; do
+  if [ -r "$required_file" ]; then
+    pass "readable file: ${required_file#"$root/"}"
+  else
+    fail "readable file: ${required_file#"$root/"}"
+  fi
+done
+
+if [ "$failures" -ne 0 ]; then
+  printf 'Summary: %d failure(s), %d check(s)\n' "$failures" "$checks" >&2
+  exit 1
+fi
+
+tmp_base=${TMPDIR:-/tmp}
+check_tmp=$(mktemp -d "$tmp_base/window-manager-check.XXXXXX")
+cleanup() {
+  case "$check_tmp" in
+    "$tmp_base"/window-manager-check.*) rm -rf "$check_tmp" ;;
+  esac
+}
+trap cleanup 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+sed 's/^[[:space:]]*//' "$aerospace_config" >"$check_tmp/aerospace.normalized"
+: >"$check_tmp/actions"
+: >"$check_tmp/logical-keys"
+
+tab=$(printf '\t')
+rows=0
+while IFS="$tab" read -r action logical_key hypr_key hypr_action \
+  i3_key i3_action aerospace_key aerospace_action extra \
+  || [ -n "${action:-}" ]
+do
+  case ${action:-} in
+    ''|'#'*) continue ;;
+  esac
+  rows=$((rows + 1))
+
+  case "$action" in
+    *[!a-z0-9-]*)
+      fail "contract action has unsafe characters: $action"
+      continue
+      ;;
+  esac
+  if [ -n "${extra:-}" ] \
+    || [ -z "$logical_key" ] \
+    || [ -z "$hypr_key" ] \
+    || [ -z "$hypr_action" ] \
+    || [ -z "$i3_key" ] \
+    || [ -z "$i3_action" ] \
+    || [ -z "$aerospace_key" ] \
+    || [ -z "$aerospace_action" ]; then
+    fail "contract row has exactly eight non-empty fields: $action"
+    continue
+  fi
+
+  if grep -Fqx "$action" "$check_tmp/actions"; then
+    fail "contract action is unique: $action"
+  else
+    printf '%s\n' "$action" >>"$check_tmp/actions"
+  fi
+  if grep -Fqx "$logical_key" "$check_tmp/logical-keys"; then
+    fail "contract logical key is unique: $logical_key"
+  else
+    printf '%s\n' "$logical_key" >>"$check_tmp/logical-keys"
+  fi
+
+  hypr_expected="hl.bind(\"$hypr_key\", $hypr_action)"
+  i3_expected="bindsym $i3_key $i3_action"
+  aerospace_expected="$aerospace_key = '$aerospace_action'"
+
+  hypr_count=$(grep -Fxc "$hypr_expected" "$hypr_config" || true)
+  i3_count=$(grep -Fxc "$i3_expected" "$i3_config" || true)
+  aerospace_count=$(grep -Fxc "$aerospace_expected" \
+    "$check_tmp/aerospace.normalized" || true)
+
+  if [ "$hypr_count" -eq 1 ]; then
+    pass "Hyprland implements $action exactly once"
+  else
+    fail "Hyprland implements $action exactly once"
+  fi
+  if [ "$i3_count" -eq 1 ]; then
+    pass "i3 implements $action exactly once"
+  else
+    fail "i3 implements $action exactly once"
+  fi
+  if [ "$aerospace_count" -eq 1 ]; then
+    pass "AeroSpace implements $action exactly once"
+  else
+    fail "AeroSpace implements $action exactly once"
+  fi
+done <"$manifest"
+
+if [ "$rows" -eq 40 ]; then
+  pass 'contract contains exactly 40 shared bindings'
+else
+  fail "contract contains exactly 40 shared bindings (found $rows)"
+fi
+
+if grep -Fqx 'hl.bind("SUPER + 1", hl.dsp.focus({ workspace = "name:0" }))' \
+  "$hypr_config" \
+  && grep -Fqx "bindsym \$mod+1 workspace --no-auto-back-and-forth \"0\"" \
+    "$i3_config" \
+  && grep -Fqx "alt-1 = 'workspace 0'" "$check_tmp/aerospace.normalized"; then
+  pass 'physical key 1 selects logical workspace 0 everywhere'
+else
+  fail 'physical key 1 selects logical workspace 0 everywhere'
+fi
+
+if grep -Fq 'follow_mouse = 0' "$hypr_config" \
+  && grep -Fqx 'focus_follows_mouse no' "$i3_config" \
+  && grep -Fqx 'focus-follows-mouse.enabled = false' "$aerospace_config"; then
+  pass 'focus-follows-mouse is disabled everywhere'
+else
+  fail 'focus-follows-mouse is disabled everywhere'
+fi
+
+if grep -Fq 'dofile(local_config)' "$hypr_config" \
+  && grep -Fqx 'include ~/.config/i3/local.conf' "$i3_config" \
+  && grep -Fqx \
+    "after-startup-command = ['exec-and-forget /bin/sh \${HOME}/.config/aerospace/local.sh']" \
+    "$aerospace_config"; then
+  pass 'each manager has only its portable local override boundary'
+else
+  fail 'each manager has only its portable local override boundary'
+fi
+
+if awk '
+  /hl[.]dsp[.]exec_/ && $0 !~ /hl[.]dsp[.]exec_cmd[(]"hyprctl reload"[)]/ {
+    bad = 1
+  }
+  /hl[.](on|window_rule|layer_rule|animation|curve|gesture|device)[(]/ {
+    bad = 1
+  }
+  END { exit bad }
+' "$hypr_config"; then
+  pass 'Hyprland config contains no desktop-shell behavior'
+else
+  fail 'Hyprland config contains no desktop-shell behavior'
+fi
+
+if awk '
+  /^[[:space:]]*(exec|exec_always|bar|assign|for_window|client[.])/ {
+    bad = 1
+  }
+  END { exit bad }
+' "$i3_config"; then
+  pass 'i3 config contains no desktop-shell behavior'
+else
+  fail 'i3 config contains no desktop-shell behavior'
+fi
+
+if awk '
+  /^[[:space:]]*(on-window-detected|exec-on-workspace-change|gaps[.]|workspace-to-monitor-force-assignment)/ {
+    bad = 1
+  }
+  END { exit bad }
+' "$aerospace_config"; then
+  pass 'AeroSpace config contains no desktop-shell behavior'
+else
+  fail 'AeroSpace config contains no desktop-shell behavior'
+fi
+
+if [ ! -e "$root/.config/hypr/hyprland.conf" ] \
+  && [ ! -e "$root/.aerospace.toml" ]; then
+  pass 'repository contains no legacy manager entrypoint'
+else
+  fail 'repository contains no legacy manager entrypoint'
+fi
+
+if command -v luac >/dev/null 2>&1; then
+  if luac -p "$hypr_config"; then
+    pass 'Hyprland config passes luac syntax validation'
+  else
+    fail 'Hyprland config passes luac syntax validation'
+  fi
+fi
+
+if command -v i3 >/dev/null 2>&1; then
+  if i3 -C -c "$i3_config" >/dev/null 2>&1; then
+    pass 'i3 config passes native offline validation'
+  else
+    fail 'i3 config passes native offline validation'
+  fi
+fi
+
+if [ "$(uname -s)" = Darwin ] \
+  && command -v aerospace >/dev/null 2>&1 \
+  && [ -S "/tmp/bobko.aerospace-$(id -un).sock" ]; then
+  if aerospace reload-config --dry-run --no-gui --warnings-as-errors \
+    >/dev/null 2>&1; then
+    pass 'AeroSpace config passes native live validation'
+  else
+    fail 'AeroSpace config passes native live validation'
+  fi
+fi
+
+printf 'Summary: %d failure(s), %d check(s)\n' "$failures" "$checks"
+[ "$failures" -eq 0 ]

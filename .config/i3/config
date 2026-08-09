@@ -1,0 +1,49 @@
+# Portable i3 window-management configuration.
+
+set $mod Mod4
+focus_follows_mouse no
+workspace_auto_back_and_forth no
+
+bindsym $mod+h focus left
+bindsym $mod+j focus down
+bindsym $mod+k focus up
+bindsym $mod+l focus right
+bindsym $mod+Shift+h move left
+bindsym $mod+Shift+j move down
+bindsym $mod+Shift+k move up
+bindsym $mod+Shift+l move right
+bindsym $mod+Control+h resize shrink width 50 px or 5 ppt
+bindsym $mod+Control+j resize grow height 50 px or 5 ppt
+bindsym $mod+Control+k resize shrink height 50 px or 5 ppt
+bindsym $mod+Control+l resize grow width 50 px or 5 ppt
+bindsym $mod+comma focus output prev
+bindsym $mod+period focus output next
+bindsym $mod+Shift+comma move container to output prev
+bindsym $mod+Shift+period move container to output next
+bindsym $mod+f fullscreen toggle
+bindsym $mod+Shift+space floating toggle
+bindsym $mod+Shift+q kill
+bindsym $mod+Shift+c reload
+
+bindsym $mod+1 workspace --no-auto-back-and-forth "0"
+bindsym $mod+2 workspace --no-auto-back-and-forth "1"
+bindsym $mod+3 workspace --no-auto-back-and-forth "2"
+bindsym $mod+4 workspace --no-auto-back-and-forth "3"
+bindsym $mod+5 workspace --no-auto-back-and-forth "4"
+bindsym $mod+6 workspace --no-auto-back-and-forth "5"
+bindsym $mod+7 workspace --no-auto-back-and-forth "6"
+bindsym $mod+8 workspace --no-auto-back-and-forth "7"
+bindsym $mod+9 workspace --no-auto-back-and-forth "8"
+bindsym $mod+0 workspace --no-auto-back-and-forth "9"
+bindsym $mod+Shift+1 move container to workspace "0"
+bindsym $mod+Shift+2 move container to workspace "1"
+bindsym $mod+Shift+3 move container to workspace "2"
+bindsym $mod+Shift+4 move container to workspace "3"
+bindsym $mod+Shift+5 move container to workspace "4"
+bindsym $mod+Shift+6 move container to workspace "5"
+bindsym $mod+Shift+7 move container to workspace "6"
+bindsym $mod+Shift+8 move container to workspace "7"
+bindsym $mod+Shift+9 move container to workspace "8"
+bindsym $mod+Shift+0 move container to workspace "9"
+
+include ~/.config/i3/local.conf
