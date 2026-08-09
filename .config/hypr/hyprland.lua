@@ -38,7 +38,7 @@ hl.bind("SUPER + SHIFT + period", hl.dsp.window.move({ monitor = "+1", follow = 
 hl.bind("SUPER + F", hl.dsp.window.fullscreen({ action = "toggle" }))
 hl.bind("SUPER + SHIFT + SPACE", hl.dsp.window.float({ action = "toggle" }))
 hl.bind("SUPER + SHIFT + Q", hl.dsp.window.close())
-hl.bind("SUPER + SHIFT + C", hl.dsp.exec_cmd("hyprctl reload"))
+hl.bind("SUPER + SHIFT + R", hl.dsp.exec_cmd("hyprctl reload"))
 
 hl.bind("SUPER + 1", hl.dsp.focus({ workspace = "name:0" }))
 hl.bind("SUPER + 2", hl.dsp.focus({ workspace = "name:1" }))

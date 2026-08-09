@@ -29,7 +29,7 @@ after-startup-command = ['exec-and-forget /bin/sh ${HOME}/.config/aerospace/loca
     alt-f = 'fullscreen'
     alt-shift-space = 'layout floating tiling'
     alt-shift-q = 'close'
-    alt-shift-c = 'reload-config'
+    alt-shift-r = 'reload-config'
 
     alt-1 = 'workspace 0'
     alt-2 = 'workspace 1'
