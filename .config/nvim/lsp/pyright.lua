@@ -1,4 +1,11 @@
 return {
+  before_init = function(params)
+    local text_document = params.capabilities and params.capabilities.textDocument
+
+    if text_document then
+      text_document.diagnostic = nil
+    end
+  end,
   cmd = { "pyright-langserver", "--stdio" },
   filetypes = { "python" },
   root_markers = {

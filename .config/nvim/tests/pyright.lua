@@ -127,9 +127,10 @@ local ok, failure = xpcall(function()
   local config = dofile(vim.fs.joinpath(nvim_root, "lsp", "pyright.lua"))
   exact_keys(
     config,
-    { "cmd", "filetypes", "root_markers", "settings" },
+    { "before_init", "cmd", "filetypes", "root_markers", "settings" },
     "Pyright configuration keys"
   )
+  assert(type(config.before_init) == "function", "Pyright before_init callback missing")
   eq(config.cmd, { "pyright-langserver", "--stdio" }, "Pyright command")
   eq(config.filetypes, { "python" }, "Pyright filetypes")
   eq(config.root_markers, {
@@ -143,6 +144,51 @@ local ok, failure = xpcall(function()
   }, "Pyright ordered root markers")
   eq(config.settings, expected_settings, "Pyright settings")
 
+  local init_params = {
+    capabilities = {
+      textDocument = {
+        diagnostic = {
+          dynamicRegistration = true,
+          relatedDocumentSupport = true,
+        },
+        hover = {
+          contentFormat = { "markdown" },
+        },
+      },
+      workspace = {
+        configuration = true,
+      },
+    },
+  }
+  config.before_init(init_params)
+  eq(init_params, {
+    capabilities = {
+      textDocument = {
+        hover = {
+          contentFormat = { "markdown" },
+        },
+      },
+      workspace = {
+        configuration = true,
+      },
+    },
+  }, "Pyright before_init removes only pull diagnostics")
+
+  local sparse_init_params = {
+    capabilities = {
+      workspace = {
+        configuration = true,
+      },
+    },
+  }
+  local expected_sparse_init_params = vim.deepcopy(sparse_init_params)
+  config.before_init(sparse_init_params)
+  eq(
+    sparse_init_params,
+    expected_sparse_init_params,
+    "Pyright before_init tolerates a missing textDocument capability"
+  )
+
   registry.setup()
   assert(vim.lsp.is_enabled("lua_ls"), "lua_ls must remain enabled")
   assert(vim.lsp.is_enabled("pyright"), "pyright must be enabled")
@@ -152,6 +198,7 @@ local ok, failure = xpcall(function()
   )
 
   local resolved = vim.lsp.config.pyright
+  assert(type(resolved.before_init) == "function", "resolved Pyright before_init callback missing")
   eq(resolved.cmd, { "pyright-langserver", "--stdio" }, "resolved Pyright command")
   eq(resolved.filetypes, { "python" }, "resolved Pyright filetypes")
   eq(resolved.settings, expected_settings, "resolved Pyright settings")
@@ -199,11 +246,15 @@ local ok, failure = xpcall(function()
   eq(client.config.settings, expected_settings, "Pyright live initialized settings")
   eq(client.settings, expected_settings, "Pyright live documented settings")
   assert(
+    not client:supports_method("textDocument/diagnostic", bufnr),
+    "Pyright must not register pull diagnostics"
+  )
+  assert(
     #vim.lsp.get_clients({ name = "lua_ls", _uninitialized = true }) == 0,
     "Python buffer must not start lua_ls"
   )
 
-  local diagnostic_namespace = vim.lsp.diagnostic.get_namespace(client.id, true, "Pyright")
+  local diagnostic_namespace = vim.lsp.diagnostic.get_namespace(client.id)
 
   local function pyright_diagnostics()
     return vim.diagnostic.get(bufnr, { namespace = diagnostic_namespace })
@@ -211,7 +262,11 @@ local ok, failure = xpcall(function()
 
   local has_error = vim.wait(30000, function()
     for _, diagnostic in ipairs(pyright_diagnostics()) do
-      if diagnostic.severity == vim.diagnostic.severity.ERROR then
+      if
+        diagnostic.severity == vim.diagnostic.severity.ERROR
+        and diagnostic.source == "Pyright"
+        and diagnostic.code == "reportAssignmentType"
+      then
         return true
       end
     end
@@ -219,7 +274,7 @@ local ok, failure = xpcall(function()
     return false
   end, 25)
 
-  assert(has_error, "invalid Python fixture must produce a Pyright error diagnostic")
+  assert(has_error, "invalid Python fixture must produce a Pyright push error diagnostic")
 end, debug.traceback)
 
 local clients_removed, cleanup_result = clean_fixture()
