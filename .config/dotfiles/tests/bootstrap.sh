@@ -74,7 +74,7 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-printf '1..125\n'
+printf '1..143\n'
 
 if [ -x "$bootstrap" ]; then
   pass 'bootstrap is executable'
@@ -112,6 +112,16 @@ require_contains "$linux_output" 'Mode: dry-run' 'no arguments select dry-run mo
 require_contains "$linux_output" 'Platform: linux' 'Linux platform is reported'
 require_contains "$linux_output" 'Package manager: pacman' 'pacman backend is reported'
 require_contains "$linux_output" '.config/tmux/conf/platform/linux.conf' 'Linux plan includes Linux tmux adapter'
+require_contains "$linux_output" '.config/tmux/conf/persistence.conf' \
+  'common plan includes tmux persistence binding'
+require_contains "$linux_output" '.codex/hooks.json' \
+  'common plan includes Codex lifecycle hooks'
+require_contains "$linux_output" '.config/systemd/user/tmux-workspace.service' \
+  'Linux plan includes the tmux workspace user service'
+require_contains "$linux_output" 'systemctl --user daemon-reload' \
+  'Linux dry-run reports the user daemon reload'
+require_contains "$linux_output" 'systemctl --user enable --now tmux-workspace.service' \
+  'Linux dry-run reports service enablement and startup'
 require_excludes "$linux_output" '.config/tmux/conf/platform/macos.conf' 'Linux plan excludes macOS tmux adapter'
 require_excludes "$linux_output" 'Library/Application Support/com.mitchellh.ghostty/config.ghostty' 'Linux plan excludes macOS Ghostty entrypoint'
 
@@ -171,12 +181,28 @@ macos_output=$(
     "$bootstrap"
 )
 require_contains "$macos_output" '.config/tmux/conf/platform/macos.conf' 'macOS plan includes macOS tmux adapter'
+require_contains "$macos_output" 'Library/LaunchAgents/dev.ruohao.tmux-workspace.plist' \
+  'macOS plan includes the tmux workspace LaunchAgent'
+require_contains "$macos_output" "launchctl bootstrap gui/$(id -u)" \
+  'macOS dry-run reports LaunchAgent bootstrap'
+require_contains "$macos_output" \
+  "launchctl kickstart -k gui/$(id -u)/dev.ruohao.tmux-workspace" \
+  'macOS dry-run reports LaunchAgent kickstart'
 require_contains "$macos_output" 'install homebrew-formula neovim' 'Homebrew plan includes Neovim formula'
 require_contains "$macos_output" 'install homebrew-cask ghostty' 'Homebrew plan includes Ghostty cask'
 require_excludes "$macos_output" '.config/tmux/conf/platform/linux.conf' 'macOS plan excludes Linux tmux adapter'
 require_contains "$macos_output" \
   'backup and set Spotlight shortcut Command+Shift+semicolon' \
   'macOS dry-run reports the transactional Spotlight shortcut change'
+workspace_launch_agent=$workspace_root/Library/LaunchAgents/dev.ruohao.tmux-workspace.plist
+if grep -Fq '<key>RunAtLoad</key>' "$workspace_launch_agent" \
+  && grep -Fq '<key>KeepAlive</key>' "$workspace_launch_agent" \
+  && grep -Fq '<string>/bin/sh</string>' "$workspace_launch_agent" \
+  && ! grep -Fq '/home/ruohao' "$workspace_launch_agent"; then
+  pass 'workspace LaunchAgent is portable and starts automatically'
+else
+  fail 'workspace LaunchAgent is portable and starts automatically'
+fi
 
 if [ ! -e "$test_tmp/linux-home" ] && [ ! -e "$test_tmp/linux-state" ]; then
   pass 'dry-run creates no persistent home or state paths'
@@ -338,9 +364,15 @@ require_contains "$aerospace_brew_apply_commands" \
 
 fixture_work=$test_tmp/fixture-work
 fixture_repo=$test_tmp/fixture.git
-mkdir -p "$fixture_work/.config" "$fixture_work/Library/Application Support/com.mitchellh.ghostty"
+mkdir -p \
+  "$fixture_work/.codex" \
+  "$fixture_work/.config" \
+  "$fixture_work/.config/systemd/user" \
+  "$fixture_work/Library/Application Support/com.mitchellh.ghostty" \
+  "$fixture_work/Library/LaunchAgents"
 mkdir -p "$fixture_work/.local/bin"
 cp -R "$dotfiles_dir" "$fixture_work/.config/dotfiles"
+cp "$workspace_root/.codex/hooks.json" "$fixture_work/.codex/hooks.json"
 cp "$workspace_root/.local/bin/t" "$fixture_work/.local/bin/t"
 cp -R \
   "$workspace_root/.config/aerospace" \
@@ -359,6 +391,7 @@ mkdir -p \
 cp \
   "$workspace_root/.config/tmux/conf/keys.conf" \
   "$workspace_root/.config/tmux/conf/options.conf" \
+  "$workspace_root/.config/tmux/conf/persistence.conf" \
   "$workspace_root/.config/tmux/conf/status.conf" \
   "$fixture_work/.config/tmux/conf/"
 cp \
@@ -369,8 +402,12 @@ cp "$workspace_root/.config/tmux/tmux.conf" "$fixture_work/.config/tmux/tmux.con
 cp -R "$workspace_root/.config/tmux/scripts/." "$fixture_work/.config/tmux/scripts/"
 cp "$workspace_root/.config/tmux/tests/project-session.sh" \
   "$fixture_work/.config/tmux/tests/project-session.sh"
+cp "$workspace_root/.config/systemd/user/tmux-workspace.service" \
+  "$fixture_work/.config/systemd/user/tmux-workspace.service"
 cp "$workspace_root/Library/Application Support/com.mitchellh.ghostty/config.ghostty" \
   "$fixture_work/Library/Application Support/com.mitchellh.ghostty/config.ghostty"
+cp "$workspace_root/Library/LaunchAgents/dev.ruohao.tmux-workspace.plist" \
+  "$fixture_work/Library/LaunchAgents/dev.ruohao.tmux-workspace.plist"
 printf '%s\n' 'fixture nvim' >"$fixture_work/.config/nvim/init.lua"
 printf '%s\n' 'fixture tmux' >"$fixture_work/.config/tmux/tmux.conf"
 printf '%s\n' 'fixture linux' >"$fixture_work/.config/tmux/conf/platform/linux.conf"
@@ -724,8 +761,15 @@ fi
 
 transaction_home=$test_tmp/transaction-home
 transaction_state=$test_tmp/transaction-state
-mkdir -p "$transaction_home/.config/nvim" "$transaction_home/.config/tmux" "$transaction_home/.local/share"
+transaction_service_log=$test_tmp/transaction-service.commands
+mkdir -p \
+  "$transaction_home/.config/nvim" \
+  "$transaction_home/.config/systemd/user" \
+  "$transaction_home/.config/tmux" \
+  "$transaction_home/.local/share"
 printf '%s\n' 'original nvim' >"$transaction_home/.config/nvim/init.lua"
+printf '%s\n' 'original service unit' \
+  >"$transaction_home/.config/systemd/user/tmux-workspace.service"
 printf '%s\n' 'keep local-only' >"$transaction_home/.config/nvim/local-only.lua"
 printf '%s\n' 'original tmux target' >"$transaction_home/.local/share/original-tmux.conf"
 ln -s "$transaction_home/.local/share/original-tmux.conf" "$transaction_home/.config/tmux/tmux.conf"
@@ -737,6 +781,9 @@ run_capture "$test_tmp/transaction-apply.output" env \
   DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
   DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
   DOTFILES_BOOTSTRAP_TEST_RUN_ID=transaction-success \
+  DOTFILES_BOOTSTRAP_TEST_SERVICE_ENABLED=true \
+  DOTFILES_BOOTSTRAP_TEST_SERVICE_ACTIVE=true \
+  DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$transaction_service_log" \
   "$bootstrap" --apply --repo "$fixture_repo" --ref main
 if [ "$run_status" -eq 0 ]; then
   pass 'transactional configuration apply succeeds'
@@ -744,7 +791,29 @@ else
   fail 'transactional configuration apply succeeds'
   sed 's/^/  /' "$test_tmp/transaction-apply.output" >&2
 fi
+transaction_service_commands=$(cat "$transaction_service_log" 2>/dev/null || true)
+require_contains "$transaction_service_commands" \
+  'systemctl --user daemon-reload' \
+  'transactional apply reloads the systemd user manager'
+require_contains "$transaction_service_commands" \
+  'systemctl --user enable --now tmux-workspace.service' \
+  'transactional apply enables and starts the workspace service'
+if [ -L "$transaction_home/.local/bin/tmux-workspace" ] \
+  && [ "$(readlink "$transaction_home/.local/bin/tmux-workspace")" = \
+    "$transaction_home/.config/tmux/scripts/workspace" ]; then
+  pass 'transactional apply installs the workspace helper command link'
+else
+  fail 'transactional apply installs the workspace helper command link'
+fi
 transaction_run=$transaction_state/dotfiles-bootstrap/transaction-success
+if [ "$(cat "$transaction_run/service-platform" 2>/dev/null || true)" = linux ] \
+  && [ "$(cat "$transaction_run/service-was-installed" 2>/dev/null || true)" = true ] \
+  && [ "$(cat "$transaction_run/service-was-enabled" 2>/dev/null || true)" = true ] \
+  && [ "$(cat "$transaction_run/service-was-active" 2>/dev/null || true)" = true ]; then
+  pass 'transaction records the previous workspace service state'
+else
+  fail 'transaction records the previous workspace service state'
+fi
 if [ "$(cat "$transaction_run/backup/.config/nvim/init.lua" 2>/dev/null || true)" = 'original nvim' ]; then
   pass 'conflicting file is automatically backed up'
 else
@@ -773,17 +842,34 @@ else
   fail 'completed transaction and latest run are journaled'
 fi
 
+: >"$transaction_service_log"
 run_capture "$test_tmp/transaction-rollback.output" env \
   HOME="$transaction_home" \
   XDG_STATE_HOME="$transaction_state" \
   DOTFILES_BOOTSTRAP_TESTING=1 \
   DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
   DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$transaction_service_log" \
   "$bootstrap" --rollback transaction-success
 if [ "$run_status" -eq 0 ]; then
   pass 'manual rollback by run ID succeeds'
 else
   fail 'manual rollback by run ID succeeds'
+fi
+transaction_rollback_service_commands=$(cat "$transaction_service_log" 2>/dev/null || true)
+require_contains "$transaction_rollback_service_commands" \
+  'systemctl --user disable --now tmux-workspace.service' \
+  'rollback stops and disables the deployed workspace service'
+require_contains "$transaction_rollback_service_commands" \
+  'systemctl --user daemon-reload' \
+  'rollback reloads the restored systemd user configuration'
+if printf '%s\n' "$transaction_rollback_service_commands" \
+    | grep -Fqx 'systemctl --user enable tmux-workspace.service' \
+  && printf '%s\n' "$transaction_rollback_service_commands" \
+    | grep -Fqx 'systemctl --user start tmux-workspace.service'; then
+  pass 'rollback restores the previous enabled and active service state'
+else
+  fail 'rollback restores the previous enabled and active service state'
 fi
 if [ "$(cat "$transaction_home/.config/nvim/init.lua" 2>/dev/null || true)" = 'original nvim' ]; then
   pass 'rollback restores the original conflicting file'
@@ -797,7 +883,10 @@ else
   fail 'rollback restores the original symlink'
 fi
 if [ ! -e "$transaction_home/.config/tmux/conf/platform/linux.conf" ] \
-  && [ ! -e "$transaction_home/.cfg" ]; then
+  && [ ! -e "$transaction_home/.cfg" ] \
+  && [ ! -e "$transaction_home/.local/bin/tmux-workspace" ] \
+  && [ "$(cat "$transaction_home/.config/systemd/user/tmux-workspace.service" 2>/dev/null || true)" = \
+    'original service unit' ]; then
   pass 'rollback removes newly deployed files and repository metadata'
 else
   fail 'rollback removes newly deployed files and repository metadata'
@@ -809,6 +898,33 @@ else
 fi
 rollback_output=$(cat "$test_tmp/transaction-rollback.output")
 require_contains "$rollback_output" 'Packages are not uninstalled' 'rollback reports that package changes are retained'
+
+service_failure_home=$test_tmp/service-failure-home
+service_failure_state=$test_tmp/service-failure-state
+run_capture "$test_tmp/service-failure.output" env \
+  HOME="$service_failure_home" \
+  XDG_STATE_HOME="$service_failure_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_RUN_ID=service-activation-failure \
+  DOTFILES_BOOTSTRAP_TEST_SERVICE_FAIL=enable \
+  "$bootstrap" --apply --repo "$fixture_repo" --ref main
+if [ "$run_status" -ne 0 ]; then
+  pass 'service activation failure exits unsuccessfully'
+else
+  fail 'service activation failure exits unsuccessfully'
+fi
+if [ "$(cat "$service_failure_state/dotfiles-bootstrap/service-activation-failure/status" 2>/dev/null || true)" = \
+    rolled-back ] \
+  && [ ! -e "$service_failure_home/.cfg" ] \
+  && [ ! -e "$service_failure_home/.local/bin/tmux-workspace" ] \
+  && [ ! -e "$service_failure_home/.config/systemd/user/tmux-workspace.service" ]; then
+  pass 'service activation failure rolls back deployed configuration'
+else
+  fail 'service activation failure rolls back deployed configuration'
+fi
 
 run_capture "$test_tmp/transaction-rollback-again.output" env \
   HOME="$transaction_home" \
