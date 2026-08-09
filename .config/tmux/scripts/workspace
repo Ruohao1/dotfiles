@@ -5,6 +5,11 @@ LC_ALL=C
 export LC_ALL
 umask 077
 
+if [ "${TMUX_WORKSPACE_TESTING:-0}" != 1 ]; then
+  PATH=$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+fi
+export PATH
+
 program=tmux-workspace
 schema=1
 retention=10

@@ -258,6 +258,25 @@ emit_platform_preference_plan() {
   esac
 }
 
+emit_service_plan() {
+  selected_platform=$1
+  printf '%s\n' 'Login service:'
+  case "$selected_platform" in
+    linux)
+      printf '%s\n' \
+        '  systemctl --user daemon-reload' \
+        '  systemctl --user enable --now tmux-workspace.service'
+      ;;
+    macos)
+      service_domain=gui/$(id -u)
+      printf '%s\n' \
+        "  launchctl bootstrap $service_domain $HOME/Library/LaunchAgents/dev.ruohao.tmux-workspace.plist" \
+        "  launchctl kickstart -k $service_domain/dev.ruohao.tmux-workspace"
+      ;;
+    *) die "unsupported service platform: $selected_platform" ;;
+  esac
+}
+
 window_manager_config_manifest() {
   selected_window_manager=$1
   manifest_root=$2
@@ -420,6 +439,37 @@ record_package_action() {
 run_command() {
   if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ]; then
     record_test_command "$@"
+    return 0
+  fi
+  "$@"
+}
+
+record_service_action() {
+  [ -n "${transaction_run:-}" ] || return 0
+  [ -d "$transaction_run" ] || return 0
+  action_log=$transaction_run/service-actions.log
+  first_argument=true
+  for argument do
+    if [ "$first_argument" = true ]; then
+      first_argument=false
+    else
+      printf ' ' >>"$action_log"
+    fi
+    printf '%s' "$argument" >>"$action_log"
+  done
+  printf '\n' >>"$action_log"
+}
+
+run_service_command() {
+  record_service_action "$@"
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ]; then
+    record_test_command "$@"
+    failure_token=${DOTFILES_BOOTSTRAP_TEST_SERVICE_FAIL:-}
+    if [ -n "$failure_token" ]; then
+      for service_argument do
+        [ "$service_argument" != "$failure_token" ] || return 1
+      done
+    fi
     return 0
   fi
   "$@"
@@ -1268,6 +1318,7 @@ emit_conflict_plan() {
   printf '%s\n' 'Conflicts to back up during apply:'
   scan_selected_conflict .cfg
   scan_selected_conflict .local/bin/dotfiles
+  scan_selected_conflict .local/bin/tmux-workspace
   case "$selected_window_manager" in
     hypr) scan_selected_conflict .config/hypr/hyprland.conf ;;
     aerospace) scan_selected_conflict .aerospace.toml ;;
@@ -1278,6 +1329,101 @@ emit_conflict_plan() {
   if [ ! -s "$prepared_conflicts" ]; then
     printf '%s\n' '  none'
   fi
+}
+
+boolean_value() {
+  boolean_name=$1
+  boolean_candidate=$2
+  case $boolean_candidate in
+    true|false) printf '%s\n' "$boolean_candidate" ;;
+    *) die "$boolean_name must be true or false" ;;
+  esac
+}
+
+service_unit_path() {
+  service_platform=$1
+  case "$service_platform" in
+    linux) printf '%s\n' "$HOME/.config/systemd/user/tmux-workspace.service" ;;
+    macos) printf '%s\n' "$HOME/Library/LaunchAgents/dev.ruohao.tmux-workspace.plist" ;;
+    *) die "unsupported service platform: $service_platform" ;;
+  esac
+}
+
+service_domain() {
+  printf 'gui/%s\n' "$(id -u)"
+}
+
+require_service_manager() {
+  service_platform=$1
+  [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] && return 0
+  case "$service_platform" in
+    linux)
+      command -v systemctl >/dev/null 2>&1 \
+        || die 'systemctl is required to activate the Linux user service'
+      ;;
+    macos)
+      command -v launchctl >/dev/null 2>&1 \
+        || die 'launchctl is required to activate the macOS LaunchAgent'
+      ;;
+    *) die "unsupported service platform: $service_platform" ;;
+  esac
+}
+
+record_initial_service_state() {
+  service_platform=$1
+  service_target=$(service_unit_path "$service_platform")
+  if path_exists "$service_target"; then
+    service_was_installed=true
+  else
+    service_was_installed=false
+  fi
+  service_was_enabled=false
+  service_was_active=false
+
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ]; then
+    service_was_installed=$(boolean_value \
+      DOTFILES_BOOTSTRAP_TEST_SERVICE_INSTALLED \
+      "${DOTFILES_BOOTSTRAP_TEST_SERVICE_INSTALLED:-$service_was_installed}") \
+      || die 'invalid test service installed state'
+    case "$service_platform" in
+      linux)
+        service_was_enabled=$(boolean_value \
+          DOTFILES_BOOTSTRAP_TEST_SERVICE_ENABLED \
+          "${DOTFILES_BOOTSTRAP_TEST_SERVICE_ENABLED:-false}") \
+          || die 'invalid test service enabled state'
+        service_was_active=$(boolean_value \
+          DOTFILES_BOOTSTRAP_TEST_SERVICE_ACTIVE \
+          "${DOTFILES_BOOTSTRAP_TEST_SERVICE_ACTIVE:-false}") \
+          || die 'invalid test service active state'
+        ;;
+      macos)
+        service_was_active=$(boolean_value \
+          DOTFILES_BOOTSTRAP_TEST_SERVICE_LOADED \
+          "${DOTFILES_BOOTSTRAP_TEST_SERVICE_LOADED:-false}") \
+          || die 'invalid test service loaded state'
+        ;;
+    esac
+  else
+    case "$service_platform" in
+      linux)
+        systemctl --user is-enabled --quiet tmux-workspace.service \
+          >/dev/null 2>&1 && service_was_enabled=true
+        systemctl --user is-active --quiet tmux-workspace.service \
+          >/dev/null 2>&1 && service_was_active=true
+        ;;
+      macos)
+        launchctl print "$(service_domain)/dev.ruohao.tmux-workspace" \
+          >/dev/null 2>&1 && service_was_active=true
+        ;;
+    esac
+  fi
+
+  printf '%s\n' "$service_platform" >"$transaction_run/service-platform"
+  printf '%s\n' "$service_was_installed" >"$transaction_run/service-was-installed"
+  printf '%s\n' "$service_was_enabled" >"$transaction_run/service-was-enabled"
+  printf '%s\n' "$service_was_active" >"$transaction_run/service-was-active"
+  printf '%s\n' false >"$transaction_run/service-new-loaded"
+  : >"$transaction_run/service-actions.log"
 }
 
 begin_transaction() {
@@ -1320,6 +1466,7 @@ begin_transaction() {
       && printf '%s\n' "$selected_manager" >"$transaction_run/package-manager" \
       && printf '%s\n' "$selected_window_manager" >"$transaction_run/window-manager"
   } || die 'could not initialize transaction metadata'
+  record_initial_service_state "$selected_platform"
   printf '%s\n' \
     'Package changes are retained during rollback.' \
     "Package manager: $selected_manager" \
@@ -1420,15 +1567,62 @@ install_repository_metadata() {
     || die 'could not configure concise dotfiles status output'
 }
 
-install_dotfiles_wrapper() {
-  wrapper_path=.local/bin/dotfiles
-  ensure_target_parents "$wrapper_path"
-  backup_existing_path "$wrapper_path"
-  append_journal_path "$transaction_run/managed.paths" "$wrapper_path"
-  [ -x "$HOME/.config/dotfiles/dotfiles" ] \
-    || die 'deployed dotfiles wrapper is missing or not executable'
-  ln -s "$HOME/.config/dotfiles/dotfiles" "$HOME/$wrapper_path" \
-    || die 'could not install ~/.local/bin/dotfiles'
+install_command_link() {
+  command_path=$1
+  command_source=$2
+  command_label=$3
+  ensure_target_parents "$command_path"
+  backup_existing_path "$command_path"
+  append_journal_path "$transaction_run/managed.paths" "$command_path"
+  [ -x "$command_source" ] \
+    || die "deployed $command_label is missing or not executable"
+  ln -s "$command_source" "$HOME/$command_path" \
+    || die "could not install ~/$command_path"
+}
+
+install_command_links() {
+  install_command_link \
+    .local/bin/dotfiles \
+    "$HOME/.config/dotfiles/dotfiles" \
+    'dotfiles wrapper'
+  install_command_link \
+    .local/bin/tmux-workspace \
+    "$HOME/.config/tmux/scripts/workspace" \
+    'tmux workspace helper'
+}
+
+activate_login_service() {
+  service_platform=$1
+  [ -x "$HOME/.config/tmux/scripts/workspace" ] \
+    || die 'deployed tmux workspace helper is not executable'
+  service_target=$(service_unit_path "$service_platform")
+  [ -f "$service_target" ] && [ ! -L "$service_target" ] \
+    || die 'deployed tmux workspace service file is invalid'
+
+  case "$service_platform" in
+    linux)
+      run_service_command systemctl --user daemon-reload \
+        || die 'could not reload the systemd user manager'
+      run_service_command systemctl --user enable --now tmux-workspace.service \
+        || die 'could not enable and start tmux-workspace.service'
+      ;;
+    macos)
+      service_target_domain=$(service_domain)
+      service_was_active=$(cat "$transaction_run/service-was-active")
+      if [ "$service_was_active" = true ]; then
+        run_service_command launchctl bootout \
+          "$service_target_domain/dev.ruohao.tmux-workspace" \
+          || die 'could not unload the previous tmux workspace LaunchAgent'
+      fi
+      run_service_command launchctl bootstrap "$service_target_domain" "$service_target" \
+        || die 'could not bootstrap the tmux workspace LaunchAgent'
+      printf '%s\n' true >"$transaction_run/service-new-loaded"
+      run_service_command launchctl kickstart -k \
+        "$service_target_domain/dev.ruohao.tmux-workspace" \
+        || die 'could not start the tmux workspace LaunchAgent'
+      ;;
+    *) die "unsupported service platform: $service_platform" ;;
+  esac
 }
 
 install_platform_preferences() {
@@ -1529,6 +1723,7 @@ deploy_configuration() {
   selected_platform=$1
   selected_manager=$2
   selected_window_manager=$3
+  require_service_manager "$selected_platform"
   begin_transaction \
     "$selected_platform" "$selected_manager" "$selected_window_manager"
   printf '%s\n' 'Applying configuration:'
@@ -1539,8 +1734,9 @@ deploy_configuration() {
     deploy_selected_file "$selected_path"
   done <"$prepared_selected_paths"
   create_window_manager_local_override "$selected_window_manager"
-  install_dotfiles_wrapper
+  install_command_links
   install_platform_preferences "$selected_platform"
+  activate_login_service "$selected_platform"
 
   if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
     && [ "${DOTFILES_BOOTSTRAP_TEST_FAIL_AFTER_CHECKOUT:-0}" = 1 ]; then
@@ -1645,6 +1841,91 @@ restore_transaction_preferences() {
   "$preference_helper" restore "$preference_journal"
 }
 
+transaction_has_service_metadata() {
+  [ -f "$transaction_run/service-platform" ]
+}
+
+preflight_transaction_service() {
+  transaction_has_service_metadata || return 0
+  rollback_service_platform=$(cat "$transaction_run/service-platform" 2>/dev/null || true)
+  case $rollback_service_platform in
+    linux|macos) ;;
+    *)
+      printf 'bootstrap: transaction has invalid service platform: %s\n' \
+        "${rollback_service_platform:-missing}" >&2
+      return 1
+      ;;
+  esac
+  require_service_manager "$rollback_service_platform"
+  for service_state_name in \
+    service-was-installed \
+    service-was-enabled \
+    service-was-active \
+    service-new-loaded
+  do
+    service_state_value=$(cat "$transaction_run/$service_state_name" 2>/dev/null || true)
+    case $service_state_value in
+      true|false) ;;
+      *)
+        printf 'bootstrap: transaction has invalid %s metadata: %s\n' \
+          "$service_state_name" "${service_state_value:-missing}" >&2
+        return 1
+        ;;
+    esac
+  done
+}
+
+stop_deployed_service() {
+  transaction_has_service_metadata || return 0
+  rollback_service_platform=$(cat "$transaction_run/service-platform")
+  case $rollback_service_platform in
+    linux)
+      run_service_command systemctl --user disable --now tmux-workspace.service
+      ;;
+    macos)
+      service_new_loaded=$(cat "$transaction_run/service-new-loaded")
+      if [ "$service_new_loaded" = true ]; then
+        run_service_command launchctl bootout \
+          "$(service_domain)/dev.ruohao.tmux-workspace"
+      fi
+      ;;
+  esac
+}
+
+restore_previous_service_state() {
+  transaction_has_service_metadata || return 0
+  rollback_service_platform=$(cat "$transaction_run/service-platform")
+  service_was_enabled=$(cat "$transaction_run/service-was-enabled")
+  service_was_active=$(cat "$transaction_run/service-was-active")
+  case $rollback_service_platform in
+    linux)
+      run_service_command systemctl --user daemon-reload || return 1
+      if [ "$service_was_enabled" = true ]; then
+        run_service_command systemctl --user enable tmux-workspace.service \
+          || return 1
+      fi
+      if [ "$service_was_active" = true ]; then
+        run_service_command systemctl --user start tmux-workspace.service \
+          || return 1
+      fi
+      ;;
+    macos)
+      if [ "$service_was_active" = true ]; then
+        restored_service_target=$(service_unit_path macos)
+        [ -f "$restored_service_target" ] && [ ! -L "$restored_service_target" ] \
+          || return 1
+        restored_service_domain=$(service_domain)
+        run_service_command launchctl bootstrap \
+          "$restored_service_domain" "$restored_service_target" \
+          || return 1
+        run_service_command launchctl kickstart -k \
+          "$restored_service_domain/dev.ruohao.tmux-workspace" \
+          || return 1
+      fi
+      ;;
+  esac
+}
+
 rollback_transaction() {
   transaction_run=$1
   rollback_status=$(cat "$transaction_run/status" 2>/dev/null || true)
@@ -1663,7 +1944,9 @@ rollback_transaction() {
   esac
 
   preflight_transaction_preferences || return 1
+  preflight_transaction_service || return 1
   printf '%s\n' rolling-back >"$transaction_run/status" || return 1
+  stop_deployed_service || return 1
   restore_transaction_preferences || return 1
   managed_journal=$transaction_run/managed.paths
   if [ -r "$managed_journal" ]; then
@@ -1675,6 +1958,7 @@ rollback_transaction() {
   fi
   prune_created_directories || return 1
   restore_backups || return 1
+  restore_previous_service_state || return 1
   printf '%s\n' rolled-back >"$transaction_run/status" || return 1
   printf 'Rolled back transaction: %s\n' "${transaction_run##*/}"
   report_retained_packages
@@ -1811,6 +2095,7 @@ emit_selected_paths "$platform" "$window_manager" "$script_dir/manifests" \
 printf '%s\n' 'Packages:'
 emit_package_plan "$manager" "$window_manager" "$script_dir/manifests"
 emit_platform_preference_plan "$platform"
+emit_service_plan "$platform"
 
 if [ "$mode" = dry-run ]; then
   prepare_dry_run=true

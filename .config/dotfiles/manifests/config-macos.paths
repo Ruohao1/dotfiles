@@ -2,3 +2,4 @@
 .config/macos/spotlight-shortcut
 .config/tmux/conf/platform/macos.conf
 Library/Application Support/com.mitchellh.ghostty/config.ghostty
+Library/LaunchAgents/dev.ruohao.tmux-workspace.plist

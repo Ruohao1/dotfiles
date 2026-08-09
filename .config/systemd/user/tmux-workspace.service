@@ -1,0 +1,13 @@
+[Unit]
+Description=Restore and checkpoint the tmux workspace
+Documentation=man:tmux(1)
+
+[Service]
+Type=simple
+ExecStart=%h/.config/tmux/scripts/workspace supervise
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

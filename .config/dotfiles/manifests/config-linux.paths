@@ -1,1 +1,2 @@
 .config/tmux/conf/platform/linux.conf
+.config/systemd/user/tmux-workspace.service
