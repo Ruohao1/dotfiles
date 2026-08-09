@@ -5123,7 +5123,9 @@ start_configured_nvim() {
   start_state_quoted=$(shell_single_quote "$XDG_STATE_HOME") || return 1
   start_cache_quoted=$(shell_single_quote "$XDG_CACHE_HOME") || return 1
   start_file_quoted=$(shell_single_quote "$start_file") || return 1
-  start_command="env -u NVIM_APPNAME XDG_CONFIG_HOME=$start_config_quoted XDG_DATA_HOME=$start_data_quoted XDG_STATE_HOME=$start_state_quoted XDG_CACHE_HOME=$start_cache_quoted TERM=tmux-256color $start_nvim_quoted -i NONE -- $start_file_quoted"
+  start_lsp_command='lua assert(vim.lsp.is_enabled("lua_ls"), "lua_ls is not enabled before checker TUI fixture"); assert(vim.bo.filetype ~= "lua", "checker TUI fixture must start without a Lua buffer"); assert(#vim.lsp.get_clients({ name = "lua_ls", _uninitialized = true }) == 0, "lua_ls client spawned before checker TUI fixture"); vim.lsp.enable("lua_ls", false); assert(not vim.lsp.is_enabled("lua_ls"), "lua_ls remained enabled for checker TUI fixture"); assert(#vim.lsp.get_clients({ name = "lua_ls", _uninitialized = true }) == 0, "lua_ls client remained after checker TUI disable"); vim.cmd.edit(vim.fn.fnameescape(vim.env.DOTFILES_NVIM_START_FILE)); assert(#vim.lsp.get_clients({ name = "lua_ls", _uninitialized = true }) == 0, "lua_ls client spawned after checker TUI fixture opened")'
+  start_lsp_command_quoted=$(shell_single_quote "$start_lsp_command") || return 1
+  start_command="env -u NVIM_APPNAME XDG_CONFIG_HOME=$start_config_quoted XDG_DATA_HOME=$start_data_quoted XDG_STATE_HOME=$start_state_quoted XDG_CACHE_HOME=$start_cache_quoted DOTFILES_NVIM_START_FILE=$start_file_quoted TERM=tmux-256color $start_nvim_quoted -i NONE -c $start_lsp_command_quoted"
 
   tmux -S "$start_socket" send-keys -t "$start_pane" -l "$start_command" \
     && tmux -S "$start_socket" send-keys -t "$start_pane" Enter
@@ -5422,7 +5424,7 @@ printf 'Data root: %s\n\n' "$data_home"
 static_shellcheck_ready=true
 static_stylua_ready=true
 git_security_commands_ready=true
-for required_command in uname awk sed grep cmp mktemp mkfifo wc ps infocmp git env ghostty herdr tmux nvim fzf jq shellcheck stylua cksum stat date curl tar tree-sitter; do
+for required_command in uname awk sed grep cmp mktemp mkfifo wc ps infocmp git env ghostty herdr tmux nvim lua-language-server fzf jq shellcheck stylua cksum stat date curl tar tree-sitter; do
   if ! require_command "$required_command"; then
     case "$required_command" in
       shellcheck) static_shellcheck_ready=false ;;
@@ -5487,9 +5489,11 @@ for static_lint_file in \
   "$terminal_stack_checker" \
   "$nvim_root/.stylua.toml" \
   "$nvim_root/init.lua" \
+  "$nvim_root/lsp/lua_ls.lua" \
   "$nvim_root/lua/config/autocmds.lua" \
   "$nvim_root/lua/config/keymaps.lua" \
   "$nvim_root/lua/config/lazy.lua" \
+  "$nvim_root/lua/config/lsp.lua" \
   "$nvim_root/lua/config/options.lua" \
   "$nvim_root/lua/config/platform.lua" \
   "$nvim_root/lua/config/treesitter.lua" \
@@ -5502,6 +5506,7 @@ for static_lint_file in \
   "$nvim_root/lua/plugins/treesitter.lua" \
   "$nvim_root/lua/ui/statusline.lua" \
   "$nvim_root/tests/foundation.lua" \
+  "$nvim_root/tests/lsp.lua" \
   "$nvim_root/tests/navigation.lua" \
   "$nvim_root/tests/oil_trash.lua" \
   "$nvim_root/tests/plugin_source.lua" \
@@ -9620,11 +9625,13 @@ nvim_config_ready=true
 for nvim_file in \
   "$nvim_root/init.lua" \
   "$nvim_root/lazy-lock.json" \
+  "$nvim_root/lsp/lua_ls.lua" \
   "$nvim_root/lua/config/options.lua" \
   "$nvim_root/lua/config/keymaps.lua" \
   "$nvim_root/lua/config/autocmds.lua" \
   "$nvim_root/lua/config/platform.lua" \
   "$nvim_root/lua/config/lazy.lua" \
+  "$nvim_root/lua/config/lsp.lua" \
   "$nvim_root/lua/config/treesitter.lua" \
   "$nvim_root/lua/navigation/root.lua" \
   "$nvim_root/lua/navigation/pickers.lua" \
@@ -9636,6 +9643,7 @@ for nvim_file in \
   "$nvim_root/lua/integrations/tmux_status.lua" \
   "$nvim_root/tests/platform.lua" \
   "$nvim_root/tests/foundation.lua" \
+  "$nvim_root/tests/lsp.lua" \
   "$nvim_root/tests/navigation.lua" \
   "$nvim_root/tests/oil_trash.lua" \
   "$nvim_root/tests/plugin_source.lua" \
@@ -9751,13 +9759,15 @@ if [ "$nvim_config_ready" = true ] && [ "$plugins_trusted" = true ] && command -
     XDG_CONFIG_HOME="$config_root" XDG_DATA_HOME="$data_home" TERM_PROGRAM=ghostty \
     DOTFILES_NVIM_SKIP_PARSER_INSTALL=1 \
     nvim --headless -i NONE \
+    -c 'lua assert(vim.lsp.is_enabled("lua_ls"), "lua_ls is not enabled during configured startup"); assert(vim.bo.filetype ~= "lua", "configured startup assertion buffer must not be Lua"); assert(#vim.lsp.get_clients({ name = "lua_ls", _uninitialized = true }) == 0, "lua_ls client spawned before a Lua buffer opened"); vim.lsp.enable("lua_ls", false)' \
     -c "luafile $nvim_root/tests/platform.lua" \
     -c "luafile $nvim_root/tests/foundation.lua" \
     -c "luafile $nvim_root/tests/navigation.lua" \
     -c "luafile $nvim_root/tests/statusline.lua" \
+    -c 'lua assert(#vim.lsp.get_clients({ name = "lua_ls", _uninitialized = true }) == 0, "lua_ls client spawned during configured foundation assertions")' \
     -c qa > "$check_tmp/nvim-tests.txt" 2>&1 \
     && ! nvim_log_has_error "$check_tmp/nvim-tests.txt"; then
-    pass "Neovim platform, navigation, TokyoNight, Treesitter, parser, FzfLua, Oil, MiniIcons, smart-splits, and statusline assertions pass"
+    pass "Neovim platform, native Lua LSP startup, navigation, TokyoNight, Treesitter, parser, FzfLua, Oil, MiniIcons, smart-splits, and statusline assertions pass"
   else
     sed 's/^/      /' "$check_tmp/nvim-tests.txt" >&2
     fail "Neovim headless foundation assertions failed"
