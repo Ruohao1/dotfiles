@@ -245,6 +245,19 @@ emit_selected_paths() {
   fi
 }
 
+emit_platform_preference_plan() {
+  selected_platform=$1
+  printf '%s\n' 'System preferences:'
+  case "$selected_platform" in
+    macos)
+      printf '%s\n' \
+        '  backup and set Spotlight shortcut Command+Shift+semicolon'
+      ;;
+    linux) printf '%s\n' '  none' ;;
+    *) die "unsupported preference platform: $selected_platform" ;;
+  esac
+}
+
 window_manager_config_manifest() {
   selected_window_manager=$1
   manifest_root=$2
@@ -1418,6 +1431,30 @@ install_dotfiles_wrapper() {
     || die 'could not install ~/.local/bin/dotfiles'
 }
 
+install_platform_preferences() {
+  selected_platform=$1
+  case "$selected_platform" in
+    linux) return 0 ;;
+    macos) ;;
+    *) die "unsupported preference platform: $selected_platform" ;;
+  esac
+
+  preference_helper=$HOME/.config/macos/spotlight-shortcut
+  [ -x "$preference_helper" ] \
+    || die 'deployed macOS Spotlight shortcut helper is not executable'
+  preference_tools=$transaction_run/preference-tools
+  mkdir -p "$transaction_run/preferences" "$preference_tools" \
+    || die 'could not create transaction preference storage'
+  transaction_preference_helper=$preference_tools/spotlight-shortcut
+  cp -p "$preference_helper" "$transaction_preference_helper" \
+    || die 'could not journal the Spotlight shortcut helper'
+  chmod 0700 "$transaction_preference_helper" \
+    || die 'could not protect the journaled Spotlight shortcut helper'
+  "$transaction_preference_helper" apply \
+    "$transaction_run/preferences/spotlight-shortcut" \
+    || die 'could not configure the macOS Spotlight shortcut'
+}
+
 migrate_window_manager_entrypoint() {
   selected_window_manager=$1
   case "$selected_window_manager" in
@@ -1503,6 +1540,7 @@ deploy_configuration() {
   done <"$prepared_selected_paths"
   create_window_manager_local_override "$selected_window_manager"
   install_dotfiles_wrapper
+  install_platform_preferences "$selected_platform"
 
   if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
     && [ "${DOTFILES_BOOTSTRAP_TEST_FAIL_AFTER_CHECKOUT:-0}" = 1 ]; then
@@ -1571,6 +1609,42 @@ report_retained_packages() {
   sed -n '/^Retained package actions:$/,$p' "$retained_report"
 }
 
+transaction_preference_helper_path() {
+  printf '%s\n' "$transaction_run/preference-tools/spotlight-shortcut"
+}
+
+preflight_transaction_preferences() {
+  preference_platform=$(cat "$transaction_run/platform" 2>/dev/null || true)
+  case "$preference_platform" in
+    linux) return 0 ;;
+    macos) ;;
+    *)
+      printf 'bootstrap: transaction has invalid platform metadata: %s\n' \
+        "${preference_platform:-missing}" >&2
+      return 1
+      ;;
+  esac
+
+  preference_journal=$transaction_run/preferences/spotlight-shortcut
+  [ -d "$preference_journal" ] || return 0
+  preference_helper=$(transaction_preference_helper_path)
+  if [ ! -x "$preference_helper" ]; then
+    printf '%s\n' \
+      'bootstrap: transaction is missing its Spotlight rollback helper' >&2
+    return 1
+  fi
+  "$preference_helper" can-restore "$preference_journal"
+}
+
+restore_transaction_preferences() {
+  preference_platform=$(cat "$transaction_run/platform" 2>/dev/null || true)
+  [ "$preference_platform" = macos ] || return 0
+  preference_journal=$transaction_run/preferences/spotlight-shortcut
+  [ -d "$preference_journal" ] || return 0
+  preference_helper=$(transaction_preference_helper_path)
+  "$preference_helper" restore "$preference_journal"
+}
+
 rollback_transaction() {
   transaction_run=$1
   rollback_status=$(cat "$transaction_run/status" 2>/dev/null || true)
@@ -1588,7 +1662,9 @@ rollback_transaction() {
       ;;
   esac
 
+  preflight_transaction_preferences || return 1
   printf '%s\n' rolling-back >"$transaction_run/status" || return 1
+  restore_transaction_preferences || return 1
   managed_journal=$transaction_run/managed.paths
   if [ -r "$managed_journal" ]; then
     reverse_journal "$managed_journal" \
@@ -1734,6 +1810,7 @@ emit_selected_paths "$platform" "$window_manager" "$script_dir/manifests" \
   | sed 's/^/  install /'
 printf '%s\n' 'Packages:'
 emit_package_plan "$manager" "$window_manager" "$script_dir/manifests"
+emit_platform_preference_plan "$platform"
 
 if [ "$mode" = dry-run ]; then
   prepare_dry_run=true

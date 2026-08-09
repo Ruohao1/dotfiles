@@ -1,1 +1,3 @@
 .config/hypr/hyprland.lua
+.config/launcher/application-launcher
+.config/launcher/rofi.rasi

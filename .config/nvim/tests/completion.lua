@@ -391,6 +391,7 @@ eq(#state.mapping_calls, 8, "repeated setup replaces four mappings")
 
 local original_autocomplete = vim.o.autocomplete
 local original_complete = vim.o.complete
+local original_backspace = vim.fn.maparg("<BS>", "i", false, true)
 completion.setup()
 completion.setup()
 eq(vim.opt.completeopt:get(), { "menuone", "noselect", "popup" }, "production completeopt")
@@ -414,9 +415,10 @@ for lhs, expected in pairs(expected_mappings) do
   eq(mapping.silent, 1, lhs .. " production silent flag")
 end
 
-assert(
-  vim.tbl_isempty(vim.fn.maparg("<BS>", "i", false, true)),
-  "physical Backspace must remain unmapped"
+eq(
+  vim.fn.maparg("<BS>", "i", false, true),
+  original_backspace,
+  "completion preserves physical Backspace ownership"
 )
 
 print("Native LSP completion assertions: ok")

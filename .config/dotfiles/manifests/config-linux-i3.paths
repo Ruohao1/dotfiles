@@ -1,2 +1,4 @@
 .config/i3/config
 .config/i3/dwindle
+.config/launcher/application-launcher
+.config/launcher/rofi.rasi

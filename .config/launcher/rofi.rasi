@@ -1,0 +1,101 @@
+configuration {
+    modes:               "drun";
+    font:                "SpaceMono Nerd Font Mono 12";
+    show-icons:          true;
+    drun-display-format: "{name}";
+    matching:            "fuzzy";
+    case-smart:          true;
+    cycle:               true;
+    sidebar-mode:        false;
+}
+
+* {
+    background:          #1a1b26f2;
+    surface:             #24283b;
+    selected:            #364a82;
+    border:              #3d59a1;
+    foreground:          #c0caf5;
+    muted:               #565f89;
+    accent:              #7aa2f7;
+
+    background-color:    transparent;
+    text-color:          var(foreground);
+}
+
+window {
+    width:               38em;
+    location:            center;
+    anchor:              center;
+    border:              1px;
+    border-radius:       14px;
+    border-color:        var(border);
+    background-color:    var(background);
+    padding:             12px;
+}
+
+mainbox {
+    background-color:    transparent;
+    spacing:             8px;
+    children:            [ inputbar, message, listview ];
+}
+
+inputbar {
+    background-color:    var(surface);
+    border-radius:       10px;
+    padding:             9px 11px;
+    spacing:             8px;
+    children:            [ prompt, entry ];
+}
+
+prompt {
+    background-color:    transparent;
+    text-color:          var(accent);
+}
+
+entry {
+    background-color:    transparent;
+    placeholder:         "Applications";
+    placeholder-color:   var(muted);
+}
+
+listview {
+    background-color:    transparent;
+    spacing:             4px;
+    scrollbar:           false;
+    fixed-height:        true;
+    lines:               8;
+    columns:             1;
+}
+
+element {
+    background-color:    transparent;
+    border-radius:       9px;
+    padding:             8px 10px;
+    spacing:             9px;
+}
+
+element selected {
+    background-color:    var(selected);
+    text-color:          var(foreground);
+}
+
+element-icon {
+    background-color:    transparent;
+    size:                1.2em;
+}
+
+element-text {
+    background-color:    transparent;
+    text-color:          inherit;
+}
+
+message {
+    background-color:    var(surface);
+    border-radius:       9px;
+    padding:             7px 9px;
+}
+
+textbox {
+    background-color:    transparent;
+    text-color:          var(muted);
+}

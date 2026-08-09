@@ -1,0 +1,555 @@
+#!/bin/sh
+
+set -eu
+
+LC_ALL=C
+export LC_ALL
+umask 077
+
+program=${0##*/}
+preference_domain=com.apple.symbolichotkeys
+preference_key=AppleSymbolicHotKeys
+spotlight_key=64
+target_entry='{"enabled":true,"value":{"parameters":[59,41,1179648],"type":"standard"}}'
+preference_tmp=
+tmp_base=
+
+usage() {
+  printf 'usage: %s (apply|can-restore|restore) JOURNAL_DIRECTORY\n' "$program"
+}
+
+error() {
+  printf '%s: %s\n' "$program" "$1" >&2
+}
+
+validate_absolute_path() {
+  checked_path=$1
+  path_label=$2
+  case "$checked_path" in
+    /|''|*"
+"*|*""*|*"	"*)
+      error "$path_label is unsafe"
+      return 1
+      ;;
+    /*) ;;
+    *)
+      error "$path_label must be absolute"
+      return 1
+      ;;
+  esac
+}
+
+cleanup() {
+  if [ -n "$preference_tmp" ] && [ -d "$preference_tmp" ]; then
+    case "$preference_tmp" in
+      "$tmp_base"/dotfiles-spotlight.*) rm -rf "$preference_tmp" ;;
+    esac
+  fi
+}
+
+trap cleanup 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+prepare_temporary_directory() {
+  [ -z "$preference_tmp" ] || return 0
+  tmp_base=${TMPDIR:-/tmp}
+  validate_absolute_path "$tmp_base" TMPDIR || return 1
+  preference_tmp=$(mktemp -d "$tmp_base/dotfiles-spotlight.XXXXXX") || {
+    error 'could not create temporary preference storage'
+    return 1
+  }
+}
+
+testing=false
+if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ]; then
+  testing=true
+fi
+
+test_state_directory() {
+  test_state=${DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STATE:-}
+  validate_absolute_path "$test_state" 'test preference state' || return 1
+  if [ ! -d "$test_state" ] || [ -L "$test_state" ]; then
+    error 'test preference state must be a real directory'
+    return 1
+  fi
+}
+
+production_tools_are_available() {
+  defaults_command=/usr/bin/defaults
+  plutil_command=/usr/bin/plutil
+  if [ ! -x "$defaults_command" ] || [ ! -x "$plutil_command" ]; then
+    error 'macOS defaults and plutil are required'
+    return 1
+  fi
+  if ! "$plutil_command" -help 2>&1 | grep -Fq -- '-replace'; then
+    error 'the installed plutil does not support guarded key-path updates'
+    return 1
+  fi
+}
+
+export_domain() {
+  domain_output=$1
+  if ! "$defaults_command" export "$preference_domain" "$domain_output" \
+      >/dev/null 2>&1; then
+    error "could not export $preference_domain"
+    return 1
+  fi
+  if ! "$plutil_command" -extract "$preference_key" xml1 \
+      -o "$preference_tmp/shortcut-dictionary.plist" "$domain_output" \
+      >/dev/null 2>&1; then
+    error "$preference_domain has an unsupported $preference_key schema"
+    return 1
+  fi
+}
+
+extract_entry_from_domain() {
+  domain_input=$1
+  entry_output=$2
+  if "$plutil_command" -extract "$preference_key.$spotlight_key" xml1 \
+      -o "$entry_output" "$domain_input" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 3
+}
+
+validate_existing_entry() {
+  entry_file=$1
+  if [ "$testing" = true ]; then
+    if [ "${DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_INVALID_SCHEMA:-0}" = 1 ]; then
+      error 'Spotlight shortcut has an unsupported preference schema'
+      return 1
+    fi
+    return 0
+  fi
+
+  enabled_value=$(
+    "$plutil_command" -extract enabled raw -o - "$entry_file" 2>/dev/null
+  ) || {
+    error 'Spotlight shortcut is missing its enabled flag'
+    return 1
+  }
+  case "$enabled_value" in
+    true|false|0|1) ;;
+    *)
+      error 'Spotlight shortcut has an invalid enabled flag'
+      return 1
+      ;;
+  esac
+  type_value=$(
+    "$plutil_command" -extract value.type raw -o - "$entry_file" 2>/dev/null
+  ) || {
+    error 'Spotlight shortcut is missing its type'
+    return 1
+  }
+  if [ "$type_value" != standard ]; then
+    error 'Spotlight shortcut has an unsupported type'
+    return 1
+  fi
+  parameter_index=0
+  while [ "$parameter_index" -lt 3 ]; do
+    parameter_value=$(
+      "$plutil_command" -extract "value.parameters.$parameter_index" raw \
+        -o - "$entry_file" 2>/dev/null
+    ) || {
+      error 'Spotlight shortcut has an incomplete parameter list'
+      return 1
+    }
+    case "$parameter_value" in
+      ''|*[!0-9]*)
+        error 'Spotlight shortcut has a nonnumeric parameter'
+        return 1
+        ;;
+    esac
+    parameter_index=$((parameter_index + 1))
+  done
+  if "$plutil_command" -extract value.parameters.3 raw -o - "$entry_file" \
+      >/dev/null 2>&1; then
+    error 'Spotlight shortcut has an unsupported parameter list'
+    return 1
+  fi
+}
+
+read_current_entry() {
+  entry_output=$1
+  if [ "$testing" = true ]; then
+    test_state_directory || return 1
+    if [ -f "$test_state/entry" ] && [ ! -L "$test_state/entry" ]; then
+      cp "$test_state/entry" "$entry_output" || return 1
+      validate_existing_entry "$entry_output" || return 1
+      return 0
+    fi
+    return 3
+  fi
+
+  production_tools_are_available || return 1
+  prepare_temporary_directory || return 1
+  domain_file=$preference_tmp/read-domain.plist
+  export_domain "$domain_file" || return 1
+  extract_entry_from_domain "$domain_file" "$entry_output"
+  read_status=$?
+  if [ "$read_status" -eq 0 ]; then
+    validate_existing_entry "$entry_output" || return 1
+  fi
+  return "$read_status"
+}
+
+entries_are_equal() {
+  first_entry=$1
+  second_entry=$2
+  if [ "$testing" = true ]; then
+    cmp -s "$first_entry" "$second_entry"
+    return
+  fi
+
+  prepare_temporary_directory || return 1
+  first_normalized=$preference_tmp/equal-first.plist
+  second_normalized=$preference_tmp/equal-second.plist
+  cp "$first_entry" "$first_normalized" || return 1
+  cp "$second_entry" "$second_normalized" || return 1
+  "$plutil_command" -convert binary1 "$first_normalized" >/dev/null 2>&1 \
+    || return 1
+  "$plutil_command" -convert binary1 "$second_normalized" >/dev/null 2>&1 \
+    || return 1
+  cmp -s "$first_normalized" "$second_normalized"
+}
+
+validate_target_entry() {
+  target_file=$1
+  if [ "$testing" = true ]; then
+    [ "$(cat "$target_file")" = "$target_entry" ]
+    return
+  fi
+
+  [ "$("$plutil_command" -extract enabled raw -o - "$target_file" 2>/dev/null)" = true ] \
+    && [ "$("$plutil_command" -extract value.type raw -o - "$target_file" 2>/dev/null)" = standard ] \
+    && [ "$("$plutil_command" -extract value.parameters.0 raw -o - "$target_file" 2>/dev/null)" = 59 ] \
+    && [ "$("$plutil_command" -extract value.parameters.1 raw -o - "$target_file" 2>/dev/null)" = 41 ] \
+    && [ "$("$plutil_command" -extract value.parameters.2 raw -o - "$target_file" 2>/dev/null)" = 1179648 ] \
+    && ! "$plutil_command" -extract value.parameters.3 raw -o - "$target_file" \
+      >/dev/null 2>&1
+}
+
+current_matches_before() {
+  before_present=$1
+  before_file=$2
+  current_file=$preference_tmp/current-before-write.entry
+  set +e
+  read_current_entry "$current_file"
+  current_status=$?
+  set -e
+  if [ "$before_present" = true ]; then
+    [ "$current_status" -eq 0 ] \
+      && entries_are_equal "$current_file" "$before_file"
+    return
+  fi
+  [ "$current_status" -eq 3 ]
+}
+
+write_target_entry() {
+  before_present=$1
+  before_file=$2
+  if [ "$testing" = true ]; then
+    test_state_directory || return 1
+    prepare_temporary_directory || return 1
+    if ! current_matches_before "$before_present" "$before_file"; then
+      error 'Spotlight shortcut changed before it could be updated'
+      return 3
+    fi
+    if [ "${DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_FAIL_WRITE:-0}" = 1 ]; then
+      error 'simulated Spotlight preference write failure'
+      return 1
+    fi
+    printf '%s\n' "$target_entry" >"$test_state/entry"
+    return
+  fi
+
+  production_tools_are_available || return 1
+  prepare_temporary_directory || return 1
+  domain_file=$preference_tmp/write-target-domain.plist
+  export_domain "$domain_file" || return 1
+  current_file=$preference_tmp/write-target-current.entry
+  set +e
+  extract_entry_from_domain "$domain_file" "$current_file"
+  current_status=$?
+  set -e
+  if [ "$before_present" = true ]; then
+    if [ "$current_status" -ne 0 ] \
+      || ! entries_are_equal "$current_file" "$before_file"; then
+      error 'Spotlight shortcut changed before it could be updated'
+      return 3
+    fi
+    update_action=-replace
+  else
+    if [ "$current_status" -ne 3 ]; then
+      error 'Spotlight shortcut appeared before it could be updated'
+      return 3
+    fi
+    update_action=-insert
+  fi
+  if ! "$plutil_command" "$update_action" \
+      "$preference_key.$spotlight_key" -json "$target_entry" "$domain_file"; then
+    error 'could not prepare the Spotlight shortcut preference'
+    return 1
+  fi
+  if ! "$defaults_command" import "$preference_domain" "$domain_file" \
+      >/dev/null 2>&1; then
+    error 'could not write the Spotlight shortcut preference'
+    return 1
+  fi
+}
+
+write_saved_entry() {
+  saved_entry=$1
+  if [ "$testing" = true ]; then
+    test_state_directory || return 1
+    cp "$saved_entry" "$test_state/entry"
+    return
+  fi
+
+  production_tools_are_available || return 1
+  prepare_temporary_directory || return 1
+  domain_file=$preference_tmp/restore-domain.plist
+  export_domain "$domain_file" || return 1
+  saved_json=$(
+    "$plutil_command" -convert json -o - "$saved_entry" 2>/dev/null
+  ) || {
+    error 'could not normalize the saved Spotlight shortcut'
+    return 1
+  }
+  if ! "$plutil_command" -replace "$preference_key.$spotlight_key" \
+      -json "$saved_json" "$domain_file"; then
+    error 'could not prepare the saved Spotlight shortcut'
+    return 1
+  fi
+  if ! "$defaults_command" import "$preference_domain" "$domain_file" \
+      >/dev/null 2>&1; then
+    error 'could not restore the saved Spotlight shortcut'
+    return 1
+  fi
+}
+
+delete_current_entry() {
+  if [ "$testing" = true ]; then
+    test_state_directory || return 1
+    rm -f "$test_state/entry"
+    return
+  fi
+
+  production_tools_are_available || return 1
+  prepare_temporary_directory || return 1
+  domain_file=$preference_tmp/delete-domain.plist
+  export_domain "$domain_file" || return 1
+  if ! "$plutil_command" -remove "$preference_key.$spotlight_key" \
+      "$domain_file"; then
+    error 'could not prepare removal of the generated Spotlight shortcut'
+    return 1
+  fi
+  if ! "$defaults_command" import "$preference_domain" "$domain_file" \
+      >/dev/null 2>&1; then
+    error 'could not remove the generated Spotlight shortcut'
+    return 1
+  fi
+}
+
+restore_previous_value() {
+  journal_directory=$1
+  if [ -f "$journal_directory/before.present" ]; then
+    write_saved_entry "$journal_directory/before.entry" || return 1
+    restored_entry=$preference_tmp/restored.entry
+    set +e
+    read_current_entry "$restored_entry"
+    restored_status=$?
+    set -e
+    [ "$restored_status" -eq 0 ] \
+      && entries_are_equal "$restored_entry" "$journal_directory/before.entry"
+    return
+  fi
+
+  delete_current_entry || return 1
+  absent_check=$preference_tmp/absent-check.entry
+  set +e
+  read_current_entry "$absent_check"
+  absent_status=$?
+  set -e
+  [ "$absent_status" -eq 3 ]
+}
+
+current_matches_journal_before() {
+  journal_directory=$1
+  prepare_temporary_directory || return 1
+  current_file=$preference_tmp/current-before-rollback.entry
+  set +e
+  read_current_entry "$current_file"
+  current_status=$?
+  set -e
+  if [ -f "$journal_directory/before.present" ]; then
+    [ "$current_status" -eq 0 ] \
+      && entries_are_equal "$current_file" "$journal_directory/before.entry"
+    return
+  fi
+  [ "$current_status" -eq 3 ]
+}
+
+apply_shortcut() {
+  journal_directory=$1
+  if [ -e "$journal_directory" ] || [ -L "$journal_directory" ]; then
+    error "journal already exists: $journal_directory"
+    return 1
+  fi
+  mkdir "$journal_directory" || {
+    error "could not create journal: $journal_directory"
+    return 1
+  }
+  printf '%s\n' preparing >"$journal_directory/status"
+  prepare_temporary_directory || return 1
+
+  before_file=$journal_directory/before.entry
+  set +e
+  read_current_entry "$before_file"
+  before_status=$?
+  set -e
+  case "$before_status" in
+    0)
+      : >"$journal_directory/before.present"
+      before_present=true
+      ;;
+    3)
+      rm -f "$before_file"
+      before_present=false
+      ;;
+    *)
+      printf '%s\n' failed >"$journal_directory/status"
+      return 1
+      ;;
+  esac
+
+  after_file=$journal_directory/after.entry
+  printf '%s\n' "$target_entry" >"$after_file"
+  if ! validate_target_entry "$after_file"; then
+    error 'could not prepare the expected Spotlight shortcut value'
+    printf '%s\n' failed >"$journal_directory/status"
+    return 1
+  fi
+
+  set +e
+  write_target_entry "$before_present" "$before_file"
+  write_status=$?
+  set -e
+  if [ "$write_status" -ne 0 ]; then
+    return "$write_status"
+  fi
+
+  if [ "$testing" = true ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STOP_AFTER_WRITE:-0}" = 1 ]; then
+    return 75
+  fi
+
+  applied_file=$preference_tmp/applied.entry
+  set +e
+  read_current_entry "$applied_file"
+  after_status=$?
+  set -e
+  if [ "$after_status" -ne 0 ] \
+    || ! validate_target_entry "$applied_file" \
+    || ! entries_are_equal "$applied_file" "$after_file"; then
+    error 'Spotlight shortcut verification failed; restoring the previous value'
+    if restore_previous_value "$journal_directory"; then
+      printf '%s\n' restored-after-failure >"$journal_directory/status"
+    else
+      printf '%s\n' restore-failed >"$journal_directory/status"
+      error 'the previous Spotlight shortcut could not be restored'
+    fi
+    return 1
+  fi
+
+  printf '%s\n' applied >"$journal_directory/status"
+  printf '%s\n' 'Spotlight shortcut set to Command+Shift+semicolon.'
+}
+
+can_restore_shortcut() {
+  journal_directory=$1
+  journal_status=$(cat "$journal_directory/status" 2>/dev/null || true)
+  case "$journal_status" in
+    failed|restored|restored-after-failure) return 0 ;;
+    applied|preparing) ;;
+    *)
+      error "Spotlight shortcut journal has invalid status: ${journal_status:-missing}"
+      return 1
+      ;;
+  esac
+  if [ ! -r "$journal_directory/after.entry" ]; then
+    error 'Spotlight shortcut journal is missing the applied value'
+    return 1
+  fi
+  prepare_temporary_directory || return 1
+  current_file=$preference_tmp/current-for-rollback.entry
+  set +e
+  read_current_entry "$current_file"
+  current_status=$?
+  set -e
+  if [ "$current_status" -eq 0 ] \
+    && entries_are_equal "$current_file" "$journal_directory/after.entry"; then
+    return 0
+  fi
+  if [ "$journal_status" = preparing ] \
+    && current_matches_journal_before "$journal_directory"; then
+    return 0
+  fi
+  error 'Spotlight shortcut changed after bootstrap; refusing to overwrite it'
+  return 3
+}
+
+restore_shortcut() {
+  journal_directory=$1
+  journal_status=$(cat "$journal_directory/status" 2>/dev/null || true)
+  case "$journal_status" in
+    failed|restored|restored-after-failure)
+      return 0
+      ;;
+  esac
+  can_restore_shortcut "$journal_directory" || return $?
+  if [ "$journal_status" = preparing ] \
+    && current_matches_journal_before "$journal_directory"; then
+    printf '%s\n' restored >"$journal_directory/status"
+    return 0
+  fi
+  if ! restore_previous_value "$journal_directory"; then
+    error 'could not restore the previous Spotlight shortcut'
+    return 1
+  fi
+  printf '%s\n' restored >"$journal_directory/status"
+  printf '%s\n' 'Spotlight shortcut restored.'
+}
+
+if [ "$#" -ne 2 ]; then
+  usage >&2
+  exit 2
+fi
+
+operation=$1
+journal=$2
+validate_absolute_path "$journal" journal || exit 2
+
+case "$operation" in
+  apply) apply_shortcut "$journal" ;;
+  can-restore)
+    [ -d "$journal" ] && [ ! -L "$journal" ] || {
+      error "journal is unavailable: $journal"
+      exit 1
+    }
+    can_restore_shortcut "$journal"
+    ;;
+  restore)
+    [ -d "$journal" ] && [ ! -L "$journal" ] || {
+      error "journal is unavailable: $journal"
+      exit 1
+    }
+    restore_shortcut "$journal"
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
