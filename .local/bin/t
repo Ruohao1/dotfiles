@@ -1,0 +1,92 @@
+#!/bin/sh
+set -eu
+
+die() {
+  printf 't: %s\n' "$1" >&2
+  exit 1
+}
+
+usage() {
+  printf '%s\n' 'usage: t' >&2
+}
+
+attach_session() {
+  exec tmux attach-session -c "$project_root" -t "=$1"
+}
+
+session_root() {
+  tmux display-message -p -t "=$1:" '#{session_path}' 2>/dev/null
+}
+
+claim_or_attach() {
+  candidate=$1
+
+  if tmux has-session -t "=$candidate" 2>/dev/null; then
+    existing_root=$(session_root "$candidate") || die "could not inspect session '$candidate'"
+    if [ "$existing_root" = "$project_root" ]; then
+      attach_session "$candidate"
+    fi
+    return 1
+  fi
+
+  if tmux new-session -d -s "$candidate" -c "$project_root" 2>/dev/null; then
+    attach_session "$candidate"
+  fi
+
+  if tmux has-session -t "=$candidate" 2>/dev/null; then
+    existing_root=$(session_root "$candidate") || die "could not inspect session '$candidate' after a create race"
+    if [ "$existing_root" = "$project_root" ]; then
+      attach_session "$candidate"
+    fi
+    return 1
+  fi
+
+  die "could not create session '$candidate'"
+}
+
+if [ -n "${TMUX-}" ]; then
+  die "already inside tmux"
+fi
+
+if [ "$#" -ne 0 ]; then
+  usage
+  exit 2
+fi
+
+if ! command -v tmux >/dev/null 2>&1; then
+  printf '%s\n' 't: tmux is not installed or not in PATH' >&2
+  exit 127
+fi
+
+if ! command -v git >/dev/null 2>&1; then
+  printf '%s\n' 't: git is not installed or not in PATH' >&2
+  exit 127
+fi
+
+if ! git_root=$(git rev-parse --show-toplevel 2>/dev/null); then
+  exec tmux
+fi
+
+if ! project_root=$(CDPATH='' cd -P "$git_root" 2>/dev/null && pwd -P); then
+  die "could not normalize Git root '$git_root'"
+fi
+
+project_name=${project_root##*/}
+session_base=$(printf '%s' "$project_name" | LC_ALL=C sed 's/[^A-Za-z0-9_-][^A-Za-z0-9_-]*/_/g')
+if [ -z "$session_base" ]; then
+  session_base=project
+fi
+
+if claim_or_attach "$session_base"; then
+  exit 0
+fi
+
+full_hash=$(printf '%s' "$project_root" | git hash-object --stdin 2>/dev/null) || die "could not hash Git root '$project_root'"
+short_hash=$(printf '%.8s' "$full_hash")
+collision_name=$session_base-$short_hash
+
+if claim_or_attach "$collision_name"; then
+  exit 0
+fi
+
+die "session '$collision_name' belongs to another project"
