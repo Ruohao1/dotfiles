@@ -223,7 +223,12 @@ validate_snapshot() {
         or .process.kind == "codex"
         or .process.kind == "other")
       and (.process.codex_session_id == null or (.process.codex_session_id | safe_text(512) and length > 0))
-      and (.process.nvim_session == null or (.process.nvim_session | safe_text(1024) and length > 0)))
+      and (.process.nvim_session == null
+        or (.process.nvim_session
+          | safe_text(1024) and test("^nvim/pane-[0-9]+\\.vim$")))
+      and (if .process.kind == "codex" then .process.nvim_session == null
+        elif .process.kind == "nvim" then .process.codex_session_id == null
+        else .process.codex_session_id == null and .process.nvim_session == null end))
     and all(.windows[];
       . as $window
       | all($window.panes[];
@@ -303,6 +308,39 @@ display_field() {
     || die "could not read $label from tmux" 1
   require_safe_text "$field_value" "$maximum" "$label"
   printf '%s\n' "$field_value"
+}
+
+checkpoint_nvim() {
+  checkpoint_pane=$1
+  checkpoint_server=$2
+  require_identifier "$checkpoint_pane" '^%[0-9]+$' 'Neovim pane identifier'
+  require_safe_text "$checkpoint_server" 8192 'Neovim server address'
+  case $checkpoint_server in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  command -v nvim >/dev/null 2>&1 || return 1
+
+  checkpoint_relative=nvim/pane-${checkpoint_pane#%}.vim
+  checkpoint_file=$staging_dir/$checkpoint_relative
+  mkdir -p "$staging_dir/nvim"
+  chmod 0700 "$staging_dir/nvim"
+  encoded_checkpoint=$(jq -Rn --arg path "$checkpoint_file" '$path')
+  checkpoint_expression="luaeval(\"require('integrations.tmux_persistence').checkpoint(_A)\",$encoded_checkpoint)"
+  if ! checkpoint_result=$(nvim --server "$checkpoint_server" --remote-expr \
+    "$checkpoint_expression" 2>/dev/null); then
+    append_warning 'a Neovim checkpoint RPC failed; a clean editor will be restored'
+    return 1
+  fi
+  if [ "$checkpoint_result" != ok ] \
+    || [ ! -f "$checkpoint_file" ] \
+    || [ -L "$checkpoint_file" ] \
+    || [ ! -s "$checkpoint_file" ]; then
+    append_warning 'a Neovim checkpoint was invalid; a clean editor will be restored'
+    return 1
+  fi
+  chmod 0600 "$checkpoint_file"
+  printf '%s\n' "$checkpoint_relative"
 }
 
 capture_snapshot() {
@@ -452,7 +490,16 @@ capture_snapshot() {
     pane_title=$(display_field "$pane_key" '#{pane_title}' 'pane title' 1024)
     pane_command=$(display_field "$pane_key" '#{pane_current_command}' 'pane command' 256)
     codex_session_id=
+    nvim_session=
     case ${pane_command##*/} in
+      nvim|nvimdiff|nvim-wrapped|nvimdiff-wrapped)
+        process_kind=nvim
+        nvim_server=$(tmux_run show-options -pqv -t "$pane_key" \
+          @dotfiles_nvim_server 2>/dev/null || :)
+        if [ -n "$nvim_server" ]; then
+          nvim_session=$(checkpoint_nvim "$pane_key" "$nvim_server" || :)
+        fi
+        ;;
       codex|codex-*)
         codex_active=$(tmux_run show-options -pqv -t "$pane_key" \
           @dotfiles_codex_active 2>/dev/null || :)
@@ -482,6 +529,7 @@ capture_snapshot() {
       --arg title "$pane_title" \
       --arg process_kind "$process_kind" \
       --arg codex_session_id "$codex_session_id" \
+      --arg nvim_session "$nvim_session" \
       '{
         key:$key,
         window_key:$window_key,
@@ -491,7 +539,7 @@ capture_snapshot() {
         process:{
           kind:$process_kind,
           codex_session_id:(if $codex_session_id == "" then null else $codex_session_id end),
-          nvim_session:null
+          nvim_session:(if $nvim_session == "" then null else $nvim_session end)
         }
       }' >>"$panes_file"
   done <"$pane_ids_file"
@@ -650,6 +698,15 @@ append_warning() {
   warning_file=$workspace_state/last-warning
   printf '%s\n' "$warning" >"$warning_file"
   chmod 0600 "$warning_file"
+}
+
+file_mode() {
+  mode_path=$1
+  case $(uname -s) in
+    Linux) stat -c %a "$mode_path" ;;
+    Darwin) stat -f %Lp "$mode_path" ;;
+    *) return 1 ;;
+  esac
 }
 
 restore_path() {
@@ -1067,7 +1124,22 @@ resume_pane() {
       exec codex resume
       ;;
     nvim)
-      die 'Neovim resume is not available yet' 1
+      command -v nvim >/dev/null 2>&1 \
+        || die 'nvim is unavailable; leaving the restored shell open' 127
+      nvim_session=$(printf '%s\n' "$pane_record" | \
+        jq -r '.process.nvim_session // empty')
+      if [ -n "$nvim_session" ]; then
+        printf '%s\n' "$nvim_session" | grep -Eq '^nvim/pane-[0-9]+\.vim$' \
+          || die 'invalid Neovim session path in snapshot' 1
+        nvim_session_file=$workspace_state/snapshots/$requested_generation/$nvim_session
+        if [ -f "$nvim_session_file" ] \
+          && [ ! -L "$nvim_session_file" ] \
+          && [ -s "$nvim_session_file" ] \
+          && [ "$(file_mode "$nvim_session_file" 2>/dev/null || :)" = 600 ]; then
+          exec nvim -S "$nvim_session_file"
+        fi
+      fi
+      exec nvim
       ;;
     *)
       die 'pane process is not restorable' 2

@@ -373,4 +373,80 @@ if grep -R -F '/ignored/a.jsonl' "$state/dotfiles/tmux" >/dev/null 2>&1 \
   fail "Codex transcript path entered persistence state"
 fi
 
+stop_private_server
+real_nvim=$(command -v nvim) || fail "nvim is required"
+nvim_project=$test_root/projects/nvim
+mkdir -p "$nvim_project"
+printf '%s\n' "return 'first'" >"$nvim_project/first.lua"
+printf '%s\n' "return 'second'" >"$nvim_project/second.lua"
+NVIM_TEST_REAL=$real_nvim
+NVIM_TEST_CONFIG=$script_dir/../../nvim
+NVIM_TEST_FIRST=$nvim_project/first.lua
+NVIM_TEST_SECOND=$nvim_project/second.lua
+export NVIM_TEST_REAL NVIM_TEST_CONFIG NVIM_TEST_FIRST NVIM_TEST_SECOND
+cat >"$shim_directory/nvim-source" <<'SHIM'
+#!/bin/sh
+set -eu
+exec "$NVIM_TEST_REAL" -i NONE -u NONE \
+  --cmd "set runtimepath^=$NVIM_TEST_CONFIG" \
+  --cmd "lua require('integrations.tmux_persistence').setup()" \
+  -c "edit $NVIM_TEST_FIRST" \
+  -c "vsplit $NVIM_TEST_SECOND"
+SHIM
+chmod 0755 "$shim_directory/nvim-source"
+HOME=$test_root/home XDG_STATE_HOME=$state XDG_RUNTIME_DIR=$runtime \
+  PATH=$PATH "$real_tmux" -f "$script_dir/../conf/options.conf" -S "$socket" \
+  new-session -d -s nvim-work -c "$nvim_project" -n editor nvim-source
+nvim_pane=$(private_tmux display-message -p -t '=nvim-work:1.1' '#{pane_id}')
+wait_attempt=0
+nvim_server=
+while [ "$wait_attempt" -lt 300 ]; do
+  nvim_server=$(private_tmux show-options -pqv -t "$nvim_pane" \
+    @dotfiles_nvim_server 2>/dev/null || :)
+  [ -n "$nvim_server" ] && break
+  sleep 0.01
+  wait_attempt=$((wait_attempt + 1))
+done
+[ -n "$nvim_server" ] || fail "Neovim RPC registration"
+assert_equal nvim \
+  "$(private_tmux display-message -p -t "$nvim_pane" '#{pane_current_command}')" \
+  "Neovim pane command"
+
+run_workspace save
+[ "$status" -eq 0 ] || sed -n '1,120p' "$stderr" >&2
+assert_equal 0 "$status" "Neovim metadata checkpoint"
+nvim_generation=$(cat "$state/dotfiles/tmux/current")
+nvim_manifest=$state/dotfiles/tmux/snapshots/$nvim_generation/snapshot.json
+nvim_relative=$(jq -er '
+  .panes[]
+  | select(.process.kind == "nvim")
+  | .process.nvim_session
+' "$nvim_manifest") || fail "native Neovim session metadata"
+nvim_session_file=$state/dotfiles/tmux/snapshots/$nvim_generation/$nvim_relative
+[ -s "$nvim_session_file" ] || fail "native Neovim session file"
+assert_equal 600 "$(stat -c %a "$nvim_session_file")" "native Neovim session mode"
+
+stop_private_server
+cat >"$shim_directory/nvim" <<'SHIM'
+#!/bin/sh
+set -eu
+for argument
+do
+  printf '%s\n' "$argument"
+done >"$CODEX_TEST_LOG_DIRECTORY/nvim"
+SHIM
+chmod 0755 "$shim_directory/nvim"
+run_workspace restore
+[ "$status" -eq 0 ] || sed -n '1,120p' "$stderr" >&2
+assert_equal 0 "$status" "Neovim process restore"
+wait_attempt=0
+while [ ! -f "$codex_log_directory/nvim" ] && [ "$wait_attempt" -lt 200 ]; do
+  sleep 0.01
+  wait_attempt=$((wait_attempt + 1))
+done
+[ -f "$codex_log_directory/nvim" ] || fail "Neovim restore argv"
+assert_equal "$(printf '%s\n%s' -S "$nvim_session_file")" \
+  "$(cat "$codex_log_directory/nvim")" \
+  "native Neovim restore argv"
+
 pass "workspace structural restore"
