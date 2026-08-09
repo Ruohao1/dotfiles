@@ -615,13 +615,110 @@ local fzf_keys = {}
 for _, mapping in ipairs(fzf_spec.keys) do
   table.insert(fzf_keys, mapping[1])
 end
-eq(
-  fzf_keys,
-  { "<leader>ff", "<leader>fg", "<leader>fb", "<leader>fr", "<leader>fh" },
-  "FzfLua mapping surface"
-)
+eq(fzf_keys, {
+  "<leader>ff",
+  "<leader>fg",
+  "<leader>fb",
+  "<leader>fr",
+  "<leader>fh",
+  "<leader>fl",
+  "<leader>fs",
+  "<leader>fS",
+  "<leader>fd",
+  "<leader>fD",
+}, "FzfLua mapping surface")
 assert(not contains(fzf_keys, "<leader>fk"), "keymap picker must remain absent")
 assert(not contains(fzf_keys, "<leader>fR"), "resume picker must remain absent")
+
+local expected_fzf_lsp_mappings = {
+  {
+    lhs = "<leader>fl",
+    desc = "LSP locations",
+    picker = "lsp_locations",
+    api = "lsp_finder",
+  },
+  {
+    lhs = "<leader>fs",
+    desc = "Document symbols",
+    picker = "document_symbols",
+    api = "lsp_document_symbols",
+  },
+  {
+    lhs = "<leader>fS",
+    desc = "Workspace symbols",
+    picker = "workspace_symbols",
+    api = "lsp_live_workspace_symbols",
+  },
+  {
+    lhs = "<leader>fd",
+    desc = "Document diagnostics",
+    picker = "document_diagnostics",
+    api = "diagnostics_document",
+  },
+  {
+    lhs = "<leader>fD",
+    desc = "All diagnostics",
+    picker = "all_diagnostics",
+    api = "diagnostics_workspace",
+  },
+}
+
+local fzf_lsp_callbacks = {}
+for _, expected in ipairs(expected_fzf_lsp_mappings) do
+  local matches = {}
+  for _, mapping in ipairs(fzf_spec.keys) do
+    if mapping[1] == expected.lhs then
+      table.insert(matches, mapping)
+    end
+  end
+  eq(#matches, 1, "mapping count for " .. expected.lhs)
+  assert(type(matches[1][2]) == "function", "mapping callback missing for " .. expected.lhs)
+  eq(matches[1].desc, expected.desc, "mapping description for " .. expected.lhs)
+  table.insert(fzf_lsp_callbacks, matches[1][2])
+end
+
+local previous_picker_module = package.loaded["navigation.pickers"]
+local callback_calls = {}
+local fake_picker_module = {}
+for _, expected in ipairs(expected_fzf_lsp_mappings) do
+  local picker_name = expected.picker
+  fake_picker_module[picker_name] = function()
+    table.insert(callback_calls, picker_name)
+  end
+end
+
+package.loaded["navigation.pickers"] = fake_picker_module
+local callbacks_ok, callbacks_error = xpcall(function()
+  for _, callback in ipairs(fzf_lsp_callbacks) do
+    callback()
+  end
+end, debug.traceback)
+package.loaded["navigation.pickers"] = previous_picker_module
+if not callbacks_ok then
+  error(callbacks_error, 0)
+end
+
+eq(callback_calls, {
+  "lsp_locations",
+  "document_symbols",
+  "workspace_symbols",
+  "document_diagnostics",
+  "all_diagnostics",
+}, "FzfLua LSP mapping callbacks")
+
+if package.loaded["lazy"] ~= nil then
+  local installed_fzf = require("fzf-lua")
+  for _, expected in ipairs(expected_fzf_lsp_mappings) do
+    assert(type(installed_fzf[expected.api]) == "function", "missing FzfLua API " .. expected.api)
+    local mapping = vim.fn.maparg(expected.lhs, "n", false, true)
+    assert(
+      type(mapping) == "table" and next(mapping) ~= nil,
+      "missing live mapping " .. expected.lhs
+    )
+    eq(mapping.desc, expected.desc, "live mapping description for " .. expected.lhs)
+  end
+end
+
 eq(fzf_spec.dependencies, { "nvim-mini/mini.icons" }, "FzfLua MiniIcons dependency")
 
 local action_stubs = {
