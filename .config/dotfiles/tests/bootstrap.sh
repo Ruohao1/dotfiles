@@ -281,8 +281,24 @@ cp -R \
   "$workspace_root/.config/ghostty" \
   "$workspace_root/.config/herdr" \
   "$workspace_root/.config/nvim" \
-  "$workspace_root/.config/tmux" \
   "$fixture_work/.config/"
+mkdir -p \
+  "$fixture_work/.config/tmux/conf/platform" \
+  "$fixture_work/.config/tmux/scripts" \
+  "$fixture_work/.config/tmux/tests"
+cp \
+  "$workspace_root/.config/tmux/conf/keys.conf" \
+  "$workspace_root/.config/tmux/conf/options.conf" \
+  "$workspace_root/.config/tmux/conf/status.conf" \
+  "$fixture_work/.config/tmux/conf/"
+cp \
+  "$workspace_root/.config/tmux/conf/platform/linux.conf" \
+  "$workspace_root/.config/tmux/conf/platform/macos.conf" \
+  "$fixture_work/.config/tmux/conf/platform/"
+cp "$workspace_root/.config/tmux/tmux.conf" "$fixture_work/.config/tmux/tmux.conf"
+cp -R "$workspace_root/.config/tmux/scripts/." "$fixture_work/.config/tmux/scripts/"
+cp "$workspace_root/.config/tmux/tests/project-session.sh" \
+  "$fixture_work/.config/tmux/tests/project-session.sh"
 cp "$workspace_root/Library/Application Support/com.mitchellh.ghostty/config.ghostty" \
   "$fixture_work/Library/Application Support/com.mitchellh.ghostty/config.ghostty"
 printf '%s\n' 'fixture nvim' >"$fixture_work/.config/nvim/init.lua"
