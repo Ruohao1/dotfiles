@@ -209,6 +209,24 @@ else
   fail 'focus-follows-mouse is disabled everywhere'
 fi
 
+if grep -Fqx \
+    'hl.bind("SUPER + mouse:272", hl.dsp.window.drag(), { mouse = true })' \
+    "$hypr_config" \
+  && grep -Fqx \
+    'hl.bind("SUPER + mouse:273", hl.dsp.window.resize(), { mouse = true })' \
+    "$hypr_config"; then
+  pass 'Hyprland supports Super plus left-drag move and right-drag resize'
+else
+  fail 'Hyprland supports Super plus left-drag move and right-drag resize'
+fi
+
+if grep -Fqx "floating_modifier \$mod" "$i3_config" \
+  && grep -Fqx 'tiling_drag modifier' "$i3_config"; then
+  pass 'i3 supports Super plus mouse drag for floating and tiled windows'
+else
+  fail 'i3 supports Super plus mouse drag for floating and tiled windows'
+fi
+
 if grep -Fq 'dofile(local_config)' "$hypr_config" \
   && grep -Fqx 'include ~/.config/i3/local.conf' "$i3_config" \
   && grep -Fqx \

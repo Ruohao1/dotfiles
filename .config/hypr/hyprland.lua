@@ -19,6 +19,9 @@ hl.config({
     },
 })
 
+hl.bind("SUPER + mouse:272", hl.dsp.window.drag(), { mouse = true })
+hl.bind("SUPER + mouse:273", hl.dsp.window.resize(), { mouse = true })
+
 hl.bind("SUPER + H", hl.dsp.focus({ direction = "left" }))
 hl.bind("SUPER + J", hl.dsp.focus({ direction = "down" }))
 hl.bind("SUPER + K", hl.dsp.focus({ direction = "up" }))

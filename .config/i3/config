@@ -3,6 +3,8 @@
 set $mod Mod4
 focus_follows_mouse no
 workspace_auto_back_and_forth no
+floating_modifier $mod
+tiling_drag modifier
 
 bindsym $mod+h focus left
 bindsym $mod+j focus down
