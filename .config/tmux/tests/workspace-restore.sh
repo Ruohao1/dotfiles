@@ -60,6 +60,23 @@ run_workspace() {
   set -e
 }
 
+run_codex_hook() {
+  hook_pane=$1
+  hook_payload=$2
+  set +e
+  printf '%s\n' "$hook_payload" |
+    HOME=$test_root/home \
+      SHELL=/bin/sh \
+      XDG_STATE_HOME=$state \
+      XDG_RUNTIME_DIR=$runtime \
+      TMUX_WORKSPACE_TESTING=1 \
+      TMUX_WORKSPACE_SOCKET=$socket \
+      TMUX_PANE=$hook_pane \
+      "$workspace" codex-hook >"$stdout" 2>"$stderr"
+  status=$?
+  set -e
+}
+
 private_tmux() {
   "$real_tmux" -S "$socket" "$@"
 }
@@ -242,5 +259,118 @@ assert_equal 1 \
 assert_equal "$(cat "$runtime/dotfiles-tmux/ready")" \
   "$(private_tmux show-options -gqv @dotfiles_workspace_generation)" \
   "ready marker matches restored generation"
+
+stop_private_server
+shim_directory=$test_root/bin
+codex_log_directory=$test_root/codex-logs
+mkdir -p "$shim_directory" "$codex_log_directory" \
+  "$test_root/home/.config/tmux/scripts"
+ln -s "$workspace" "$test_root/home/.config/tmux/scripts/workspace"
+cp "$(command -v sleep)" "$shim_directory/codex"
+chmod 0755 "$shim_directory/codex"
+PATH=$shim_directory:$PATH
+CODEX_TEST_LOG_DIRECTORY=$codex_log_directory
+export PATH CODEX_TEST_LOG_DIRECTORY
+
+"$real_tmux" -f "$script_dir/../conf/options.conf" -S "$socket" \
+  new-session -d -s codex-work -c "$test_root/projects/alpha" \
+  -n conversations 'codex 300'
+private_tmux split-window -d -t '=codex-work:1' \
+  -c "$test_root/projects/alpha" 'codex 300'
+codex_alpha_pane=$(private_tmux display-message -p -t '=codex-work:1.1' '#{pane_id}')
+codex_beta_pane=$(private_tmux display-message -p -t '=codex-work:1.2' '#{pane_id}')
+assert_equal codex \
+  "$(private_tmux display-message -p -t "$codex_alpha_pane" '#{pane_current_command}')" \
+  "alpha pane command"
+assert_equal codex \
+  "$(private_tmux display-message -p -t "$codex_beta_pane" '#{pane_current_command}')" \
+  "beta pane command"
+
+alpha_payload='{"session_id":"thr_alpha","transcript_path":"/ignored/a.jsonl","cwd":"/same","hook_event_name":"SessionStart","model":"gpt-5.6-sol","source":"startup"}'
+beta_payload='{"session_id":"thr_beta","transcript_path":"/ignored/b.jsonl","cwd":"/same","hook_event_name":"SessionStart","model":"gpt-5.6-sol","source":"resume"}'
+run_codex_hook "$codex_alpha_pane" "$alpha_payload"
+assert_equal 0 "$status" "alpha SessionStart hook"
+[ ! -s "$stdout" ] || fail "SessionStart hook wrote model context"
+run_codex_hook "$codex_beta_pane" "$beta_payload"
+assert_equal 0 "$status" "beta SessionStart hook"
+assert_equal thr_alpha \
+  "$(private_tmux show-options -pqv -t "$codex_alpha_pane" @dotfiles_codex_session_id)" \
+  "alpha pane exact session"
+assert_equal thr_beta \
+  "$(private_tmux show-options -pqv -t "$codex_beta_pane" @dotfiles_codex_session_id)" \
+  "beta pane exact session"
+
+stale_end='{"session_id":"thr_stale","transcript_path":"/ignored/stale.jsonl","cwd":"/same","hook_event_name":"SessionEnd","model":"gpt-5.6-sol","reason":"other"}'
+run_codex_hook "$codex_alpha_pane" "$stale_end"
+assert_equal 0 "$status" "stale SessionEnd hook"
+assert_equal thr_alpha \
+  "$(private_tmux show-options -pqv -t "$codex_alpha_pane" @dotfiles_codex_session_id)" \
+  "stale SessionEnd preserves current conversation"
+alpha_end='{"session_id":"thr_alpha","transcript_path":"/ignored/a.jsonl","cwd":"/same","hook_event_name":"SessionEnd","model":"gpt-5.6-sol","reason":"other"}'
+run_codex_hook "$codex_alpha_pane" "$alpha_end"
+assert_equal 0 "$status" "matching SessionEnd hook"
+assert_equal '' \
+  "$(private_tmux show-options -pqv -t "$codex_alpha_pane" @dotfiles_codex_session_id)" \
+  "matching SessionEnd clears identifier"
+run_codex_hook "$codex_alpha_pane" "$alpha_payload"
+assert_equal 0 "$status" "alpha SessionStart re-registration"
+
+run_workspace save
+assert_equal 0 "$status" "Codex metadata checkpoint"
+codex_generation=$(cat "$state/dotfiles/tmux/current")
+codex_manifest=$state/dotfiles/tmux/snapshots/$codex_generation/snapshot.json
+jq -e '
+  any(.panes[]; .process.kind == "codex" and .process.codex_session_id == "thr_alpha")
+  and any(.panes[]; .process.kind == "codex" and .process.codex_session_id == "thr_beta")
+' "$codex_manifest" >/dev/null || fail "distinct same-cwd Codex metadata"
+
+private_tmux set-option -pu -t "$codex_beta_pane" @dotfiles_codex_session_id
+run_workspace save
+assert_equal 0 "$status" "Codex picker fallback checkpoint"
+codex_generation=$(cat "$state/dotfiles/tmux/current")
+codex_manifest=$state/dotfiles/tmux/snapshots/$codex_generation/snapshot.json
+jq -e '
+  any(.panes[]; .process.kind == "codex" and .process.codex_session_id == "thr_alpha")
+  and any(.panes[]; .process.kind == "codex" and .process.codex_session_id == null)
+' "$codex_manifest" >/dev/null || fail "Codex picker fallback metadata"
+
+stop_private_server
+cat >"$shim_directory/codex" <<'SHIM'
+#!/bin/sh
+set -eu
+
+case $* in
+  'resume thr_alpha') output=$CODEX_TEST_LOG_DIRECTORY/alpha ;;
+  'resume') output=$CODEX_TEST_LOG_DIRECTORY/picker ;;
+  *) output=$CODEX_TEST_LOG_DIRECTORY/unexpected ;;
+esac
+for argument
+do
+  printf '%s\n' "$argument"
+done >"$output"
+SHIM
+chmod 0755 "$shim_directory/codex"
+run_workspace restore
+[ "$status" -eq 0 ] || sed -n '1,120p' "$stderr" >&2
+assert_equal 0 "$status" "Codex process restore"
+wait_attempt=0
+while { [ ! -f "$codex_log_directory/alpha" ] \
+  || [ ! -f "$codex_log_directory/picker" ]; } \
+  && [ "$wait_attempt" -lt 200 ]; do
+  sleep 0.01
+  wait_attempt=$((wait_attempt + 1))
+done
+[ -f "$codex_log_directory/alpha" ] || fail "exact Codex resume call"
+[ -f "$codex_log_directory/picker" ] || fail "Codex picker resume call"
+assert_equal "$(printf 'resume\nthr_alpha')" \
+  "$(cat "$codex_log_directory/alpha")" \
+  "exact Codex resume argv"
+assert_equal resume "$(cat "$codex_log_directory/picker")" \
+  "Codex picker argv"
+[ ! -e "$codex_log_directory/unexpected" ] || fail "unexpected Codex resume argv"
+if grep -R -F '/ignored/a.jsonl' "$state/dotfiles/tmux" >/dev/null 2>&1 \
+  || grep -R -F '/ignored/b.jsonl' "$state/dotfiles/tmux" >/dev/null 2>&1; then
+  fail "Codex transcript path entered persistence state"
+fi
 
 pass "workspace structural restore"

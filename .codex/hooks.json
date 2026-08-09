@@ -1,0 +1,29 @@
+{
+  "description": "Associate Codex conversations with their tmux panes for workspace restoration.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.config/tmux/scripts/workspace\" codex-hook",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "other",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.config/tmux/scripts/workspace\" codex-hook",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

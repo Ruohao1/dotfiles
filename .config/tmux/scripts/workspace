@@ -25,6 +25,7 @@ supervisor_lock_path=
 supervisor_lock_held=0
 supervisor_stop=0
 sleeper=
+hook_temp=
 
 usage() {
   destination=$1
@@ -262,6 +263,14 @@ safe_text() {
     >/dev/null 2>&1
 }
 
+session_id_is_valid() {
+  session_id=$1
+  case $session_id in
+    ''|-*) return 1 ;;
+  esac
+  safe_text "$session_id" 512
+}
+
 require_safe_text() {
   value=$1
   maximum=$2
@@ -442,7 +451,22 @@ capture_snapshot() {
     esac
     pane_title=$(display_field "$pane_key" '#{pane_title}' 'pane title' 1024)
     pane_command=$(display_field "$pane_key" '#{pane_current_command}' 'pane command' 256)
+    codex_session_id=
     case ${pane_command##*/} in
+      codex|codex-*)
+        codex_active=$(tmux_run show-options -pqv -t "$pane_key" \
+          @dotfiles_codex_active 2>/dev/null || :)
+        codex_session_id=$(tmux_run show-options -pqv -t "$pane_key" \
+          @dotfiles_codex_session_id 2>/dev/null || :)
+        if [ "$codex_active" = 1 ] \
+          && { [ -z "$codex_session_id" ] \
+            || session_id_is_valid "$codex_session_id"; }; then
+          process_kind=codex
+        else
+          process_kind=other
+          codex_session_id=
+        fi
+        ;;
       sh|ash|bash|dash|fish|ksh|mksh|nu|tcsh|zsh|elvish)
         process_kind=shell
         ;;
@@ -457,13 +481,18 @@ capture_snapshot() {
       --arg path "$pane_path" \
       --arg title "$pane_title" \
       --arg process_kind "$process_kind" \
+      --arg codex_session_id "$codex_session_id" \
       '{
         key:$key,
         window_key:$window_key,
         index:$index,
         path:$path,
         title:$title,
-        process:{kind:$process_kind,codex_session_id:null,nvim_session:null}
+        process:{
+          kind:$process_kind,
+          codex_session_id:(if $codex_session_id == "" then null else $codex_session_id end),
+          nvim_session:null
+        }
       }' >>"$panes_file"
   done <"$pane_ids_file"
 
@@ -953,6 +982,99 @@ record_restore() {
   mv "$restore_record_staging" "$workspace_state/last-restore.json"
 }
 
+resume_restored_processes() {
+  resume_keys_file=$workspace_runtime/restore-$$-resume-keys
+  jq -r '.panes[] | select(.process.kind == "codex" or .process.kind == "nvim") | .key' \
+    "$selected_manifest" >"$resume_keys_file"
+  chmod 0600 "$resume_keys_file"
+  while IFS= read -r saved_pane_key; do
+    [ -n "$saved_pane_key" ] || continue
+    require_identifier "$saved_pane_key" '^%[0-9]+$' 'resumed pane identifier'
+    actual_pane_id=$(map_lookup "$restore_pane_map" "$saved_pane_key") \
+      || die 'missing process pane mapping' 1
+    # The restored shell, not this coordinator, expands its own HOME.
+    # shellcheck disable=SC2016
+    resume_command='"$HOME/.config/tmux/scripts/workspace" resume-pane '
+    resume_command="${resume_command}${selected_generation} ${saved_pane_key}"
+    tmux_run send-keys -t "$actual_pane_id" -l "$resume_command"
+    tmux_run send-keys -t "$actual_pane_id" Enter
+  done <"$resume_keys_file"
+  rm -f "$resume_keys_file"
+}
+
+codex_hook() {
+  prepare_roots
+  case ${TMUX_PANE-} in
+    %*) ;;
+    *) return 0 ;;
+  esac
+  require_identifier "$TMUX_PANE" '^%[0-9]+$' 'TMUX_PANE'
+  hook_temp=$workspace_runtime/.codex-hook-$$
+  command cat >"$hook_temp"
+  chmod 0600 "$hook_temp"
+  hook_event=$(jq -er '.hook_event_name | select(type == "string")' \
+    "$hook_temp") || die 'invalid Codex hook event' 1
+  hook_session_id=$(jq -er '.session_id | select(type == "string")' \
+    "$hook_temp") || die 'invalid Codex hook session identifier' 1
+  session_id_is_valid "$hook_session_id" \
+    || die 'invalid Codex hook session identifier' 1
+
+  case $hook_event in
+    SessionStart)
+      tmux_run set-option -pt "$TMUX_PANE" \
+        @dotfiles_codex_session_id "$hook_session_id" \
+        \; set-option -pt "$TMUX_PANE" @dotfiles_codex_active 1
+      ;;
+    SessionEnd)
+      current_session_id=$(tmux_run show-options -pqv -t "$TMUX_PANE" \
+        @dotfiles_codex_session_id 2>/dev/null || :)
+      if [ "$current_session_id" = "$hook_session_id" ]; then
+        tmux_run set-option -pu -t "$TMUX_PANE" \
+          @dotfiles_codex_session_id \
+          \; set-option -pu -t "$TMUX_PANE" @dotfiles_codex_active
+      fi
+      ;;
+  esac
+  rm -f "$hook_temp"
+  hook_temp=
+}
+
+resume_pane() {
+  requested_generation=$1
+  requested_pane=$2
+  prepare_roots
+  generation_is_valid "$requested_generation" \
+    || die 'invalid resume generation' 2
+  require_identifier "$requested_pane" '^%[0-9]+$' 'resume pane key'
+  requested_manifest=$workspace_state/snapshots/$requested_generation/snapshot.json
+  validate_snapshot "$requested_manifest" || die 'invalid resume snapshot' 1
+  pane_record=$(jq -cer --arg key "$requested_pane" '
+    [.panes[] | select(.key == $key)]
+    | if length == 1 then .[0] else error("pane not found") end
+  ' "$requested_manifest") || die 'resume pane is absent from snapshot' 1
+  process_kind=$(printf '%s\n' "$pane_record" | jq -er '.process.kind')
+  case $process_kind in
+    codex)
+      command -v codex >/dev/null 2>&1 \
+        || die 'codex is unavailable; leaving the restored shell open' 127
+      codex_session_id=$(printf '%s\n' "$pane_record" | \
+        jq -r '.process.codex_session_id // empty')
+      if [ -n "$codex_session_id" ]; then
+        session_id_is_valid "$codex_session_id" \
+          || die 'invalid Codex session identifier in snapshot' 1
+        exec codex resume "$codex_session_id"
+      fi
+      exec codex resume
+      ;;
+    nvim)
+      die 'Neovim resume is not available yet' 1
+      ;;
+    *)
+      die 'pane process is not restorable' 2
+      ;;
+  esac
+}
+
 restore_snapshot() {
   prepare_roots
   if ! select_snapshot; then
@@ -983,6 +1105,7 @@ restore_snapshot() {
   publish_pane_map
 
   tmux_run kill-session -t "$staging_session_id"
+  resume_restored_processes
   tmux_run set-option -g renumber-windows "$restore_renumber_original"
   tmux_run set-option -guq @dotfiles_workspace_adopted
   tmux_run set-option -g @dotfiles_workspace_generation "$selected_generation"
@@ -1117,6 +1240,11 @@ cleanup_on_exit() {
       "$workspace_state"/snapshots/.staging-*) rm -rf "$staging_dir" ;;
     esac
   fi
+  if [ -n "$hook_temp" ]; then
+    case $hook_temp in
+      "$workspace_runtime"/.codex-hook-*) rm -f "$hook_temp" ;;
+    esac
+  fi
   if [ "$restore_in_progress" -eq 1 ] && [ "$restore_committed" -eq 0 ]; then
     rollback_restore || :
   fi
@@ -1149,6 +1277,14 @@ case ${1-} in
   supervise)
     [ "$#" -eq 1 ] || { usage 0; exit 2; }
     supervise_loop
+    ;;
+  codex-hook)
+    [ "$#" -eq 1 ] || { usage 0; exit 2; }
+    codex_hook
+    ;;
+  resume-pane)
+    [ "$#" -eq 3 ] || { usage 0; exit 2; }
+    resume_pane "$2" "$3"
     ;;
   status)
     [ "$#" -eq 1 ] || { usage 0; exit 2; }
