@@ -51,6 +51,32 @@ require_excludes() {
   esac
 }
 
+require_equals() {
+  actual=$1
+  expected=$2
+  label=$3
+  if [ "$actual" = "$expected" ]; then
+    pass "$label"
+  else
+    fail "$label"
+    printf '  expected: %s\n' "$expected" >&2
+    printf '  actual:   %s\n' "$actual" >&2
+  fi
+}
+
+require_status() {
+  actual=$1
+  expected=$2
+  label=$3
+  if [ "$actual" -eq "$expected" ]; then
+    pass "$label"
+  else
+    fail "$label"
+    printf '  expected status: %s\n' "$expected" >&2
+    printf '  actual status:   %s\n' "$actual" >&2
+  fi
+}
+
 run_capture() {
   output_file=$1
   shift
@@ -74,7 +100,9 @@ trap 'exit 143' TERM
 for required_file in \
   "$workspace_root/.config/hypr/hyprland.lua" \
   "$workspace_root/.config/i3/config" \
+  "$workspace_root/.config/i3/dwindle" \
   "$workspace_root/.config/aerospace/aerospace.toml" \
+  "$workspace_root/.config/aerospace/dwindle" \
   "$dotfiles_dir/manifests/window-manager-bindings.tsv" \
   "$dotfiles_dir/manifests/config-linux-hypr.paths" \
   "$dotfiles_dir/manifests/config-linux-i3.paths" \
@@ -88,6 +116,17 @@ do
     pass "required file exists: ${required_file#"$workspace_root/"}"
   else
     fail "required file exists: ${required_file#"$workspace_root/"}"
+  fi
+done
+
+for required_helper in \
+  "$workspace_root/.config/i3/dwindle" \
+  "$workspace_root/.config/aerospace/dwindle"
+do
+  if [ -x "$required_helper" ]; then
+    pass "helper is executable: ${required_helper#"$workspace_root/"}"
+  else
+    fail "helper is executable: ${required_helper#"$workspace_root/"}"
   fi
 done
 
@@ -119,11 +158,14 @@ if command -v git >/dev/null 2>&1; then
     "$local_root/.config/i3"
   cp "$workspace_root/.config/aerospace/aerospace.toml" \
     "$local_root/.config/aerospace/aerospace.toml"
+  cp "$workspace_root/.config/aerospace/dwindle" \
+    "$local_root/.config/aerospace/dwindle"
   cp "$workspace_root/.config/dotfiles/manifests/window-manager-bindings.tsv" \
     "$local_root/.config/dotfiles/manifests/window-manager-bindings.tsv"
   cp "$workspace_root/.config/hypr/hyprland.lua" \
     "$local_root/.config/hypr/hyprland.lua"
   cp "$workspace_root/.config/i3/config" "$local_root/.config/i3/config"
+  cp "$workspace_root/.config/i3/dwindle" "$local_root/.config/i3/dwindle"
   git -C "$local_root" init -q -b main
   git -C "$local_root" add .config
   printf '%s\n' 'machine-local legacy config' \
@@ -135,6 +177,30 @@ if command -v git >/dev/null 2>&1; then
   else
     fail 'contract checker preserves an untracked local legacy config'
   fi
+
+  printf '%s\n' 'exec --no-startup-id unrelated-command' \
+    >>"$local_root/.config/i3/config"
+  run_capture "$test_tmp/checker-unrelated-i3-exec.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects an unrelated i3 startup command'
+  else
+    fail 'contract checker rejects an unrelated i3 startup command'
+  fi
+  cp "$workspace_root/.config/i3/config" "$local_root/.config/i3/config"
+
+  printf '%s\n' \
+    "on-window-detected = [{ run = 'exec-and-forget unrelated-command' }]" \
+    >>"$local_root/.config/aerospace/aerospace.toml"
+  run_capture "$test_tmp/checker-unrelated-aerospace-callback.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects an unrelated AeroSpace callback'
+  else
+    fail 'contract checker rejects an unrelated AeroSpace callback'
+  fi
+  cp "$workspace_root/.config/aerospace/aerospace.toml" \
+    "$local_root/.config/aerospace/aerospace.toml"
 
   git -C "$local_root" add .config/hypr/hyprland.conf
   run_capture "$test_tmp/checker-tracked-legacy.output" \
@@ -161,6 +227,141 @@ if command -v luac >/dev/null 2>&1 \
 else
   pass 'Hyprland Lua syntax check skipped when luac or config is unavailable'
 fi
+
+hypr_config=$(cat "$workspace_root/.config/hypr/hyprland.lua")
+require_contains "$hypr_config" 'force_split = 2' \
+  'Hyprland places new Dwindle tiles on the right or bottom'
+require_contains "$hypr_config" 'preserve_split = true' \
+  'Hyprland preserves established Dwindle splits'
+
+i3_config=$(cat "$workspace_root/.config/i3/config")
+require_contains "$i3_config" 'exec --no-startup-id ~/.config/i3/dwindle' \
+  'i3 starts its Dwindle event helper'
+
+aerospace_config=$(cat "$workspace_root/.config/aerospace/aerospace.toml")
+require_contains "$aerospace_config" \
+  "on-window-detected = [{ check-further-callbacks = true, run = 'exec-and-forget /bin/sh \"\${HOME}/.config/aerospace/dwindle\"' }]" \
+  'AeroSpace runs its Dwindle helper for newly detected windows'
+
+fake_i3msg=$test_tmp/i3-msg
+# The variables below belong to the generated fake, not this test process.
+# shellcheck disable=SC2016
+printf '%s\n' \
+  '#!/bin/sh' \
+  'printf "%s\n" "$*" >>"$I3_DWINDLE_TEST_LOG"' \
+  >"$fake_i3msg"
+chmod +x "$fake_i3msg"
+i3_helper=$workspace_root/.config/i3/dwindle
+i3_log=$test_tmp/i3-actions.log
+
+: >"$i3_log"
+run_capture "$test_tmp/i3-wide.output" env \
+  I3_DWINDLE_I3MSG="$fake_i3msg" \
+  I3_DWINDLE_TEST_LOG="$i3_log" \
+  "$i3_helper" --once \
+  '{"change":"focus","container":{"id":42,"floating":"auto_off","rect":{"width":1200,"height":700}}}'
+require_status "$run_status" 0 'i3 helper accepts a wide tiled-window event'
+require_equals "$(cat "$i3_log")" '[con_id=42] split h' \
+  'i3 helper makes the next child of a wide tile appear to its right'
+
+: >"$i3_log"
+run_capture "$test_tmp/i3-tall.output" env \
+  I3_DWINDLE_I3MSG="$fake_i3msg" \
+  I3_DWINDLE_TEST_LOG="$i3_log" \
+  "$i3_helper" --once \
+  '{"change":"move","container":{"id":43,"floating":"user_off","rect":{"width":600,"height":900}}}'
+require_status "$run_status" 0 'i3 helper accepts a tall tiled-window event'
+require_equals "$(cat "$i3_log")" '[con_id=43] split v' \
+  'i3 helper makes the next child of a tall tile appear below it'
+
+: >"$i3_log"
+run_capture "$test_tmp/i3-floating.output" env \
+  I3_DWINDLE_I3MSG="$fake_i3msg" \
+  I3_DWINDLE_TEST_LOG="$i3_log" \
+  "$i3_helper" --once \
+  '{"change":"focus","container":{"id":44,"floating":"auto_on","rect":{"width":1200,"height":700}}}'
+require_status "$run_status" 0 'i3 helper accepts a floating-window event'
+require_equals "$(cat "$i3_log")" '' \
+  'i3 helper leaves floating windows untouched'
+
+fake_aerospace=$test_tmp/aerospace
+# The variables below belong to the generated fake, not this test process.
+# shellcheck disable=SC2016
+printf '%s\n' \
+  '#!/bin/sh' \
+  'case ${1:-} in' \
+  '  echo)' \
+  '    case ${5:-} in' \
+  "      '%{workspace}') printf '%s\\n' \"\${AEROSPACE_DWINDLE_TEST_WORKSPACE:-0}\" ;;" \
+  "      '%{window-layout}') printf '%s\\n' \"\${AEROSPACE_DWINDLE_TEST_LAYOUT:-h_tiles}\" ;;" \
+  '      *) exit 2 ;;' \
+  '    esac' \
+  '    ;;' \
+  '  list-windows)' \
+  '    count=${AEROSPACE_DWINDLE_TEST_WINDOW_COUNT:-0}' \
+  '    while [ "$count" -gt 0 ]; do' \
+  '      printf "%s\n" "${AEROSPACE_DWINDLE_TEST_LAYOUT:-h_tiles}"' \
+  '      count=$((count - 1))' \
+  '    done' \
+  '    ;;' \
+  '  join-with)' \
+  '    printf "%s\n" "$*" >>"$AEROSPACE_DWINDLE_TEST_LOG"' \
+  '    ;;' \
+  '  *) exit 2 ;;' \
+  'esac' \
+  >"$fake_aerospace"
+chmod +x "$fake_aerospace"
+aerospace_helper=$workspace_root/.config/aerospace/dwindle
+aerospace_log=$test_tmp/aerospace-actions.log
+
+: >"$aerospace_log"
+run_capture "$test_tmp/aerospace-two.output" env \
+  AEROSPACE_DWINDLE_BIN="$fake_aerospace" \
+  AEROSPACE_DWINDLE_TEST_LOG="$aerospace_log" \
+  AEROSPACE_DWINDLE_TEST_WINDOW_COUNT=2 \
+  AEROSPACE_WINDOW_ID=52 \
+  "$aerospace_helper"
+require_status "$run_status" 0 'AeroSpace helper accepts a second tiled window'
+require_equals "$(cat "$aerospace_log")" '' \
+  'AeroSpace helper leaves the first two tiles side by side'
+
+: >"$aerospace_log"
+run_capture "$test_tmp/aerospace-horizontal.output" env \
+  AEROSPACE_DWINDLE_BIN="$fake_aerospace" \
+  AEROSPACE_DWINDLE_TEST_LAYOUT=h_tiles \
+  AEROSPACE_DWINDLE_TEST_LOG="$aerospace_log" \
+  AEROSPACE_DWINDLE_TEST_WINDOW_COUNT=3 \
+  AEROSPACE_WINDOW_ID=53 \
+  "$aerospace_helper"
+require_status "$run_status" 0 'AeroSpace helper accepts a third horizontal tile'
+require_equals "$(cat "$aerospace_log")" \
+  'join-with --window-id 53 left' \
+  'AeroSpace helper nests a horizontal tile with its left neighbor'
+
+: >"$aerospace_log"
+run_capture "$test_tmp/aerospace-vertical.output" env \
+  AEROSPACE_DWINDLE_BIN="$fake_aerospace" \
+  AEROSPACE_DWINDLE_TEST_LAYOUT=v_tiles \
+  AEROSPACE_DWINDLE_TEST_LOG="$aerospace_log" \
+  AEROSPACE_DWINDLE_TEST_WINDOW_COUNT=4 \
+  AEROSPACE_WINDOW_ID=54 \
+  "$aerospace_helper"
+require_status "$run_status" 0 'AeroSpace helper accepts a fourth tile in a vertical parent'
+require_equals "$(cat "$aerospace_log")" \
+  'join-with --window-id 54 up' \
+  'AeroSpace helper splits the bottom-right tile into left and right children'
+
+: >"$aerospace_log"
+run_capture "$test_tmp/aerospace-floating.output" env \
+  AEROSPACE_DWINDLE_BIN="$fake_aerospace" \
+  AEROSPACE_DWINDLE_TEST_LAYOUT=floating \
+  AEROSPACE_DWINDLE_TEST_LOG="$aerospace_log" \
+  AEROSPACE_DWINDLE_TEST_WINDOW_COUNT=3 \
+  AEROSPACE_WINDOW_ID=55 \
+  "$aerospace_helper"
+require_status "$run_status" 0 'AeroSpace helper accepts a floating window'
+require_equals "$(cat "$aerospace_log")" '' \
+  'AeroSpace helper leaves floating windows untouched'
 
 run_capture "$test_tmp/missing-selection.output" env \
   -u DOTFILES_BOOTSTRAP_TEST_WINDOW_MANAGER \
@@ -201,8 +402,12 @@ require_contains "$hypr_output" 'install pacman hyprland' \
   'Hyprland profile selects only its package'
 require_excludes "$hypr_output" '.config/i3/config' \
   'Hyprland profile excludes i3 config'
+require_excludes "$hypr_output" '.config/i3/dwindle' \
+  'Hyprland profile excludes the i3 Dwindle helper'
 require_excludes "$hypr_output" '.config/aerospace/aerospace.toml' \
   'Hyprland profile excludes Aerospace config'
+require_excludes "$hypr_output" '.config/aerospace/dwindle' \
+  'Hyprland profile excludes the AeroSpace Dwindle helper'
 
 i3_apt_output=$(
   HOME="$test_tmp/i3-apt-home" \
@@ -217,10 +422,14 @@ require_contains "$i3_apt_output" 'Window manager: i3' \
   'i3 apt profile is reported'
 require_contains "$i3_apt_output" '.config/i3/config' \
   'i3 profile selects its config'
+require_contains "$i3_apt_output" '.config/i3/dwindle' \
+  'i3 profile selects its Dwindle helper'
 require_contains "$i3_apt_output" 'install apt i3-wm' \
   'i3 apt profile selects only i3-wm'
 require_excludes "$i3_apt_output" '.config/hypr/hyprland.lua' \
   'i3 profile excludes Hyprland config'
+require_excludes "$i3_apt_output" '.config/aerospace/dwindle' \
+  'i3 profile excludes the AeroSpace Dwindle helper'
 
 i3_pacman_output=$(
   HOME="$test_tmp/i3-pacman-home" \
@@ -245,6 +454,8 @@ require_contains "$aerospace_output" 'Window manager: aerospace' \
   'Aerospace profile is reported'
 require_contains "$aerospace_output" '.config/aerospace/aerospace.toml' \
   'Aerospace profile selects its XDG config'
+require_contains "$aerospace_output" '.config/aerospace/dwindle' \
+  'Aerospace profile selects its Dwindle helper'
 require_contains "$aerospace_output" \
   'install homebrew-cask nikitabobko/tap/aerospace' \
   'Aerospace profile selects the official Homebrew cask'
@@ -252,6 +463,8 @@ require_excludes "$aerospace_output" '.config/hypr/hyprland.lua' \
   'Aerospace profile excludes Hyprland config'
 require_excludes "$aerospace_output" '.config/i3/config' \
   'Aerospace profile excludes i3 config'
+require_excludes "$aerospace_output" '.config/i3/dwindle' \
+  'Aerospace profile excludes the i3 Dwindle helper'
 
 none_output=$(
   HOME="$test_tmp/none-home" \
@@ -268,8 +481,12 @@ require_excludes "$none_output" '.config/hypr/hyprland.lua' \
   'none profile excludes Hyprland config'
 require_excludes "$none_output" '.config/i3/config' \
   'none profile excludes i3 config'
+require_excludes "$none_output" '.config/i3/dwindle' \
+  'none profile excludes the i3 Dwindle helper'
 require_excludes "$none_output" '.config/aerospace/aerospace.toml' \
   'none profile excludes Aerospace config'
+require_excludes "$none_output" '.config/aerospace/dwindle' \
+  'none profile excludes the AeroSpace Dwindle helper'
 
 run_capture "$test_tmp/apt-hypr.output" env \
   HOME="$test_tmp/apt-hypr-home" \

@@ -1,0 +1,90 @@
+#!/bin/sh
+
+set -eu
+
+LC_ALL=C
+export LC_ALL
+
+program=${0##*/}
+i3msg_bin=${I3_DWINDLE_I3MSG:-i3-msg}
+jq_bin=${I3_DWINDLE_JQ:-jq}
+
+usage() {
+  printf 'usage: %s [--once EVENT_JSON]\n' "$program"
+}
+
+require_command() {
+  if command -v "$1" >/dev/null 2>&1; then
+    return
+  fi
+  printf '%s: required command not found: %s\n' "$program" "$1" >&2
+  exit 1
+}
+
+handle_event() {
+  event_json=$1
+  split_spec=$(
+    printf '%s\n' "$event_json" | "$jq_bin" -er '
+      select(
+        (.change == "new"
+          or .change == "focus"
+          or .change == "move"
+          or .change == "floating")
+        and ((.container.floating // "") | endswith("_off"))
+        and ((.container.id // null) | type == "number")
+        and ((.container.rect.width // 0) > 0)
+        and ((.container.rect.height // 0) > 0)
+      )
+      | [
+          (.container.id | tostring),
+          (if .container.rect.width >= .container.rect.height
+           then "h"
+           else "v"
+           end)
+        ]
+      | @tsv
+    ' 2>/dev/null
+  ) || return 0
+
+  tab=$(printf '\t')
+  container_id=${split_spec%%"$tab"*}
+  split_orientation=${split_spec#*"$tab"}
+
+  case "$container_id" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  case "$split_orientation" in
+    h|v) ;;
+    *) return 0 ;;
+  esac
+
+  "$i3msg_bin" "[con_id=$container_id] split $split_orientation" \
+    >/dev/null 2>&1 || :
+}
+
+case ${1:-} in
+  --once)
+    if [ "$#" -ne 2 ]; then
+      usage >&2
+      exit 2
+    fi
+    require_command "$jq_bin"
+    require_command "$i3msg_bin"
+    handle_event "$2"
+    ;;
+  --help|-h)
+    usage
+    ;;
+  '')
+    require_command "$jq_bin"
+    require_command "$i3msg_bin"
+    "$i3msg_bin" -t subscribe -m '["window"]' |
+      while IFS= read -r event_json; do
+        handle_event "$event_json"
+      done
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

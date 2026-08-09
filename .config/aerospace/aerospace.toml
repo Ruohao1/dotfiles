@@ -8,6 +8,7 @@ default-root-container-orientation = 'auto'
 persistent-workspaces = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']
 focus-follows-mouse.enabled = false
 after-startup-command = ['exec-and-forget /bin/sh ${HOME}/.config/aerospace/local.sh']
+on-window-detected = [{ check-further-callbacks = true, run = 'exec-and-forget /bin/sh "${HOME}/.config/aerospace/dwindle"' }]
 
 [mode.main.binding]
     alt-h = 'focus left'

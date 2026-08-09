@@ -1,0 +1,49 @@
+#!/bin/sh
+
+set -eu
+
+LC_ALL=C
+export LC_ALL
+
+aerospace_bin=${AEROSPACE_DWINDLE_BIN:-aerospace}
+window_id=${AEROSPACE_WINDOW_ID:-}
+
+case "$window_id" in
+  ''|*[!0-9]*) exit 0 ;;
+esac
+
+command -v "$aerospace_bin" >/dev/null 2>&1 || exit 0
+
+workspace=$(
+  "$aerospace_bin" echo --window-id "$window_id" -- '%{workspace}' \
+    2>/dev/null
+) || exit 0
+[ -n "$workspace" ] || exit 0
+
+window_layout=$(
+  "$aerospace_bin" echo --window-id "$window_id" -- '%{window-layout}' \
+    2>/dev/null
+) || exit 0
+case "$window_layout" in
+  h_tiles) join_direction=left ;;
+  v_tiles) join_direction=up ;;
+  *) exit 0 ;;
+esac
+
+workspace_layouts=$(
+  "$aerospace_bin" list-windows --workspace "$workspace" \
+    --format '%{window-layout}' 2>/dev/null
+) || exit 0
+tiled_count=$(
+  printf '%s\n' "$workspace_layouts" | awk '
+    $0 == "h_tiles" || $0 == "v_tiles" { count++ }
+    END { print count + 0 }
+  '
+)
+case "$tiled_count" in
+  ''|*[!0-9]*) exit 0 ;;
+esac
+[ "$tiled_count" -gt 2 ] || exit 0
+
+"$aerospace_bin" join-with --window-id "$window_id" "$join_direction" \
+  >/dev/null 2>&1 || :

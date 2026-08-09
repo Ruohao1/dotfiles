@@ -46,7 +46,9 @@ esac
 manifest=$root/.config/dotfiles/manifests/window-manager-bindings.tsv
 hypr_config=$root/.config/hypr/hyprland.lua
 i3_config=$root/.config/i3/config
+i3_dwindle=$root/.config/i3/dwindle
 aerospace_config=$root/.config/aerospace/aerospace.toml
+aerospace_dwindle=$root/.config/aerospace/dwindle
 
 failures=0
 checks=0
@@ -80,11 +82,32 @@ repository_tracks_path() {
   return 1
 }
 
-for required_file in "$manifest" "$hypr_config" "$i3_config" "$aerospace_config"; do
+for required_file in \
+  "$manifest" \
+  "$hypr_config" \
+  "$i3_config" \
+  "$i3_dwindle" \
+  "$aerospace_config" \
+  "$aerospace_dwindle"
+do
   if [ -r "$required_file" ]; then
     pass "readable file: ${required_file#"$root/"}"
   else
     fail "readable file: ${required_file#"$root/"}"
+  fi
+done
+
+for required_helper in "$i3_dwindle" "$aerospace_dwindle"; do
+  if [ -x "$required_helper" ]; then
+    pass "executable helper: ${required_helper#"$root/"}"
+  else
+    fail "executable helper: ${required_helper#"$root/"}"
+  fi
+
+  if [ -r "$required_helper" ] && sh -n "$required_helper"; then
+    pass "valid shell syntax: ${required_helper#"$root/"}"
+  else
+    fail "valid shell syntax: ${required_helper#"$root/"}"
   fi
 done
 
@@ -209,6 +232,28 @@ else
   fail 'focus-follows-mouse is disabled everywhere'
 fi
 
+if [ "$(grep -Fxc '        force_split = 2,' "$hypr_config" || true)" -eq 1 ] \
+  && [ "$(grep -Fxc '        preserve_split = true,' "$hypr_config" || true)" -eq 1 ]; then
+  pass 'Hyprland uses deterministic right-or-bottom Dwindle placement'
+else
+  fail 'Hyprland uses deterministic right-or-bottom Dwindle placement'
+fi
+
+i3_dwindle_start='exec --no-startup-id ~/.config/i3/dwindle'
+if [ "$(grep -Fxc "$i3_dwindle_start" "$i3_config" || true)" -eq 1 ]; then
+  pass 'i3 starts exactly one Dwindle event helper'
+else
+  fail 'i3 starts exactly one Dwindle event helper'
+fi
+
+aerospace_dwindle_callback="on-window-detected = [{ check-further-callbacks = true, run = 'exec-and-forget /bin/sh \"\${HOME}/.config/aerospace/dwindle\"' }]"
+if [ "$(grep -Fxc "$aerospace_dwindle_callback" \
+    "$check_tmp/aerospace.normalized" || true)" -eq 1 ]; then
+  pass 'AeroSpace runs exactly one Dwindle window callback'
+else
+  fail 'AeroSpace runs exactly one Dwindle window callback'
+fi
+
 if grep -Fqx \
     'hl.bind("SUPER + mouse:272", hl.dsp.window.drag(), { mouse = true })' \
     "$hypr_config" \
@@ -251,26 +296,40 @@ else
   fail 'Hyprland config contains no desktop-shell behavior'
 fi
 
-if awk '
-  /^[[:space:]]*(exec|exec_always|bar|assign|for_window|client[.])/ {
+if awk -v allowed_exec="$i3_dwindle_start" '
+  /^[[:space:]]*(bar|assign|for_window|client[.])/ {
     bad = 1
+  }
+  /^[[:space:]]*(exec|exec_always)([[:space:]]|$)/ {
+    line = $0
+    sub(/^[[:space:]]*/, "", line)
+    if (line != allowed_exec) {
+      bad = 1
+    }
   }
   END { exit bad }
 ' "$i3_config"; then
-  pass 'i3 config contains no desktop-shell behavior'
+  pass 'i3 config contains only the allowlisted Dwindle helper process'
 else
-  fail 'i3 config contains no desktop-shell behavior'
+  fail 'i3 config contains only the allowlisted Dwindle helper process'
 fi
 
-if awk '
-  /^[[:space:]]*(on-window-detected|exec-on-workspace-change|gaps[.]|workspace-to-monitor-force-assignment)/ {
+if awk -v allowed_callback="$aerospace_dwindle_callback" '
+  /^[[:space:]]*(exec-on-workspace-change|gaps[.]|workspace-to-monitor-force-assignment)/ {
     bad = 1
+  }
+  /^[[:space:]]*on-window-detected([[:space:]]|=)/ {
+    line = $0
+    sub(/^[[:space:]]*/, "", line)
+    if (line != allowed_callback) {
+      bad = 1
+    }
   }
   END { exit bad }
 ' "$aerospace_config"; then
-  pass 'AeroSpace config contains no desktop-shell behavior'
+  pass 'AeroSpace config contains only the allowlisted Dwindle callback'
 else
-  fail 'AeroSpace config contains no desktop-shell behavior'
+  fail 'AeroSpace config contains only the allowlisted Dwindle callback'
 fi
 
 if ! repository_tracks_path .config/hypr/hyprland.conf \

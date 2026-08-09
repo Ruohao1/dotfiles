@@ -432,7 +432,9 @@ hypr_run=$hypr_state/dotfiles-bootstrap/window-manager-hypr
 if cmp -s "$fixture_work/.config/hypr/hyprland.lua" \
   "$hypr_home/.config/hypr/hyprland.lua" \
   && [ ! -e "$hypr_home/.config/i3/config" ] \
-  && [ ! -e "$hypr_home/.config/aerospace/aerospace.toml" ]; then
+  && [ ! -e "$hypr_home/.config/i3/dwindle" ] \
+  && [ ! -e "$hypr_home/.config/aerospace/aerospace.toml" ] \
+  && [ ! -e "$hypr_home/.config/aerospace/dwindle" ]; then
   pass 'Hyprland apply deploys only the selected manager config'
 else
   fail 'Hyprland apply deploys only the selected manager config'
@@ -494,12 +496,16 @@ else
   sed 's/^/  /' "$test_tmp/i3-apply.output" >&2
 fi
 if cmp -s "$fixture_work/.config/i3/config" "$i3_home/.config/i3/config" \
+  && cmp -s "$fixture_work/.config/i3/dwindle" \
+    "$i3_home/.config/i3/dwindle" \
+  && [ -x "$i3_home/.config/i3/dwindle" ] \
   && [ -f "$i3_home/.config/i3/local.conf" ] \
   && [ ! -e "$i3_home/.config/hypr/hyprland.lua" ] \
-  && [ ! -e "$i3_home/.config/aerospace/aerospace.toml" ]; then
-  pass 'i3 apply creates its config and untracked local override only'
+  && [ ! -e "$i3_home/.config/aerospace/aerospace.toml" ] \
+  && [ ! -e "$i3_home/.config/aerospace/dwindle" ]; then
+  pass 'i3 apply creates its config, helper, and local override only'
 else
-  fail 'i3 apply creates its config and untracked local override only'
+  fail 'i3 apply creates its config, helper, and local override only'
 fi
 run_capture "$test_tmp/i3-rollback.output" env \
   HOME="$i3_home" \
@@ -514,6 +520,7 @@ else
   fail 'i3 profile rollback succeeds'
 fi
 if [ ! -e "$i3_home/.config/i3/config" ] \
+  && [ ! -e "$i3_home/.config/i3/dwindle" ] \
   && [ ! -e "$i3_home/.config/i3/local.conf" ]; then
   pass 'i3 rollback removes the deployed config and generated local override'
 else
@@ -546,8 +553,12 @@ fi
 aerospace_run=$aerospace_state/dotfiles-bootstrap/window-manager-aerospace
 if cmp -s "$fixture_work/.config/aerospace/aerospace.toml" \
   "$aerospace_home/.config/aerospace/aerospace.toml" \
+  && cmp -s "$fixture_work/.config/aerospace/dwindle" \
+    "$aerospace_home/.config/aerospace/dwindle" \
+  && [ -x "$aerospace_home/.config/aerospace/dwindle" ] \
   && [ ! -e "$aerospace_home/.config/hypr/hyprland.lua" ] \
-  && [ ! -e "$aerospace_home/.config/i3/config" ]; then
+  && [ ! -e "$aerospace_home/.config/i3/config" ] \
+  && [ ! -e "$aerospace_home/.config/i3/dwindle" ]; then
   pass 'Aerospace apply deploys only the selected manager config'
 else
   fail 'Aerospace apply deploys only the selected manager config'
@@ -580,6 +591,7 @@ fi
 if [ "$(cat "$aerospace_home/.aerospace.toml" 2>/dev/null || true)" = \
     'legacy aerospace config' ] \
   && [ ! -e "$aerospace_home/.config/aerospace/aerospace.toml" ] \
+  && [ ! -e "$aerospace_home/.config/aerospace/dwindle" ] \
   && grep -Fq 'echo local aerospace' \
     "$aerospace_home/.config/aerospace/local.sh"; then
   pass 'Aerospace rollback restores legacy config and preserves its local hook'
