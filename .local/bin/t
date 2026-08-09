@@ -58,6 +58,12 @@ if ! command -v tmux >/dev/null 2>&1; then
   exit 127
 fi
 
+workspace_helper=$HOME/.config/tmux/scripts/workspace
+[ -x "$workspace_helper" ] \
+  || die "workspace helper is missing or not executable: $workspace_helper"
+"$workspace_helper" ensure \
+  || die "workspace restoration did not become ready"
+
 if ! command -v git >/dev/null 2>&1; then
   printf '%s\n' 't: git is not installed or not in PATH' >&2
   exit 127

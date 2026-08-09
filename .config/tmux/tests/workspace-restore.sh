@@ -167,7 +167,10 @@ assert_equal "$generation" \
   "fallback generation marker"
 
 stop_private_server
-"$real_tmux" -f /dev/null -S "$socket" new-session -d -s local-only
+"$real_tmux" -f "$script_dir/../conf/options.conf" -S "$socket" \
+  new-session -d -s local-only
+private_tmux rename-window -t '=local-only:1' local
+private_tmux set-option -w -t '=local-only:1' automatic-rename off
 session_count_before=$(private_tmux list-sessions -F '#{session_id}' | wc -l | tr -d '[:space:]')
 run_workspace restore
 assert_equal 0 "$status" "live server adoption"
@@ -175,5 +178,69 @@ session_count_after=$(private_tmux list-sessions -F '#{session_id}' | wc -l | tr
 assert_equal "$session_count_before" "$session_count_after" "adoption session count"
 assert_equal 1 "$(private_tmux show-options -gqv @dotfiles_workspace_adopted)" \
   "adoption marker"
+
+supervisor_stdout=$test_root/supervisor.stdout
+supervisor_stderr=$test_root/supervisor.stderr
+HOME=$test_root/home \
+  SHELL=/bin/sh \
+  XDG_STATE_HOME=$state \
+  XDG_RUNTIME_DIR=$runtime \
+  TMUX_WORKSPACE_TESTING=1 \
+  TMUX_WORKSPACE_SOCKET=$socket \
+  TMUX_WORKSPACE_INTERVAL=1 \
+  "$workspace" supervise >"$supervisor_stdout" 2>"$supervisor_stderr" &
+supervisor_pid=$!
+wait_attempt=0
+while [ ! -f "$runtime/dotfiles-tmux/ready" ] && [ "$wait_attempt" -lt 200 ]; do
+  sleep 0.01
+  wait_attempt=$((wait_attempt + 1))
+done
+[ -f "$runtime/dotfiles-tmux/ready" ] || fail "supervisor ready marker"
+kill -0 "$supervisor_pid" >/dev/null 2>&1 || fail "supervisor exited before ready"
+summarize >"$test_root/ready-summary"
+sleep 2
+summarize >"$test_root/periodic-summary"
+if ! cmp -s "$test_root/ready-summary" "$test_root/periodic-summary"; then
+  diff -u "$test_root/ready-summary" "$test_root/periodic-summary" >&2 || :
+  fail "periodic checkpoint changed tmux topology"
+fi
+generation_before_stop=$(cat "$state/dotfiles/tmux/current")
+if ! kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+  sed -n '1,120p' "$supervisor_stderr" >&2
+  fail "supervisor exited before clean stop"
+fi
+kill -TERM "$supervisor_pid"
+wait "$supervisor_pid"
+generation_after_stop=$(cat "$state/dotfiles/tmux/current")
+[ "$generation_before_stop" != "$generation_after_stop" ] \
+  || fail "supervisor final checkpoint did not advance generation"
+[ ! -e "$runtime/dotfiles-tmux/supervisor.lock" ] \
+  || fail "supervisor lock remained after clean stop"
+
+stop_private_server
+rm -f "$runtime/dotfiles-tmux/ready"
+set +e
+HOME=$test_root/home SHELL=/bin/sh XDG_STATE_HOME=$state XDG_RUNTIME_DIR=$runtime \
+  TMUX_WORKSPACE_TESTING=1 TMUX_WORKSPACE_SOCKET=$socket \
+  "$workspace" ensure >"$test_root/ensure-one.stdout" 2>"$test_root/ensure-one.stderr" &
+ensure_one_pid=$!
+HOME=$test_root/home SHELL=/bin/sh XDG_STATE_HOME=$state XDG_RUNTIME_DIR=$runtime \
+  TMUX_WORKSPACE_TESTING=1 TMUX_WORKSPACE_SOCKET=$socket \
+  "$workspace" ensure >"$test_root/ensure-two.stdout" 2>"$test_root/ensure-two.stderr" &
+ensure_two_pid=$!
+wait "$ensure_one_pid"
+ensure_one_status=$?
+wait "$ensure_two_pid"
+ensure_two_status=$?
+set -e
+assert_equal 0 "$ensure_one_status" "first concurrent ensure"
+assert_equal 0 "$ensure_two_status" "second concurrent ensure"
+[ -f "$runtime/dotfiles-tmux/ready" ] || fail "concurrent ensure ready marker"
+assert_equal 1 \
+  "$(private_tmux list-sessions -F '#{session_id}' | wc -l | tr -d '[:space:]')" \
+  "single restored session after concurrent ensure"
+assert_equal "$(cat "$runtime/dotfiles-tmux/ready")" \
+  "$(private_tmux show-options -gqv @dotfiles_workspace_generation)" \
+  "ready marker matches restored generation"
 
 pass "workspace structural restore"

@@ -21,6 +21,10 @@ restore_window_map=
 restore_pane_map=
 restore_session_map=
 restore_group_map=
+supervisor_lock_path=
+supervisor_lock_held=0
+supervisor_stop=0
+sleeper=
 
 usage() {
   destination=$1
@@ -531,7 +535,18 @@ new_generation() {
     printf '%s\n' "$candidate" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' \
       || die 'invalid test generation' 2
   else
-    candidate=$(date -u '+%Y%m%dT%H%M%SZ')-$$
+    sequence_file=$workspace_runtime/generation-sequence
+    generation_sequence=$(sed -n '1p' "$sequence_file" 2>/dev/null || printf '0')
+    case $generation_sequence in
+      ''|*[!0-9]*) generation_sequence=0 ;;
+    esac
+    generation_sequence=$((generation_sequence + 1))
+    sequence_staging=$workspace_runtime/.generation-sequence-$$
+    printf '%s\n' "$generation_sequence" >"$sequence_staging"
+    chmod 0600 "$sequence_staging"
+    mv "$sequence_staging" "$sequence_file"
+    generation_suffix=$(printf '%s%06d' "$$" "$generation_sequence")
+    candidate=$(date -u '+%Y%m%dT%H%M%SZ')-$generation_suffix
   fi
   generation_is_valid "$candidate" || die 'invalid generated snapshot name' 1
   [ ! -e "$workspace_state/snapshots/$candidate" ] \
@@ -585,6 +600,9 @@ save_snapshot() {
   capture_snapshot "$staging_dir/snapshot.json"
 
   publish_generation "$generation"
+  if [ -f "$workspace_runtime/ready" ] && [ ! -L "$workspace_runtime/ready" ]; then
+    publish_ready "$generation"
+  fi
   release_lock
   printf '%s\n' "$generation"
 }
@@ -974,6 +992,125 @@ restore_snapshot() {
   cleanup_restore_files
 }
 
+ready_is_valid() {
+  ready_file=$workspace_runtime/ready
+  [ -f "$ready_file" ] && [ ! -L "$ready_file" ] || return 1
+  ready_generation=$(sed -n '1p' "$ready_file" 2>/dev/null || :)
+  if [ -z "$ready_generation" ]; then
+    return 0
+  fi
+  generation_is_valid "$ready_generation" || return 1
+  tmux_run list-sessions >/dev/null 2>&1 || return 1
+  live_generation=$(tmux_run show-options -gqv @dotfiles_workspace_generation 2>/dev/null || :)
+  [ "$live_generation" = "$ready_generation" ] && return 0
+  [ "$(tmux_run show-options -gqv @dotfiles_workspace_adopted 2>/dev/null || :)" = 1 ]
+}
+
+publish_ready() {
+  ready_generation=$1
+  ready_staging=$workspace_runtime/.ready-$$
+  printf '%s\n' "$ready_generation" >"$ready_staging"
+  chmod 0600 "$ready_staging"
+  mv "$ready_staging" "$workspace_runtime/ready"
+}
+
+ensure_ready() {
+  prepare_roots
+  if ready_is_valid; then
+    return 0
+  fi
+
+  ensure_timeout=${TMUX_WORKSPACE_ENSURE_TIMEOUT:-30}
+  case $ensure_timeout in
+    ''|*[!0-9]*|0) die 'TMUX_WORKSPACE_ENSURE_TIMEOUT must be a positive integer' 2 ;;
+  esac
+
+  if acquire_lock restore; then
+    if ready_is_valid; then
+      release_lock
+      return 0
+    fi
+    rm -f "$workspace_runtime/ready"
+    if select_snapshot; then
+      restore_snapshot
+      publish_ready "$selected_generation"
+    else
+      publish_ready ''
+    fi
+    release_lock
+    return 0
+  fi
+
+  ensure_waited=0
+  while [ "$ensure_waited" -lt "$ensure_timeout" ]; do
+    if ready_is_valid; then
+      return 0
+    fi
+    sleep 1
+    ensure_waited=$((ensure_waited + 1))
+  done
+  die 'workspace restoration did not become ready before timeout' 1
+}
+
+release_supervisor_lock() {
+  [ "$supervisor_lock_held" -eq 1 ] || return 0
+  case $supervisor_lock_path in
+    "$workspace_runtime"/supervisor.lock) ;;
+    *) return 1 ;;
+  esac
+  supervisor_owner=$(sed -n '1p' "$supervisor_lock_path/owner" 2>/dev/null || :)
+  if [ "$supervisor_owner" = "$$" ]; then
+    rm -f "$supervisor_lock_path/owner"
+    rmdir "$supervisor_lock_path" 2>/dev/null || :
+  fi
+  supervisor_lock_held=0
+  supervisor_lock_path=
+}
+
+acquire_supervisor_lock() {
+  acquire_lock supervisor || return 1
+  supervisor_lock_path=$lock_path
+  supervisor_lock_held=1
+  lock_path=
+  lock_held=0
+}
+
+supervisor_signal() {
+  supervisor_stop=1
+  if [ -n "$sleeper" ]; then
+    kill "$sleeper" >/dev/null 2>&1 || :
+  fi
+}
+
+supervise_loop() {
+  workspace_interval=${TMUX_WORKSPACE_INTERVAL:-300}
+  case $workspace_interval in
+    ''|*[!0-9]*|0) die 'TMUX_WORKSPACE_INTERVAL must be a positive integer' 2 ;;
+  esac
+
+  ensure_ready
+  prepare_roots
+  if ! acquire_supervisor_lock; then
+    return 0
+  fi
+  supervisor_stop=0
+  sleeper=
+  trap supervisor_signal HUP INT TERM
+
+  while [ "$supervisor_stop" -eq 0 ]; do
+    sleep "$workspace_interval" &
+    sleeper=$!
+    wait "$sleeper" || :
+    sleeper=
+    if [ "$supervisor_stop" -eq 0 ]; then
+      save_snapshot >/dev/null
+    fi
+  done
+  save_snapshot >/dev/null \
+    || printf '%s\n' 'tmux-workspace: final checkpoint failed' >&2
+  release_supervisor_lock
+}
+
 cleanup_on_exit() {
   if [ -n "$staging_dir" ] && [ -d "$staging_dir" ] && [ ! -L "$staging_dir" ]; then
     case $staging_dir in
@@ -983,6 +1120,7 @@ cleanup_on_exit() {
   if [ "$restore_in_progress" -eq 1 ] && [ "$restore_committed" -eq 0 ]; then
     rollback_restore || :
   fi
+  release_supervisor_lock || :
   release_lock || :
 }
 
@@ -1003,6 +1141,14 @@ case ${1-} in
   restore)
     [ "$#" -eq 1 ] || { usage 0; exit 2; }
     restore_snapshot
+    ;;
+  ensure)
+    [ "$#" -eq 1 ] || { usage 0; exit 2; }
+    ensure_ready
+    ;;
+  supervise)
+    [ "$#" -eq 1 ] || { usage 0; exit 2; }
+    supervise_loop
     ;;
   status)
     [ "$#" -eq 1 ] || { usage 0; exit 2; }

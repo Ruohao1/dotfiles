@@ -53,6 +53,9 @@ socket_path=$test_root/tmux.sock
 shim_directory=$test_root/bin
 attach_log=$test_root/attach.log
 native_log=$test_root/native.log
+state_root=$test_root/state
+runtime_root=$test_root/runtime
+ready_file=$runtime_root/dotfiles-tmux/ready
 stdout_file=$test_root/stdout
 stderr_file=$test_root/stderr
 run_status=0
@@ -81,11 +84,19 @@ cat >"$shim_directory/tmux" <<'SHIM'
 set -eu
 
 if [ "$#" -eq 0 ]; then
+  [ -f "$T_TEST_READY_FILE" ] || {
+    printf '%s\n' 'native tmux invoked before workspace readiness' >&2
+    exit 90
+  }
   printf '%s\n' native >>"$T_TEST_NATIVE_LOG"
   exit 0
 fi
 
 if [ "${1-}" = attach-session ]; then
+  [ -f "$T_TEST_READY_FILE" ] || {
+    printf '%s\n' 'attach invoked before workspace readiness' >&2
+    exit 90
+  }
   {
     printf '%s\n' attach
     shift
@@ -126,6 +137,11 @@ run_t() {
       T_TEST_SOCKET="$socket_path" \
       T_TEST_ATTACH_LOG="$attach_log" \
       T_TEST_NATIVE_LOG="$native_log" \
+      T_TEST_READY_FILE="$ready_file" \
+      XDG_STATE_HOME="$state_root" \
+      XDG_RUNTIME_DIR="$runtime_root" \
+      TMUX_WORKSPACE_TESTING=1 \
+      TMUX_WORKSPACE_SOCKET="$socket_path" \
       "$launcher" "$@"
   ) >"$stdout_file" 2>"$stderr_file"
   run_status=$?
@@ -144,6 +160,7 @@ mkdir -p "$space_root/src/nested"
 
 run_t "$space_root/src/nested"
 assert_equal 0 "$run_status" "nested launch"
+[ -f "$ready_file" ] || fail "workspace readiness precedes first attachment"
 assert_equal "$space_root" "$(private_tmux display-message -p -t '=project_alpha:' '#{session_path}')" "space path session root"
 assert_equal 1 "$(private_tmux list-windows -t '=project_alpha' -F '#{window_id}' | wc -l | tr -d '[:space:]')" "single window"
 assert_equal 1 "$(private_tmux list-panes -t '=project_alpha' -F '#{pane_id}' | wc -l | tr -d '[:space:]')" "single pane"
