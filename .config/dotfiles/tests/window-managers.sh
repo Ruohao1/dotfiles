@@ -280,6 +280,20 @@ require_contains "$hypr_config" \
 require_contains "$hypr_config" \
   'hl.gesture({ fingers = 3, direction = "horizontal", action = "workspace" })' \
   'Hyprland slides between workspaces with a three-finger gesture'
+require_contains "$hypr_config" \
+  'hl.bind("SUPER + 1", hl.dsp.focus({ workspace = 1 }))' \
+  'Hyprland key 1 selects numeric workspace 1'
+require_contains "$hypr_config" \
+  'hl.bind("SUPER + 0", hl.dsp.focus({ workspace = 10 }))' \
+  'Hyprland key 0 selects numeric workspace 10'
+require_contains "$hypr_config" \
+  'hl.bind("SUPER + SHIFT + 1", hl.dsp.window.move({ workspace = 1 }))' \
+  'Hyprland Shift+1 moves a window to numeric workspace 1'
+require_contains "$hypr_config" \
+  'hl.bind("SUPER + SHIFT + 0", hl.dsp.window.move({ workspace = 10 }))' \
+  'Hyprland Shift+0 moves a window to numeric workspace 10'
+require_excludes "$hypr_config" 'workspace = "name:' \
+  'Hyprland avoids dynamically ordered named numeric workspaces'
 
 i3_config=$(cat "$workspace_root/.config/i3/config")
 require_contains "$i3_config" 'exec --no-startup-id ~/.config/i3/dwindle' \

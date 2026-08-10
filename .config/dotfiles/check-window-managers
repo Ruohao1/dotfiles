@@ -217,14 +217,20 @@ else
   fail 'obsolete WM+Shift+C reload bindings are removed everywhere'
 fi
 
-if grep -Fqx 'hl.bind("SUPER + 1", hl.dsp.focus({ workspace = "name:0" }))' \
+if grep -Fqx 'hl.bind("SUPER + 1", hl.dsp.focus({ workspace = 1 }))' \
   "$hypr_config" \
   && grep -Fqx "bindsym \$mod+1 workspace --no-auto-back-and-forth \"0\"" \
     "$i3_config" \
   && grep -Fqx "alt-1 = 'workspace 0'" "$check_tmp/aerospace.normalized"; then
-  pass 'physical key 1 selects logical workspace 0 everywhere'
+  pass 'physical key 1 selects the first valid workspace on every platform'
 else
-  fail 'physical key 1 selects logical workspace 0 everywhere'
+  fail 'physical key 1 selects the first valid workspace on every platform'
+fi
+
+if ! grep -Fq 'workspace = "name:' "$hypr_config"; then
+  pass 'Hyprland uses ordered numeric workspace IDs'
+else
+  fail 'Hyprland uses ordered numeric workspace IDs'
 fi
 
 if grep -Fq 'follow_mouse = 0' "$hypr_config" \
