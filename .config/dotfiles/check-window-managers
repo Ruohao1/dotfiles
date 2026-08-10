@@ -49,6 +49,9 @@ i3_config=$root/.config/i3/config
 i3_dwindle=$root/.config/i3/dwindle
 aerospace_config=$root/.config/aerospace/aerospace.toml
 aerospace_dwindle=$root/.config/aerospace/dwindle
+hypr_touchpad_natural_scroll='            natural_scroll = true,'
+hypr_workspace_animation='hl.animation({ leaf = "workspaces", enabled = false })'
+hypr_workspace_gesture='hl.gesture({ fingers = 3, direction = "horizontal", action = "workspace" })'
 
 failures=0
 checks=0
@@ -239,6 +242,25 @@ else
   fail 'Hyprland uses deterministic right-or-bottom Dwindle placement'
 fi
 
+if [ "$(grep -Fxc "$hypr_touchpad_natural_scroll" "$hypr_config" || true)" -eq 1 ] \
+  && [ "$(grep -Fxc '        natural_scroll = true,' "$hypr_config" || true)" -eq 0 ]; then
+  pass 'Hyprland enables natural scrolling only for the touchpad'
+else
+  fail 'Hyprland enables natural scrolling only for the touchpad'
+fi
+
+if [ "$(grep -Fxc "$hypr_workspace_animation" "$hypr_config" || true)" -eq 1 ]; then
+  pass 'Hyprland disables animated shortcut workspace transitions'
+else
+  fail 'Hyprland disables animated shortcut workspace transitions'
+fi
+
+if [ "$(grep -Fxc "$hypr_workspace_gesture" "$hypr_config" || true)" -eq 1 ]; then
+  pass 'Hyprland enables one three-finger horizontal workspace gesture'
+else
+  fail 'Hyprland enables one three-finger horizontal workspace gesture'
+fi
+
 i3_dwindle_start='exec --no-startup-id ~/.config/i3/dwindle'
 if [ "$(grep -Fxc "$i3_dwindle_start" "$i3_config" || true)" -eq 1 ]; then
   pass 'i3 starts exactly one Dwindle event helper'
@@ -282,20 +304,36 @@ else
   fail 'each manager has only its portable local override boundary'
 fi
 
-if awk '
+if awk \
+  -v allowed_animation="$hypr_workspace_animation" \
+  -v allowed_gesture="$hypr_workspace_gesture" '
   /hl[.]dsp[.]exec_/ \
     && $0 !~ /hl[.]dsp[.]exec_cmd[(]"hyprctl reload"[)]/ \
     && $0 !~ /hl[.]dsp[.]exec_cmd[(]"[$]HOME[/][.]config[/]launcher[/]application-launcher"[)]/ {
     bad = 1
   }
-  /hl[.](on|window_rule|layer_rule|animation|curve|gesture|device)[(]/ {
+  /hl[.](on|window_rule|layer_rule|curve|device)[(]/ {
     bad = 1
+  }
+  /hl[.]animation[(]/ {
+    line = $0
+    sub(/^[[:space:]]*/, "", line)
+    if (line != allowed_animation) {
+      bad = 1
+    }
+  }
+  /hl[.]gesture[(]/ {
+    line = $0
+    sub(/^[[:space:]]*/, "", line)
+    if (line != allowed_gesture) {
+      bad = 1
+    }
   }
   END { exit bad }
 ' "$hypr_config"; then
-  pass 'Hyprland config contains only the approved launcher execution exception'
+  pass 'Hyprland config contains only approved launcher and workspace interaction exceptions'
 else
-  fail 'Hyprland config contains only the approved launcher execution exception'
+  fail 'Hyprland config contains only approved launcher and workspace interaction exceptions'
 fi
 
 if awk -v allowed_exec="$i3_dwindle_start" '

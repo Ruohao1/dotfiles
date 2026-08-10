@@ -178,6 +178,45 @@ if command -v git >/dev/null 2>&1; then
     fail 'contract checker preserves an untracked local legacy config'
   fi
 
+  sed 's/            natural_scroll = true,/            natural_scroll = false,/' \
+    "$workspace_root/.config/hypr/hyprland.lua" \
+    >"$local_root/.config/hypr/hyprland.lua"
+  run_capture "$test_tmp/checker-disabled-natural-scroll.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects disabled touchpad natural scrolling'
+  else
+    fail 'contract checker rejects disabled touchpad natural scrolling'
+  fi
+  cp "$workspace_root/.config/hypr/hyprland.lua" \
+    "$local_root/.config/hypr/hyprland.lua"
+
+  printf '%s\n' \
+    'hl.animation({ leaf = "windows", enabled = true, speed = 2, bezier = "default" })' \
+    >>"$local_root/.config/hypr/hyprland.lua"
+  run_capture "$test_tmp/checker-unapproved-animation.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects an unapproved Hyprland animation'
+  else
+    fail 'contract checker rejects an unapproved Hyprland animation'
+  fi
+  cp "$workspace_root/.config/hypr/hyprland.lua" \
+    "$local_root/.config/hypr/hyprland.lua"
+
+  printf '%s\n' \
+    'hl.gesture({ fingers = 4, direction = "horizontal", action = "workspace" })' \
+    >>"$local_root/.config/hypr/hyprland.lua"
+  run_capture "$test_tmp/checker-unapproved-gesture.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects an unapproved Hyprland gesture'
+  else
+    fail 'contract checker rejects an unapproved Hyprland gesture'
+  fi
+  cp "$workspace_root/.config/hypr/hyprland.lua" \
+    "$local_root/.config/hypr/hyprland.lua"
+
   printf '%s\n' 'exec --no-startup-id unrelated-command' \
     >>"$local_root/.config/i3/config"
   run_capture "$test_tmp/checker-unrelated-i3-exec.output" \
@@ -233,6 +272,14 @@ require_contains "$hypr_config" 'force_split = 2' \
   'Hyprland places new Dwindle tiles on the right or bottom'
 require_contains "$hypr_config" 'preserve_split = true' \
   'Hyprland preserves established Dwindle splits'
+require_contains "$hypr_config" '            natural_scroll = true,' \
+  'Hyprland enables natural scrolling for the touchpad'
+require_contains "$hypr_config" \
+  'hl.animation({ leaf = "workspaces", enabled = false })' \
+  'Hyprland keeps shortcut workspace changes instantaneous'
+require_contains "$hypr_config" \
+  'hl.gesture({ fingers = 3, direction = "horizontal", action = "workspace" })' \
+  'Hyprland slides between workspaces with a three-finger gesture'
 
 i3_config=$(cat "$workspace_root/.config/i3/config")
 require_contains "$i3_config" 'exec --no-startup-id ~/.config/i3/dwindle' \

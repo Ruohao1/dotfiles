@@ -17,8 +17,14 @@ hl.config({
     },
     input = {
         follow_mouse = 0,
+        touchpad = {
+            natural_scroll = true,
+        },
     },
 })
+
+hl.animation({ leaf = "workspaces", enabled = false })
+hl.gesture({ fingers = 3, direction = "horizontal", action = "workspace" })
 
 hl.bind("SUPER + mouse:272", hl.dsp.window.drag(), { mouse = true })
 hl.bind("SUPER + mouse:273", hl.dsp.window.resize(), { mouse = true })
