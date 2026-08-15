@@ -486,6 +486,7 @@ tmux_pristine_binding_delta_is_exact() {
   TMUX_EXPECTED_SWAP_UP_COMMAND=$tmux_swap_up_command \
   TMUX_EXPECTED_SWAP_RIGHT_COMMAND=$tmux_swap_right_command \
   TMUX_EXPECTED_MOVE_COMMAND=$tmux_move_command \
+  TMUX_EXPECTED_PERSISTENCE_SAVE_COMMAND=$tmux_persistence_save_command \
     awk '
       function approve(table, key, command,    identity) {
         identity = table SUBSEP key
@@ -532,6 +533,7 @@ tmux_pristine_binding_delta_is_exact() {
         approve("prefix", "K", ENVIRON["TMUX_EXPECTED_SWAP_UP_COMMAND"])
         approve("prefix", "L", ENVIRON["TMUX_EXPECTED_SWAP_RIGHT_COMMAND"])
         approve("prefix", "m", ENVIRON["TMUX_EXPECTED_MOVE_COMMAND"])
+        approve("prefix", "s", ENVIRON["TMUX_EXPECTED_PERSISTENCE_SAVE_COMMAND"])
 
         approve("root", "M-n", "new-window -c \"#{pane_current_path}\"")
         approve("root", "M-1", "select-window -t :=1")
@@ -591,7 +593,6 @@ tmux_pristine_binding_delta_is_exact() {
         allow_removal("prefix", "&")
         allow_removal("prefix", "\\\"")
         allow_removal("prefix", "\\%")
-        allow_removal("prefix", "s")
         allow_removal("prefix", "w")
         allow_removal("prefix", "h")
         allow_removal("prefix", "j")
@@ -651,12 +652,12 @@ tmux_pristine_binding_delta_is_exact() {
         }
       }
       END {
-        if (duplicate_approval || approval_count != 45) {
-          print "internal tmux owned-binding map error: expected 45 unique identities, found " approval_count
+        if (duplicate_approval || approval_count != 46) {
+          print "internal tmux owned-binding map error: expected 46 unique identities, found " approval_count
           invalid = 1
         }
-        if (duplicate_removal || removal_count != 48) {
-          print "internal tmux removal map error: expected 48 unique identities, found " removal_count
+        if (duplicate_removal || removal_count != 47) {
+          print "internal tmux removal map error: expected 47 unique identities, found " removal_count
           invalid = 1
         }
         for (line_number = 1; line_number <= pristine_count; line_number++) {
@@ -684,7 +685,10 @@ tmux_source_commands_are_allowed() {
   source_policy=$1
   source_file=$2
 
-  awk -v policy="$source_policy" '
+  TMUX_EXPECTED_PERSISTENCE_SOURCE=${tmux_persistence_source:-} \
+  TMUX_EXPECTED_PERSISTENCE_HELPER_SOURCE=${tmux_persistence_helper_source:-} \
+  TMUX_EXPECTED_PERSISTENCE_PROMPT=${tmux_persistence_prompt:-} \
+    awk -v policy="$source_policy" '
     function clear_tokens(depth,    token_index) {
       for (token_index = 1; token_index <= parsed_token_count[depth]; token_index++) {
         delete parsed_token[depth, token_index]
@@ -834,6 +838,7 @@ tmux_source_commands_are_allowed() {
       if (effective_policy == "options") return verb == "set" || verb == "setw" || verb == "if-shell"
       if (effective_policy == "options-branch") return verb == "set-option"
       if (effective_policy == "keys") return verb == "bind-key" || verb == "unbind-key"
+      if (effective_policy == "persistence") return verb == "bind-key"
       if (effective_policy == "status" || effective_policy == "platform") return verb == "set"
       return 0
     }
@@ -903,6 +908,30 @@ tmux_source_commands_are_allowed() {
       }
       return invalid
     }
+    function audit_persistence_binding(scope, brace_level, depth, start, end) {
+      seen_persistence_binding_count++
+      if (scope != "top" || brace_level != 0) {
+        print "noncanonical tmux persistence binding scope: line=" parsed_token_line[depth, start]
+        return 1
+      }
+      if (end == start + 5 \
+        && parsed_token[depth, start + 1] == "s" \
+        && parsed_token[depth, start + 2] == "confirm-before" \
+        && parsed_token[depth, start + 3] == "-p" \
+        && parsed_token[depth, start + 4] == persistence_prompt \
+        && parsed_token[depth, start + 5] \
+          == ("run-shell \047" persistence_helper_source " save\047")) {
+        return 0
+      }
+      print "noncanonical tmux persistence binding: line=" parsed_token_line[depth, start]
+      return 1
+    }
+    function audit_persistence_manifest() {
+      if (policy != "persistence") return 0
+      if (seen_persistence_binding_count == 1) return 0
+      print "tmux persistence binding count mismatch: expected=1 actual=" (seen_persistence_binding_count + 0)
+      return 1
+    }
     function audit_segment(current_policy, scope, brace_level, depth, start, end,    effective_policy, invalid, verb) {
       verb = parsed_token[depth, start]
       effective_policy = effective_policy_name(current_policy, scope, brace_level)
@@ -916,6 +945,8 @@ tmux_source_commands_are_allowed() {
         && audit_if_shell_arguments(current_policy, scope, depth, start, end)) invalid = 1
       if (current_policy == "entry" && verb == "source-file" \
         && audit_entry_source(depth, start, end)) invalid = 1
+      if (current_policy == "persistence" && verb == "bind-key" \
+        && audit_persistence_binding(scope, brace_level, depth, start, end)) invalid = 1
       return invalid
     }
     function audit_command_text(input, current_policy, scope, depth, base_line,    brace_level, end, invalid, kind, start, token_count, token_index) {
@@ -984,11 +1015,21 @@ tmux_source_commands_are_allowed() {
       return invalid
     }
     BEGIN {
-      macos_bundle_condition = "tmux -S \"#{socket_path}\" source-file \"$HOME/.config/tmux/conf/options.conf\" \"$HOME/.config/tmux/conf/keys.conf\" \"$HOME/.config/tmux/conf/status.conf\" \"$HOME/.config/tmux/conf/platform/macos.conf\""
-      linux_bundle_condition = "tmux -S \"#{socket_path}\" source-file \"$HOME/.config/tmux/conf/options.conf\" \"$HOME/.config/tmux/conf/keys.conf\" \"$HOME/.config/tmux/conf/status.conf\" \"$HOME/.config/tmux/conf/platform/linux.conf\""
+      persistence_source = ENVIRON["TMUX_EXPECTED_PERSISTENCE_SOURCE"]
+      persistence_helper_source = ENVIRON["TMUX_EXPECTED_PERSISTENCE_HELPER_SOURCE"]
+      persistence_prompt = ENVIRON["TMUX_EXPECTED_PERSISTENCE_PROMPT"]
+      if (persistence_source == "" \
+        || persistence_helper_source == "" \
+        || persistence_prompt == "") {
+        print "internal tmux persistence contract is incomplete"
+        persistence_contract_invalid = 1
+      }
+
+      macos_bundle_condition = "tmux -S \"#{socket_path}\" source-file \"$HOME/.config/tmux/conf/options.conf\" \"$HOME/.config/tmux/conf/keys.conf\" \"" persistence_source "\" \"$HOME/.config/tmux/conf/status.conf\" \"$HOME/.config/tmux/conf/platform/macos.conf\""
+      linux_bundle_condition = "tmux -S \"#{socket_path}\" source-file \"$HOME/.config/tmux/conf/options.conf\" \"$HOME/.config/tmux/conf/keys.conf\" \"" persistence_source "\" \"$HOME/.config/tmux/conf/status.conf\" \"$HOME/.config/tmux/conf/platform/linux.conf\""
 
       if (policy == "entry") {
-        expected_condition_count["for file in \"$HOME/.config/tmux/conf/options.conf\" \"$HOME/.config/tmux/conf/keys.conf\" \"$HOME/.config/tmux/conf/status.conf\"; do test -r \"$file\" || exit 1; done"] = 1
+        expected_condition_count["for file in \"$HOME/.config/tmux/conf/options.conf\" \"$HOME/.config/tmux/conf/keys.conf\" \"" persistence_source "\" \"$HOME/.config/tmux/conf/status.conf\"; do test -r \"$file\" || exit 1; done"] = 1
         expected_condition_count["test \"$(uname -s)\" = Darwin"] = 1
         expected_condition_count["test -r \"$HOME/.config/tmux/conf/platform/macos.conf\""] = 1
         expected_condition_count[macos_bundle_condition] = 1
@@ -997,6 +1038,7 @@ tmux_source_commands_are_allowed() {
         expected_condition_count[linux_bundle_condition] = 1
         expected_condition_count["test ! -r \"$HOME/.config/tmux/conf/options.conf\""] = 1
         expected_condition_count["test ! -r \"$HOME/.config/tmux/conf/keys.conf\""] = 1
+        expected_condition_count["test ! -r \"" persistence_source "\""] = 1
       } else if (policy == "options") {
         expected_condition_count["tmux show-options -sv extended-keys-format >/dev/null 2>&1"] = 1
       }
@@ -1007,6 +1049,7 @@ tmux_source_commands_are_allowed() {
       expected_source_count["$HOME/.config/tmux/conf/platform/linux.conf"] = 1
       expected_source_count["$HOME/.config/tmux/conf/options.conf"] = 1
       expected_source_count["$HOME/.config/tmux/conf/keys.conf"] = 1
+      expected_source_count[persistence_source] = 1
       expected_source_count["$HOME/.config/tmux/conf/status.conf"] = 1
     }
     {
@@ -1014,6 +1057,8 @@ tmux_source_commands_are_allowed() {
     }
     END {
       invalid = audit_command_text(source_text, policy, "top", 0, 1)
+      if (persistence_contract_invalid) invalid = 1
+      if (audit_persistence_manifest()) invalid = 1
       if (audit_condition_manifest()) invalid = 1
       if (policy == "entry" && audit_entry_graph()) invalid = 1
       exit invalid
@@ -1026,14 +1071,15 @@ tmux_entry_source_graph_is_allowed() {
 }
 
 tmux_modules_use_allowed_commands() {
-  [ "$#" -eq 5 ] || return 2
+  [ "$#" -eq 6 ] || return 2
 
   module_invalid=false
   if ! tmux_source_commands_are_allowed options "$1"; then module_invalid=true; fi
   if ! tmux_source_commands_are_allowed keys "$2"; then module_invalid=true; fi
-  if ! tmux_source_commands_are_allowed status "$3"; then module_invalid=true; fi
-  if ! tmux_source_commands_are_allowed platform "$4"; then module_invalid=true; fi
+  if ! tmux_source_commands_are_allowed persistence "$3"; then module_invalid=true; fi
+  if ! tmux_source_commands_are_allowed status "$4"; then module_invalid=true; fi
   if ! tmux_source_commands_are_allowed platform "$5"; then module_invalid=true; fi
+  if ! tmux_source_commands_are_allowed platform "$6"; then module_invalid=true; fi
 
   [ "$module_invalid" = false ]
 }
@@ -1542,6 +1588,31 @@ task6_replace_all() {
       print result remaining
     }
   '
+}
+
+require_tmux_entry_module_sequence_rejected() {
+  entry_sequence_case=$1
+  entry_sequence_from=$2
+  entry_sequence_to=$3
+  entry_sequence_label=$4
+  entry_sequence_fixture="$check_tmp/tmux-entry-$entry_sequence_case.conf"
+  entry_sequence_audit="$check_tmp/tmux-entry-$entry_sequence_case-audit.txt"
+
+  if task6_replace_all "$entry_sequence_from" "$entry_sequence_to" \
+      < "$tmux_entry" > "$entry_sequence_fixture" \
+    && ! cmp -s "$tmux_entry" "$entry_sequence_fixture" \
+    && ! tmux_entry_source_graph_is_allowed \
+      "$entry_sequence_fixture" > "$entry_sequence_audit" 2>&1 \
+    && grep -Eq \
+      'unapproved tmux if-shell condition|tmux if-shell condition count mismatch' \
+      "$entry_sequence_audit"; then
+    pass "$entry_sequence_label"
+    return 0
+  fi
+
+  sed 's/^/      /' "$entry_sequence_audit" >&2
+  fail "$entry_sequence_label"
+  return 1
 }
 
 task6_set_probe_state() {
@@ -5392,6 +5463,14 @@ ghostty_root="$config_root/ghostty"
 herdr_root="$config_root/herdr"
 herdr_move_picker="$herdr_root/scripts/move-pane"
 tmux_root="$config_root/tmux"
+# shellcheck disable=SC2016  # Preserve the literal tmux source spelling.
+tmux_persistence_source='$HOME/.config/tmux/conf/persistence.conf'
+# shellcheck disable=SC2016  # Preserve the literal tmux source spelling.
+tmux_persistence_helper_source='$HOME/.config/tmux/scripts/workspace'
+tmux_persistence_prompt='Save tmux workspace now? (y/n)'
+tmux_persistence_helper="$tmux_root/scripts/workspace"
+# shellcheck disable=SC2034  # Consumed by the effective-key contract in the next slice.
+tmux_persistence_save_command="confirm-before -p \"$tmux_persistence_prompt\" \"run-shell '$tmux_persistence_helper save'\""
 nvim_root="$config_root/nvim"
 nvim_data_root="$data_home/nvim"
 git_summary="$config_root/dotfiles/git-summary"
@@ -7302,6 +7381,7 @@ fi
 require_file "$tmux_root/tmux.conf" || true
 require_file "$tmux_root/conf/options.conf" || true
 require_file "$tmux_root/conf/keys.conf" || true
+require_file "$tmux_root/conf/persistence.conf" || true
 require_file "$tmux_root/conf/status.conf" || true
 require_file "$tmux_root/conf/platform/linux.conf" || true
 require_file "$tmux_root/conf/platform/macos.conf" || true
@@ -7309,6 +7389,7 @@ require_file "$tmux_root/conf/platform/macos.conf" || true
 tmux_entry="$tmux_root/tmux.conf"
 tmux_options="$tmux_root/conf/options.conf"
 tmux_keys="$tmux_root/conf/keys.conf"
+tmux_persistence="$tmux_root/conf/persistence.conf"
 tmux_status="$tmux_root/conf/status.conf"
 tmux_linux="$tmux_root/conf/platform/linux.conf"
 tmux_macos="$tmux_root/conf/platform/macos.conf"
@@ -7329,6 +7410,7 @@ fi
 if [ -r "$tmux_entry" ] \
   && [ -r "$tmux_options" ] \
   && [ -r "$tmux_keys" ] \
+  && [ -r "$tmux_persistence" ] \
   && [ -r "$tmux_status" ] \
   && [ -r "$tmux_linux" ] \
   && [ -r "$tmux_macos" ]; then
@@ -7476,12 +7558,20 @@ if [ -r "$tmux_entry" ] \
   fi
 
   if tmux_entry_source_graph_is_allowed "$tmux_entry"; then
-    pass "tmux entry accepts all nine exact quoted conditions, approved commands, and source graph"
+    pass "tmux entry accepts all ten exact quoted conditions, approved commands, and source graph"
   else
     fail "tmux entry contains an unapproved condition, command, or source graph"
   fi
 
-  if tmux_modules_use_allowed_commands "$tmux_options" "$tmux_keys" "$tmux_status" "$tmux_linux" "$tmux_macos"; then
+  if tmux_source_commands_are_allowed persistence "$tmux_persistence"; then
+    pass "tmux persistence module contains one exact confirmed save binding"
+  else
+    fail "tmux persistence module violates its exact binding contract"
+  fi
+
+  if tmux_modules_use_allowed_commands \
+    "$tmux_options" "$tmux_keys" "$tmux_persistence" \
+    "$tmux_status" "$tmux_linux" "$tmux_macos"; then
     pass "tmux modules accept only their exact per-file condition manifests and command allowlists"
   else
     fail "tmux modules contain a condition or command outside their exact per-file manifests"
@@ -7493,7 +7583,9 @@ if [ -r "$tmux_entry" ] \
     fail "tmux options exact condition manifest rejects its canonical quoted condition"
   fi
 
-  if tmux_sources_are_plugin_free "$tmux_entry" "$tmux_options" "$tmux_keys" "$tmux_status" "$tmux_linux" "$tmux_macos"; then
+  if tmux_sources_are_plugin_free \
+    "$tmux_entry" "$tmux_options" "$tmux_keys" "$tmux_persistence" \
+    "$tmux_status" "$tmux_linux" "$tmux_macos"; then
     pass "tmux foundation contains no plugin declarations"
   else
     fail "tmux foundation contains an @plugin declaration"
@@ -7609,6 +7701,69 @@ if [ -r "$tmux_entry" ] \
   else
     sed 's/^/      /' "$tmux_status_comment_palette_audit" >&2
     fail "tmux status palette audit counted a comment-only required color"
+  fi
+
+  tmux_shared_sequence="\"\$HOME/.config/tmux/conf/options.conf\" \"\$HOME/.config/tmux/conf/keys.conf\" \"$tmux_persistence_source\" \"\$HOME/.config/tmux/conf/status.conf\""
+  # shellcheck disable=SC2016  # Mutation text must retain literal tmux paths.
+  tmux_missing_persistence_sequence='"$HOME/.config/tmux/conf/options.conf" "$HOME/.config/tmux/conf/keys.conf" "$HOME/.config/tmux/conf/status.conf"'
+  tmux_duplicate_persistence_sequence="\"\$HOME/.config/tmux/conf/options.conf\" \"\$HOME/.config/tmux/conf/keys.conf\" \"$tmux_persistence_source\" \"$tmux_persistence_source\" \"\$HOME/.config/tmux/conf/status.conf\""
+  tmux_reordered_persistence_sequence="\"\$HOME/.config/tmux/conf/options.conf\" \"\$HOME/.config/tmux/conf/keys.conf\" \"\$HOME/.config/tmux/conf/status.conf\" \"$tmux_persistence_source\""
+  # shellcheck disable=SC2016  # Mutation text must retain literal tmux paths.
+  tmux_substituted_persistence_sequence='"$HOME/.config/tmux/conf/options.conf" "$HOME/.config/tmux/conf/keys.conf" "$HOME/.config/tmux/conf/not-persistence.conf" "$HOME/.config/tmux/conf/status.conf"'
+
+  require_tmux_entry_module_sequence_rejected \
+    persistence-missing "$tmux_shared_sequence" "$tmux_missing_persistence_sequence" \
+    "tmux entry audit rejects a missing persistence module" || true
+  require_tmux_entry_module_sequence_rejected \
+    persistence-duplicate "$tmux_shared_sequence" "$tmux_duplicate_persistence_sequence" \
+    "tmux entry audit rejects a duplicate persistence module" || true
+  require_tmux_entry_module_sequence_rejected \
+    persistence-reordered "$tmux_shared_sequence" "$tmux_reordered_persistence_sequence" \
+    "tmux entry audit rejects a reordered persistence module" || true
+  require_tmux_entry_module_sequence_rejected \
+    persistence-substituted "$tmux_shared_sequence" "$tmux_substituted_persistence_sequence" \
+    "tmux entry audit rejects a substituted persistence module" || true
+
+  task6_replace_all 'workspace save' 'workspace restore' \
+    < "$tmux_persistence" > "$check_tmp/tmux-persistence-action-mutation.conf"
+  if ! tmux_source_commands_are_allowed persistence \
+      "$check_tmp/tmux-persistence-action-mutation.conf" \
+      > "$check_tmp/tmux-persistence-action-mutation-audit.txt" 2>&1 \
+    && grep -Fq 'noncanonical tmux persistence binding' \
+      "$check_tmp/tmux-persistence-action-mutation-audit.txt"; then
+    pass "tmux persistence source audit rejects a restore action"
+  else
+    sed 's/^/      /' "$check_tmp/tmux-persistence-action-mutation-audit.txt" >&2
+    fail "tmux persistence source audit accepted or misclassified a restore action"
+  fi
+
+  sed -n 'p' "$tmux_persistence" \
+    "$tmux_persistence" > "$check_tmp/tmux-persistence-duplicate-mutation.conf"
+  if ! tmux_source_commands_are_allowed persistence \
+      "$check_tmp/tmux-persistence-duplicate-mutation.conf" \
+      > "$check_tmp/tmux-persistence-duplicate-mutation-audit.txt" 2>&1 \
+    && grep -Fq 'tmux persistence binding count mismatch' \
+      "$check_tmp/tmux-persistence-duplicate-mutation-audit.txt"; then
+    pass "tmux persistence source audit rejects a duplicate binding"
+  else
+    sed 's/^/      /' "$check_tmp/tmux-persistence-duplicate-mutation-audit.txt" >&2
+    fail "tmux persistence source audit accepted or misclassified a duplicate binding"
+  fi
+
+  {
+    printf '%s\n' '{'
+    sed 's/^/  /' "$tmux_persistence"
+    printf '%s\n' '}'
+  } > "$check_tmp/tmux-persistence-nested-mutation.conf"
+  if ! tmux_source_commands_are_allowed persistence \
+      "$check_tmp/tmux-persistence-nested-mutation.conf" \
+      > "$check_tmp/tmux-persistence-nested-mutation-audit.txt" 2>&1 \
+    && grep -Fq 'noncanonical tmux persistence binding scope' \
+      "$check_tmp/tmux-persistence-nested-mutation-audit.txt"; then
+    pass "tmux persistence source audit rejects a binding below module top level"
+  else
+    sed 's/^/      /' "$check_tmp/tmux-persistence-nested-mutation-audit.txt" >&2
+    fail "tmux persistence source audit accepted or misclassified a nested binding"
   fi
 
   sed -n 'p' "$tmux_entry" > "$check_tmp/tmux-entry-theme-mutation.conf"
@@ -8454,8 +8609,12 @@ TASK6_APPLICATION_CASES
   require_tmux_binding "$check_tmp/tmux-prefix-keys.txt" prefix K "$tmux_swap_up_command" "tmux prefix+Shift-k swaps up without wrapping" || true
   require_tmux_binding "$check_tmp/tmux-prefix-keys.txt" prefix L "$tmux_swap_right_command" "tmux prefix+Shift-l swaps right without wrapping" || true
   require_tmux_binding "$check_tmp/tmux-prefix-keys.txt" prefix m "$tmux_move_command" "tmux prefix+m opens the frozen-source pane-move chooser" || true
+  require_tmux_binding \
+    "$check_tmp/tmux-prefix-keys.txt" prefix s \
+    "$tmux_persistence_save_command" \
+    "tmux prefix+s confirms an exact workspace save" || true
 
-  for key in C-b C-Space d c n p M-n M-p 0 1 2 3 4 5 6 7 8 9 ',' '&' '"' '%' s w h j k l Up Down Left Right C-Up C-Down C-Left C-Right M-Up M-Down M-Left M-Right x z '[' Tab; do
+  for key in C-b C-Space d c n p M-n M-p 0 1 2 3 4 5 6 7 8 9 ',' '&' '"' '%' w h j k l Up Down Left Right C-Up C-Down C-Left C-Right M-Up M-Down M-Left M-Right x z '[' Tab; do
     serialized_key=$key
     case "$key" in
       '"') serialized_key='\"' ;;
@@ -9615,14 +9774,19 @@ XAUTHORITY'
   fi
 
   prefix_binding_count=0
-  for key in M-Space '?' R Q f r v H J K L m; do
+  for key in M-Space '?' R Q f r v H J K L m s; do
     prefix_binding_count=$((prefix_binding_count + $(tmux_binding_count "$check_tmp/tmux-after-reload-prefix-keys.txt" prefix "$key")))
   done
-  if [ "$prefix_binding_count" -eq 12 ]; then
-    pass "tmux reload leaves exactly twelve canonical prefix bindings"
+  if [ "$prefix_binding_count" -eq 13 ]; then
+    pass "tmux reload leaves exactly thirteen canonical prefix bindings"
   else
-    fail "tmux reload must leave twelve canonical prefix bindings; found $prefix_binding_count"
+    fail "tmux reload must leave thirteen canonical prefix bindings; found $prefix_binding_count"
   fi
+
+  require_tmux_binding \
+    "$check_tmp/tmux-after-reload-prefix-keys.txt" prefix s \
+    "$tmux_persistence_save_command" \
+    "tmux reload preserves the confirmed workspace save binding" || true
 
   root_binding_count=0
   for key in M-n M-1 M-2 M-3 M-4 M-5 M-6 M-7 M-8 M-9 M-r M-Q "$serialized_backslash_key" 'M-|' M-h M-j M-k M-l M-q M-f; do
