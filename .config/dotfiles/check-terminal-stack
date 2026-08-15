@@ -1697,6 +1697,7 @@ tmux_copy_pipe_and_run_shell_payloads_are_safe() {
   TMUX_EXPECTED_SWAP_UP_COMMAND=$tmux_swap_up_command \
   TMUX_EXPECTED_SWAP_RIGHT_COMMAND=$tmux_swap_right_command \
   TMUX_EXPECTED_MOVE_COMMAND=$tmux_move_command \
+  TMUX_EXPECTED_PERSISTENCE_SAVE_COMMAND=$tmux_persistence_save_command \
     awk '
     function take_token(    token) {
       token = remaining
@@ -1940,6 +1941,7 @@ tmux_copy_pipe_and_run_shell_payloads_are_safe() {
       canonical_swap_command["K"] = ENVIRON["TMUX_EXPECTED_SWAP_UP_COMMAND"]
       canonical_swap_command["L"] = ENVIRON["TMUX_EXPECTED_SWAP_RIGHT_COMMAND"]
       canonical_move_command = ENVIRON["TMUX_EXPECTED_MOVE_COMMAND"]
+      canonical_persistence_save_command = ENVIRON["TMUX_EXPECTED_PERSISTENCE_SAVE_COMMAND"]
     }
     /^[[:space:]]*$/ { next }
     {
@@ -1967,6 +1969,9 @@ tmux_copy_pipe_and_run_shell_payloads_are_safe() {
       if (parsed_table == "prefix" \
         && (parsed_key in canonical_swap_command) \
         && remaining == canonical_swap_command[parsed_key]) next
+      if (parsed_table == "prefix" \
+        && parsed_key == "s" \
+        && remaining == canonical_persistence_save_command) next
       if (audit_tmux_command_list(remaining, 0)) invalid = 1
     }
     END { exit invalid }
@@ -8778,9 +8783,92 @@ TASK6_APPLICATION_CASES
   fi
 
   if tmux_copy_pipe_and_run_shell_payloads_are_safe "$check_tmp/tmux-all-keys.txt"; then
-    pass "all effective tmux copy-pipe and run-shell routes avoid explicit payloads"
+    pass "all effective tmux copy-pipe and run-shell routes contain no unapproved explicit payloads"
   else
-    fail "an effective tmux copy-pipe or run-shell route contains an explicit payload"
+    fail "an effective tmux copy-pipe or run-shell route contains an unapproved explicit payload"
+  fi
+
+  tmux_persistence_payload_fixture="$check_tmp/tmux-persistence-payload-canonical.txt"
+  tmux_describe_binding "$check_tmp/tmux-all-keys.txt" prefix s \
+    > "$tmux_persistence_payload_fixture"
+  if tmux_binding_matches_exactly \
+      "$tmux_persistence_payload_fixture" prefix s \
+      "$tmux_persistence_save_command" \
+    && tmux_copy_pipe_and_run_shell_payloads_are_safe \
+      "$tmux_persistence_payload_fixture"; then
+    pass "tmux payload audit accepts the exact confirmed prefix+s workspace save"
+  else
+    fail "tmux payload audit rejects the exact confirmed prefix+s workspace save"
+  fi
+
+  tmux_persistence_wrong_table="$check_tmp/tmux-persistence-payload-wrong-table.txt"
+  printf '%s\n' "bind-key -T root s $tmux_persistence_save_command" \
+    > "$tmux_persistence_wrong_table"
+  if tmux_binding_matches_exactly \
+      "$tmux_persistence_wrong_table" root s \
+      "$tmux_persistence_save_command" \
+    && ! tmux_copy_pipe_and_run_shell_payloads_are_safe \
+      "$tmux_persistence_wrong_table"; then
+    pass "tmux payload audit rejects the canonical save outside the prefix table"
+  else
+    fail "tmux payload audit accepted or misclassified the canonical save outside the prefix table"
+  fi
+
+  tmux_persistence_wrong_key="$check_tmp/tmux-persistence-payload-wrong-key.txt"
+  printf '%s\n' "bind-key -T prefix F11 $tmux_persistence_save_command" \
+    > "$tmux_persistence_wrong_key"
+  if tmux_binding_matches_exactly \
+      "$tmux_persistence_wrong_key" prefix F11 \
+      "$tmux_persistence_save_command" \
+    && ! tmux_copy_pipe_and_run_shell_payloads_are_safe \
+      "$tmux_persistence_wrong_key"; then
+    pass "tmux payload audit rejects the canonical save outside prefix+s"
+  else
+    fail "tmux payload audit accepted or misclassified the canonical save outside prefix+s"
+  fi
+
+  tmux_persistence_restore_action="$check_tmp/tmux-persistence-payload-restore.txt"
+  task6_replace_all 'workspace save' 'workspace restore' \
+    < "$tmux_persistence_payload_fixture" \
+    > "$tmux_persistence_restore_action"
+  if ! cmp -s \
+      "$tmux_persistence_payload_fixture" "$tmux_persistence_restore_action" \
+    && [ "$(tmux_binding_count "$tmux_persistence_restore_action" prefix s)" -eq 1 ] \
+    && ! tmux_copy_pipe_and_run_shell_payloads_are_safe \
+      "$tmux_persistence_restore_action"; then
+    pass "tmux payload audit rejects a restore action on prefix+s"
+  else
+    fail "tmux payload audit accepted or misclassified a restore action on prefix+s"
+  fi
+
+  tmux_persistence_changed_helper="$check_tmp/tmux-persistence-payload-helper.txt"
+  task6_replace_all \
+    "$tmux_persistence_helper" "$tmux_root/scripts/not-workspace" \
+    < "$tmux_persistence_payload_fixture" \
+    > "$tmux_persistence_changed_helper"
+  if ! cmp -s \
+      "$tmux_persistence_payload_fixture" "$tmux_persistence_changed_helper" \
+    && [ "$(tmux_binding_count "$tmux_persistence_changed_helper" prefix s)" -eq 1 ] \
+    && ! tmux_copy_pipe_and_run_shell_payloads_are_safe \
+      "$tmux_persistence_changed_helper"; then
+    pass "tmux payload audit rejects a changed workspace helper on prefix+s"
+  else
+    fail "tmux payload audit accepted or misclassified a changed workspace helper on prefix+s"
+  fi
+
+  tmux_persistence_changed_prompt="$check_tmp/tmux-persistence-payload-prompt.txt"
+  task6_replace_all \
+    "$tmux_persistence_prompt" 'Checkpoint tmux workspace now? (y/n)' \
+    < "$tmux_persistence_payload_fixture" \
+    > "$tmux_persistence_changed_prompt"
+  if ! cmp -s \
+      "$tmux_persistence_payload_fixture" "$tmux_persistence_changed_prompt" \
+    && [ "$(tmux_binding_count "$tmux_persistence_changed_prompt" prefix s)" -eq 1 ] \
+    && ! tmux_copy_pipe_and_run_shell_payloads_are_safe \
+      "$tmux_persistence_changed_prompt"; then
+    pass "tmux payload audit rejects a changed confirmation prompt on prefix+s"
+  else
+    fail "tmux payload audit accepted or misclassified a changed confirmation prompt on prefix+s"
   fi
 
   if [ "$tmux_version" = "3.7" ]; then
@@ -9672,9 +9760,9 @@ TASK6_APPLICATION_CASES
   fi
 
   if tmux_copy_pipe_and_run_shell_payloads_are_safe "$check_tmp/tmux-after-reload-all-keys.txt"; then
-    pass "all effective tmux copy-pipe and run-shell routes remain free of explicit payloads after reload"
+    pass "all effective tmux copy-pipe and run-shell routes retain no unapproved explicit payloads after reload"
   else
-    fail "a post-reload tmux copy-pipe or run-shell route contains an explicit payload"
+    fail "a post-reload tmux copy-pipe or run-shell route contains an unapproved explicit payload"
   fi
 
   require_tmux_option_value "$check_socket" session @dotfiles_foundation_loaded 1 "tmux reload preserves the foundation marker" || true
