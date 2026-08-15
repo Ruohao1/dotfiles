@@ -88,4 +88,4 @@ dotfiles push -u origin main
 
 ## More
 
-My editor configuration is maintained in its own repository: ![neovim-configuration](https://github.com/Ruohao1/neovim-config)
+My Neovim configuration is maintained in this repository under [`.config/nvim`](.config/nvim).
