@@ -43,7 +43,8 @@ case "$root" in
     ;;
 esac
 
-manifest=$root/.config/dotfiles/manifests/window-manager-bindings.tsv
+keyboard_manifest=$root/.config/dotfiles/manifests/window-manager-bindings.tsv
+pointer_manifest=$root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv
 hypr_config=$root/.config/hypr/hyprland.lua
 i3_config=$root/.config/i3/config
 i3_dwindle=$root/.config/i3/dwindle
@@ -86,7 +87,8 @@ repository_tracks_path() {
 }
 
 for required_file in \
-  "$manifest" \
+  "$keyboard_manifest" \
+  "$pointer_manifest" \
   "$hypr_config" \
   "$i3_config" \
   "$i3_dwindle" \
@@ -199,12 +201,78 @@ do
   else
     fail "AeroSpace implements $action exactly once"
   fi
-done <"$manifest"
+done <"$keyboard_manifest"
 
 if [ "$rows" -eq 40 ]; then
   pass 'contract contains exactly 40 shared bindings'
 else
   fail "contract contains exactly 40 shared bindings (found $rows)"
+fi
+
+: >"$check_tmp/pointer-actions"
+pointer_rows=0
+while IFS= read -r pointer_row || [ -n "${pointer_row:-}" ]
+do
+  case ${pointer_row:-} in
+    ''|'#'*) continue ;;
+  esac
+  pointer_rows=$((pointer_rows + 1))
+
+  if ! printf '%s\n' "$pointer_row" | awk -F "$tab" '
+    NF != 8 { exit 1 }
+    {
+      for (field = 1; field <= NF; field++) {
+        if ($field == "") {
+          exit 1
+        }
+      }
+    }
+  '; then
+    fail 'pointer contract row has exactly seven tabs and no empty fields'
+    continue
+  fi
+
+  printf '%s\n' "$pointer_row" >"$check_tmp/pointer-row"
+  IFS="$tab" read -r pointer_action logical_input linux_modifier \
+    macos_modifier pointer_button hypr_mechanism i3_mechanism \
+    aerospace_mechanism pointer_extra <"$check_tmp/pointer-row"
+
+  if [ -n "${pointer_extra:-}" ] \
+    || [ -z "$logical_input" ] \
+    || [ -z "$linux_modifier" ] \
+    || [ -z "$macos_modifier" ] \
+    || [ -z "$pointer_button" ] \
+    || [ -z "$hypr_mechanism" ] \
+    || [ -z "$i3_mechanism" ] \
+    || [ -z "$aerospace_mechanism" ]; then
+    fail "pointer contract row has exactly eight non-empty fields: $pointer_action"
+    continue
+  fi
+
+  if grep -Fqx "$pointer_action" "$check_tmp/pointer-actions"; then
+    fail "pointer contract action is unique: $pointer_action"
+  else
+    printf '%s\n' "$pointer_action" >>"$check_tmp/pointer-actions"
+  fi
+
+  if [ "$pointer_action" = reorder-tiled-window ] \
+    && [ "$logical_input" = primary-drag ] \
+    && [ "$linux_modifier" = SUPER ] \
+    && [ "$macos_modifier" = OPTION ] \
+    && [ "$pointer_button" = button1 ] \
+    && [ "$hypr_mechanism" = hypr-window-drag ] \
+    && [ "$i3_mechanism" = i3-tiling-drag ] \
+    && [ "$aerospace_mechanism" = macos-native-window-drag ]; then
+    pass 'pointer contract preserves the shared tiled-window drag mapping'
+  else
+    fail "pointer contract has an unsupported mapping: $pointer_action"
+  fi
+done <"$pointer_manifest"
+
+if [ "$pointer_rows" -eq 1 ]; then
+  pass 'pointer contract contains exactly one shared action'
+else
+  fail "pointer contract contains exactly one shared action (found $pointer_rows)"
 fi
 
 if ! grep -Fqx 'hl.bind("SUPER + SHIFT + C", hl.dsp.exec_cmd("hyprctl reload"))' \
@@ -282,22 +350,28 @@ else
   fail 'AeroSpace runs exactly one Dwindle window callback'
 fi
 
-if grep -Fqx \
-    'hl.bind("SUPER + mouse:272", hl.dsp.window.drag(), { mouse = true })' \
-    "$hypr_config" \
-  && grep -Fqx \
-    'hl.bind("SUPER + mouse:273", hl.dsp.window.resize(), { mouse = true })' \
-    "$hypr_config"; then
-  pass 'Hyprland supports Super plus left-drag move and right-drag resize'
+hypr_tiled_drag='hl.bind("SUPER + mouse:272", hl.dsp.window.drag(), { mouse = true })'
+if [ "$(grep -Fxc "$hypr_tiled_drag" "$hypr_config" || true)" -eq 1 ]; then
+  pass 'Hyprland implements shared Super plus primary drag exactly once'
 else
-  fail 'Hyprland supports Super plus left-drag move and right-drag resize'
+  fail 'Hyprland implements shared Super plus primary drag exactly once'
 fi
 
-if grep -Fqx "floating_modifier \$mod" "$i3_config" \
-  && grep -Fqx 'tiling_drag modifier' "$i3_config"; then
-  pass 'i3 supports Super plus mouse drag for floating and tiled windows'
+hypr_native_resize='hl.bind("SUPER + mouse:273", hl.dsp.window.resize(), { mouse = true })'
+if [ "$(grep -Fxc "$hypr_native_resize" "$hypr_config" || true)" -eq 1 ]; then
+  pass 'Hyprland preserves its manager-native right-button resize'
 else
-  fail 'i3 supports Super plus mouse drag for floating and tiled windows'
+  fail 'Hyprland preserves its manager-native right-button resize'
+fi
+
+# $mod is an i3 configuration literal, not a shell variable.
+# shellcheck disable=SC2016
+if [ "$(grep -Fxc 'set $mod Mod4' "$i3_config" || true)" -eq 1 ] \
+  && [ "$(grep -Fxc 'floating_modifier $mod' "$i3_config" || true)" -eq 1 ] \
+  && [ "$(grep -Fxc 'tiling_drag modifier' "$i3_config" || true)" -eq 1 ]; then
+  pass 'i3 implements shared Super plus tiled drag exactly once'
+else
+  fail 'i3 implements shared Super plus tiled drag exactly once'
 fi
 
 if grep -Fq 'dofile(local_config)' "$hypr_config" \

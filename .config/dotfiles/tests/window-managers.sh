@@ -104,6 +104,7 @@ for required_file in \
   "$workspace_root/.config/aerospace/aerospace.toml" \
   "$workspace_root/.config/aerospace/dwindle" \
   "$dotfiles_dir/manifests/window-manager-bindings.tsv" \
+  "$dotfiles_dir/manifests/window-manager-pointer-bindings.tsv" \
   "$dotfiles_dir/manifests/config-linux-hypr.paths" \
   "$dotfiles_dir/manifests/config-linux-i3.paths" \
   "$dotfiles_dir/manifests/config-macos-aerospace.paths" \
@@ -162,6 +163,8 @@ if command -v git >/dev/null 2>&1; then
     "$local_root/.config/aerospace/dwindle"
   cp "$workspace_root/.config/dotfiles/manifests/window-manager-bindings.tsv" \
     "$local_root/.config/dotfiles/manifests/window-manager-bindings.tsv"
+  cp "$workspace_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv" \
+    "$local_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv"
   cp "$workspace_root/.config/hypr/hyprland.lua" \
     "$local_root/.config/hypr/hyprland.lua"
   cp "$workspace_root/.config/i3/config" "$local_root/.config/i3/config"
@@ -177,6 +180,112 @@ if command -v git >/dev/null 2>&1; then
   else
     fail 'contract checker preserves an untracked local legacy config'
   fi
+
+  tab=$(printf '\t')
+  sed "s/${tab}SUPER${tab}OPTION${tab}/${tab}ALT${tab}OPTION${tab}/" \
+    "$workspace_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv" \
+    >"$local_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv"
+  run_capture "$test_tmp/checker-pointer-linux-modifier.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects a changed Linux pointer modifier'
+  else
+    fail 'contract checker rejects a changed Linux pointer modifier'
+  fi
+  cp "$workspace_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv" \
+    "$local_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv"
+
+  sed "2s/^/${tab}/" \
+    "$workspace_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv" \
+    >"$local_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv"
+  run_capture "$test_tmp/checker-pointer-leading-empty.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects a leading empty pointer field'
+  else
+    fail 'contract checker rejects a leading empty pointer field'
+  fi
+  cp "$workspace_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv" \
+    "$local_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv"
+
+  sed "2s/${tab}/${tab}${tab}/" \
+    "$workspace_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv" \
+    >"$local_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv"
+  run_capture "$test_tmp/checker-pointer-repeated-empty.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects a repeated empty pointer field'
+  else
+    fail 'contract checker rejects a repeated empty pointer field'
+  fi
+  cp "$workspace_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv" \
+    "$local_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv"
+
+  sed "2s/$/${tab}/" \
+    "$workspace_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv" \
+    >"$local_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv"
+  run_capture "$test_tmp/checker-pointer-trailing-empty.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects a trailing empty pointer field'
+  else
+    fail 'contract checker rejects a trailing empty pointer field'
+  fi
+  cp "$workspace_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv" \
+    "$local_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv"
+
+  sed "s/${tab}button1${tab}/${tab}button2${tab}/" \
+    "$workspace_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv" \
+    >"$local_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv"
+  run_capture "$test_tmp/checker-pointer-button.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects a changed shared pointer button'
+  else
+    fail 'contract checker rejects a changed shared pointer button'
+  fi
+  cp "$workspace_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv" \
+    "$local_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv"
+
+  sed 's/SUPER + mouse:272/ALT + mouse:272/' \
+    "$workspace_root/.config/hypr/hyprland.lua" \
+    >"$local_root/.config/hypr/hyprland.lua"
+  run_capture "$test_tmp/checker-pointer-hypr.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects a changed Hyprland pointer chord'
+  else
+    fail 'contract checker rejects a changed Hyprland pointer chord'
+  fi
+  cp "$workspace_root/.config/hypr/hyprland.lua" \
+    "$local_root/.config/hypr/hyprland.lua"
+
+  sed 's/^tiling_drag modifier$/tiling_drag titlebar/' \
+    "$workspace_root/.config/i3/config" \
+    >"$local_root/.config/i3/config"
+  run_capture "$test_tmp/checker-pointer-i3.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects a changed i3 tiled-drag mechanism'
+  else
+    fail 'contract checker rejects a changed i3 tiled-drag mechanism'
+  fi
+  cp "$workspace_root/.config/i3/config" "$local_root/.config/i3/config"
+
+  {
+    cat "$workspace_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv"
+    printf '%b\n' \
+      'reorder-tiled-window\tprimary-drag\tSUPER\tOPTION\tbutton1\thypr-window-drag\ti3-tiling-drag\tmacos-native-window-drag'
+  } >"$local_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv"
+  run_capture "$test_tmp/checker-pointer-duplicate.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects a duplicate shared pointer action'
+  else
+    fail 'contract checker rejects a duplicate shared pointer action'
+  fi
+  cp "$workspace_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv" \
+    "$local_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv"
 
   sed 's/            natural_scroll = true,/            natural_scroll = false,/' \
     "$workspace_root/.config/hypr/hyprland.lua" \

@@ -1,0 +1,2 @@
+# action	logical-input	linux-modifier	macos-modifier	button	hypr-mechanism	i3-mechanism	aerospace-mechanism
+reorder-tiled-window	primary-drag	SUPER	OPTION	button1	hypr-window-drag	i3-tiling-drag	macos-native-window-drag
