@@ -74,6 +74,19 @@ make_version_command() {
   chmod 0755 "$command_path"
 }
 
+make_failing_version_command() {
+  command_path=$1
+  version_text=$2
+  version_status=$3
+  mkdir -p "$(dirname "$command_path")"
+  printf '%s\n' \
+    '#!/bin/sh' \
+    "printf '%s\\n' '$version_text'" \
+    "exit '$version_status'" \
+    >"$command_path"
+  chmod 0755 "$command_path"
+}
+
 make_stdio_command() {
   command_path=$1
   command_behavior=$2
@@ -215,6 +228,216 @@ make_exit_repeat_signal_bootstrap() {
     }
   ' "$exit_repeat_source" >"$exit_repeat_target"
   chmod 0755 "$exit_repeat_target"
+}
+
+make_parquet_function_bootstrap() {
+  parquet_function_source=$1
+  parquet_function_target=$2
+  awk '
+    $0 == "platform=$(detect_platform)" {
+      print "case ${DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION:-} in"
+      print "  uv-executable)"
+      print "    parquet_uv_executable"
+      print "    exit $?"
+      print "    ;;"
+      print "  viewer-satisfied)"
+      print "    parquet_viewer_is_satisfied"
+      print "    exit $?"
+      print "    ;;"
+      print "  install)"
+      print "    package_actions_file=${DOTFILES_BOOTSTRAP_TEST_PARQUET_ACTIONS:-}"
+      print "    install_parquet_viewer"
+      print "    exit $?"
+      print "    ;;"
+      print "  install-preserves-environment)"
+      print "    package_actions_file=${DOTFILES_BOOTSTRAP_TEST_PARQUET_ACTIONS:-}"
+      print "    parquet_install_status=0"
+      print "    install_parquet_viewer || parquet_install_status=$?"
+      print "    {"
+      print "      printf \"UV_BUILD_CONSTRAINT=%s\\n\" \"${UV_BUILD_CONSTRAINT-<unset>}\""
+      print "      printf \"UV_CONSTRAINT=%s\\n\" \"${UV_CONSTRAINT-<unset>}\""
+      print "      printf \"UV_DEFAULT_INDEX=%s\\n\" \"${UV_DEFAULT_INDEX-<unset>}\""
+      print "      printf \"UV_EXCLUDE=%s\\n\" \"${UV_EXCLUDE-<unset>}\""
+      print "      printf \"UV_EXCLUDE_NEWER=%s\\n\" \"${UV_EXCLUDE_NEWER-<unset>}\""
+      print "      printf \"UV_EXTRA_INDEX_URL=%s\\n\" \"${UV_EXTRA_INDEX_URL-<unset>}\""
+      print "      printf \"UV_FIND_LINKS=%s\\n\" \"${UV_FIND_LINKS-<unset>}\""
+      print "      printf \"UV_FORK_STRATEGY=%s\\n\" \"${UV_FORK_STRATEGY-<unset>}\""
+      print "      printf \"UV_INDEX=%s\\n\" \"${UV_INDEX-<unset>}\""
+      print "      printf \"UV_INDEX_STRATEGY=%s\\n\" \"${UV_INDEX_STRATEGY-<unset>}\""
+      print "      printf \"UV_INDEX_URL=%s\\n\" \"${UV_INDEX_URL-<unset>}\""
+      print "      printf \"UV_OVERRIDE=%s\\n\" \"${UV_OVERRIDE-<unset>}\""
+      print "      printf \"UV_PRERELEASE=%s\\n\" \"${UV_PRERELEASE-<unset>}\""
+      print "      printf \"UV_RESOLUTION=%s\\n\" \"${UV_RESOLUTION-<unset>}\""
+      print "      printf \"UV_TORCH_BACKEND=%s\\n\" \"${UV_TORCH_BACKEND-<unset>}\""
+      print "    } >\"$DOTFILES_BOOTSTRAP_TEST_PARQUET_CALLER_ENV_LOG\""
+      print "    exit \"$parquet_install_status\""
+      print "    ;;"
+      print "esac"
+      injected += 1
+    }
+    { print }
+    END {
+      if (injected != 1) exit 1
+    }
+  ' "$parquet_function_source" >"$parquet_function_target"
+  chmod 0755 "$parquet_function_target"
+}
+
+make_parquet_uv_tool_command() {
+  parquet_uv_command=$1
+  mkdir -p "$(dirname "$parquet_uv_command")"
+  # shellcheck disable=SC2016 # The generated fixture expands these values when invoked.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'case "${1:-}" in' \
+    '  --version)' \
+    '    printf "%s\n" "${DOTFILES_BOOTSTRAP_TEST_PARQUET_UV_VERSION:-uv 0.12.5}"' \
+    '    exit 0' \
+    '    ;;' \
+    '  tool)' \
+    '    case "${2:-}" in' \
+    '      dir)' \
+    '        [ "${UV_OFFLINE:-}" = 1 ] || exit 92' \
+    '        if [ "$#" -eq 3 ] && [ "${3:-}" = --no-config ]; then' \
+    '          [ "${DOTFILES_BOOTSTRAP_TEST_PARQUET_TOOL_PROBE_FAIL:-0}" != 1 ] || exit 61' \
+    '          printf "%s\n" "${UV_TOOL_DIR-${DOTFILES_BOOTSTRAP_TEST_PARQUET_TOOL_ROOT:-}}"' \
+    '        elif [ "$#" -eq 4 ] && [ "${3:-}" = --bin ] && [ "${4:-}" = --no-config ]; then' \
+    '          [ "${DOTFILES_BOOTSTRAP_TEST_PARQUET_BIN_PROBE_FAIL:-0}" != 1 ] || exit 62' \
+    '          printf "%s\n" "${UV_TOOL_BIN_DIR-${DOTFILES_BOOTSTRAP_TEST_PARQUET_TOOL_BIN_ROOT:-$HOME/.local/bin}}"' \
+    '        else' \
+    '          exit 90' \
+    '        fi' \
+    '        exit 0' \
+    '        ;;' \
+    '      install)' \
+    '        [ "$#" -eq 7 ] || exit 93' \
+    '        [ "${3:-}" = --force ] || exit 94' \
+    '        [ "${4:-}" = --with ] || exit 95' \
+    '        [ "${5:-}" = pyarrow==25.0.0 ] || exit 96' \
+    '        [ "${6:-}" = --no-config ] || exit 97' \
+    '        [ "${7:-}" = visidata==3.4 ] || exit 98' \
+    '        if [ -n "${DOTFILES_BOOTSTRAP_TEST_PARQUET_INSTALL_MARKER:-}" ]; then' \
+    '          : >"$DOTFILES_BOOTSTRAP_TEST_PARQUET_INSTALL_MARKER"' \
+    '        fi' \
+    '        case "${DOTFILES_BOOTSTRAP_TEST_PARQUET_INSTALL_BEHAVIOR:-succeed}" in' \
+    '          fail) exit 42 ;;' \
+    '          repair)' \
+    '            : >"$DOTFILES_BOOTSTRAP_TEST_PARQUET_PROBE_MARKER"' \
+    '            exit 0' \
+    '            ;;' \
+    '          repair-if-sanitized)' \
+    '            [ "${UV_BUILD_CONSTRAINT+x}" != x ] || exit 70' \
+    '            [ "${UV_CONSTRAINT+x}" != x ] || exit 71' \
+    '            [ "${UV_EXCLUDE+x}" != x ] || exit 72' \
+    '            [ "${UV_EXCLUDE_NEWER+x}" != x ] || exit 73' \
+    '            [ "${UV_FORK_STRATEGY+x}" != x ] || exit 74' \
+    '            [ "${UV_INDEX_STRATEGY+x}" != x ] || exit 79' \
+    '            [ "${UV_INDEX+x}" != x ] || exit 69' \
+    '            [ "${UV_DEFAULT_INDEX+x}" != x ] || exit 68' \
+    '            [ "${UV_INDEX_URL+x}" != x ] || exit 67' \
+    '            [ "${UV_EXTRA_INDEX_URL+x}" != x ] || exit 66' \
+    '            [ "${UV_FIND_LINKS+x}" != x ] || exit 65' \
+    '            [ "${UV_OVERRIDE+x}" != x ] || exit 75' \
+    '            [ "${UV_PRERELEASE+x}" != x ] || exit 76' \
+    '            [ "${UV_RESOLUTION+x}" != x ] || exit 77' \
+    '            [ "${UV_TORCH_BACKEND+x}" != x ] || exit 78' \
+    '            : >"$DOTFILES_BOOTSTRAP_TEST_PARQUET_PROBE_MARKER"' \
+    '            exit 0' \
+    '            ;;' \
+    '          succeed) exit 0 ;;' \
+    '          *) exit 99 ;;' \
+    '        esac' \
+    '        ;;' \
+    '      *) exit 89 ;;' \
+    '    esac' \
+    '    ;;' \
+    '  *) exit 88 ;;' \
+    'esac' \
+    >"$parquet_uv_command"
+  chmod 0755 "$parquet_uv_command"
+}
+
+prepare_parquet_tool_environment() {
+  parquet_environment_root=$1
+  mkdir -p "$parquet_environment_root/visidata/bin"
+  # shellcheck disable=SC2016 # The generated fixture expands these values when invoked.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    '[ "${PYTHONDONTWRITEBYTECODE:-}" = 1 ] || exit 80' \
+    '[ "$#" -eq 4 ] || exit 81' \
+    '[ "${1:-}" = -I ] || exit 82' \
+    '[ "${2:-}" = -B ] || exit 83' \
+    '[ "${3:-}" = -c ] || exit 84' \
+    '[ -n "${4:-}" ] || exit 85' \
+    '[ -n "${DOTFILES_BOOTSTRAP_TEST_PARQUET_PROBE_MARKER:-}" ] || exit 86' \
+    '[ -e "$DOTFILES_BOOTSTRAP_TEST_PARQUET_PROBE_MARKER" ]' \
+    >"$parquet_environment_root/visidata/bin/python"
+  printf '%s\n' '#!/bin/sh' 'exit 0' \
+    >"$parquet_environment_root/visidata/bin/vd"
+  chmod 0755 \
+    "$parquet_environment_root/visidata/bin/python" \
+    "$parquet_environment_root/visidata/bin/vd"
+}
+
+run_parquet_unsafe_target_case() {
+  parquet_unsafe_name=$1
+  parquet_unsafe_tool_root=$2
+  parquet_unsafe_bin_root=$3
+  parquet_unsafe_tool_probe_fail=$4
+  parquet_unsafe_bin_probe_fail=$5
+  parquet_unsafe_marker=$parquet_probe_root/$parquet_unsafe_name-install.invoked
+  parquet_unsafe_actions=$parquet_probe_root/$parquet_unsafe_name.actions
+  : >"$parquet_unsafe_actions"
+  run_capture "$parquet_probe_root/$parquet_unsafe_name.output" env \
+    PATH="$parquet_probe_bin:/usr/bin:/bin" \
+    HOME="$parquet_probe_root/home" \
+    UV_TOOL_DIR="$parquet_unsafe_tool_root" \
+    UV_TOOL_BIN_DIR="$parquet_unsafe_bin_root" \
+    DOTFILES_BOOTSTRAP_TEST_PARQUET_TOOL_PROBE_FAIL="$parquet_unsafe_tool_probe_fail" \
+    DOTFILES_BOOTSTRAP_TEST_PARQUET_BIN_PROBE_FAIL="$parquet_unsafe_bin_probe_fail" \
+    DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=install \
+    DOTFILES_BOOTSTRAP_TEST_PARQUET_PROBE_MARKER="$parquet_probe_root/missing.marker" \
+    DOTFILES_BOOTSTRAP_TEST_PARQUET_INSTALL_BEHAVIOR=succeed \
+    DOTFILES_BOOTSTRAP_TEST_PARQUET_INSTALL_MARKER="$parquet_unsafe_marker" \
+    DOTFILES_BOOTSTRAP_TEST_PARQUET_ACTIONS="$parquet_unsafe_actions" \
+    "$parquet_function_bootstrap"
+  if [ "$run_status" -ne 0 ] \
+    && [ ! -e "$parquet_unsafe_marker" ] \
+    && [ ! -s "$parquet_unsafe_actions" ]; then
+    pass "Parquet installation rejects $parquet_unsafe_name before invocation"
+  else
+    fail "Parquet installation rejects $parquet_unsafe_name before invocation"
+  fi
+}
+
+run_parquet_trailing_slash_target_case() {
+  parquet_trailing_name=$1
+  parquet_trailing_tool_root=$2
+  parquet_trailing_bin_root=$3
+  parquet_trailing_install_marker=$parquet_probe_root/$parquet_trailing_name-install.invoked
+  parquet_trailing_probe_marker=$parquet_probe_root/$parquet_trailing_name-validation.succeeded
+  parquet_trailing_actions=$parquet_probe_root/$parquet_trailing_name.actions
+  : >"$parquet_trailing_actions"
+  run_capture "$parquet_probe_root/$parquet_trailing_name.output" env \
+    PATH="$parquet_probe_bin:/usr/bin:/bin" \
+    HOME="$parquet_probe_root/home" \
+    UV_TOOL_DIR="$parquet_trailing_tool_root" \
+    UV_TOOL_BIN_DIR="$parquet_trailing_bin_root" \
+    DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=install \
+    DOTFILES_BOOTSTRAP_TEST_PARQUET_PROBE_MARKER="$parquet_trailing_probe_marker" \
+    DOTFILES_BOOTSTRAP_TEST_PARQUET_INSTALL_BEHAVIOR=repair \
+    DOTFILES_BOOTSTRAP_TEST_PARQUET_INSTALL_MARKER="$parquet_trailing_install_marker" \
+    DOTFILES_BOOTSTRAP_TEST_PARQUET_ACTIONS="$parquet_trailing_actions" \
+    "$parquet_function_bootstrap"
+  if [ "$run_status" -eq 0 ] \
+    && [ -e "$parquet_trailing_install_marker" ] \
+    && [ -e "$parquet_trailing_probe_marker" ] \
+    && [ "$(cat "$parquet_trailing_actions" 2>/dev/null || true)" \
+      = 'uv-tool visidata@3.4+pyarrow@25.0.0' ]; then
+    pass "Parquet installation accepts $parquet_trailing_name"
+  else
+    fail "Parquet installation accepts $parquet_trailing_name"
+  fi
 }
 
 prepare_satisfaction_commands() {
@@ -987,6 +1210,289 @@ else
   fail 'bootstrap is executable'
 fi
 
+parquet_function_bootstrap=$test_tmp/parquet-function-bootstrap
+make_parquet_function_bootstrap "$bootstrap" "$parquet_function_bootstrap"
+parquet_uv_selection_root=$test_tmp/parquet-uv-selection
+parquet_uv_selection_home=$parquet_uv_selection_root/home
+parquet_uv_selection_bin=$parquet_uv_selection_root/bin
+mkdir -p "$parquet_uv_selection_home/.local/bin" "$parquet_uv_selection_bin"
+make_version_command "$parquet_uv_selection_bin/uv" 'uv 0.10.0'
+make_version_command "$parquet_uv_selection_home/.local/bin/uv" 'uv 0.12.5'
+run_capture "$parquet_uv_selection_root/output" env \
+  PATH="$parquet_uv_selection_bin:/usr/bin:/bin" \
+  HOME="$parquet_uv_selection_home" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=uv-executable \
+  "$parquet_function_bootstrap"
+parquet_uv_selection_output=$(cat "$parquet_uv_selection_root/output")
+if [ "$run_status" -eq 0 ] \
+  && [ "$parquet_uv_selection_output" = "$parquet_uv_selection_home/.local/bin/uv" ]; then
+  pass 'Parquet tooling rejects an old PATH uv for the supported managed fallback'
+else
+  fail 'Parquet tooling rejects an old PATH uv for the supported managed fallback'
+fi
+
+make_version_command "$parquet_uv_selection_bin/uv" 'not a uv version'
+run_capture "$parquet_uv_selection_root/malformed.output" env \
+  PATH="$parquet_uv_selection_bin:/usr/bin:/bin" \
+  HOME="$parquet_uv_selection_home" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=uv-executable \
+  "$parquet_function_bootstrap"
+parquet_uv_malformed_output=$(cat "$parquet_uv_selection_root/malformed.output")
+if [ "$run_status" -eq 0 ] \
+  && [ "$parquet_uv_malformed_output" = "$parquet_uv_selection_home/.local/bin/uv" ]; then
+  pass 'Parquet tooling rejects a malformed PATH uv version'
+else
+  fail 'Parquet tooling rejects a malformed PATH uv version'
+fi
+
+make_version_command "$parquet_uv_selection_bin/uv" 'release 99.0.0'
+run_capture "$parquet_uv_selection_root/arbitrary-numeric.output" env \
+  PATH="$parquet_uv_selection_bin:/usr/bin:/bin" \
+  HOME="$parquet_uv_selection_home" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=uv-executable \
+  "$parquet_function_bootstrap"
+parquet_uv_arbitrary_numeric_output=$(cat "$parquet_uv_selection_root/arbitrary-numeric.output")
+if [ "$run_status" -eq 0 ] \
+  && [ "$parquet_uv_arbitrary_numeric_output" = "$parquet_uv_selection_home/.local/bin/uv" ]; then
+  pass 'Parquet tooling rejects arbitrary numeric uv version output'
+else
+  fail 'Parquet tooling rejects arbitrary numeric uv version output'
+fi
+
+make_failing_version_command "$parquet_uv_selection_bin/uv" 'uv 99.0.0' 42
+run_capture "$parquet_uv_selection_root/nonzero-version.output" env \
+  PATH="$parquet_uv_selection_bin:/usr/bin:/bin" \
+  HOME="$parquet_uv_selection_home" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=uv-executable \
+  "$parquet_function_bootstrap"
+parquet_uv_nonzero_version_output=$(cat "$parquet_uv_selection_root/nonzero-version.output")
+if [ "$run_status" -eq 0 ] \
+  && [ "$parquet_uv_nonzero_version_output" = "$parquet_uv_selection_home/.local/bin/uv" ]; then
+  pass 'Parquet tooling rejects uv version output from a failing command'
+else
+  fail 'Parquet tooling rejects uv version output from a failing command'
+fi
+
+make_version_command \
+  "$parquet_uv_selection_bin/uv" \
+  '  uv 0.11.6 (x86_64-unknown-linux-gnu)  '
+run_capture "$parquet_uv_selection_root/suffixed-version.output" env \
+  PATH="$parquet_uv_selection_bin:/usr/bin:/bin" \
+  HOME="$parquet_uv_selection_home" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=uv-executable \
+  "$parquet_function_bootstrap"
+parquet_uv_suffixed_version_output=$(cat "$parquet_uv_selection_root/suffixed-version.output")
+if [ "$run_status" -eq 0 ] \
+  && [ "$parquet_uv_suffixed_version_output" = "$parquet_uv_selection_bin/uv" ]; then
+  pass 'Parquet tooling accepts trimmed official uv version output with a platform suffix'
+else
+  fail 'Parquet tooling accepts trimmed official uv version output with a platform suffix'
+fi
+
+parquet_probe_root=$test_tmp/parquet-production-probe
+parquet_probe_bin=$parquet_probe_root/bin
+parquet_probe_tools=$parquet_probe_root/tools
+parquet_probe_marker=$parquet_probe_root/exact.marker
+mkdir -p "$parquet_probe_root/home"
+make_parquet_uv_tool_command "$parquet_probe_bin/uv"
+prepare_parquet_tool_environment "$parquet_probe_tools"
+: >"$parquet_probe_marker"
+run_capture "$parquet_probe_root/exact.output" env \
+  PATH="$parquet_probe_bin:/usr/bin:/bin" \
+  HOME="$parquet_probe_root/home" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=viewer-satisfied \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_TOOL_ROOT="$parquet_probe_tools" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_PROBE_MARKER="$parquet_probe_marker" \
+  "$parquet_function_bootstrap"
+if [ "$run_status" -eq 0 ]; then
+  pass 'Parquet tooling accepts an exact isolated managed environment'
+else
+  fail 'Parquet tooling accepts an exact isolated managed environment'
+fi
+
+run_capture "$parquet_probe_root/mismatch.output" env \
+  PATH="$parquet_probe_bin:/usr/bin:/bin" \
+  HOME="$parquet_probe_root/home" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=viewer-satisfied \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_TOOL_ROOT="$parquet_probe_tools" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_PROBE_MARKER="$parquet_probe_root/missing.marker" \
+  "$parquet_function_bootstrap"
+if [ "$run_status" -ne 0 ]; then
+  pass 'Parquet tooling rejects a mismatched managed environment'
+else
+  fail 'Parquet tooling rejects a mismatched managed environment'
+fi
+
+run_capture "$parquet_probe_root/malformed.output" env \
+  PATH="$parquet_probe_bin:/usr/bin:/bin" \
+  HOME="$parquet_probe_root/home" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=viewer-satisfied \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_TOOL_ROOT=relative/tool-root \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_PROBE_MARKER="$parquet_probe_marker" \
+  "$parquet_function_bootstrap"
+if [ "$run_status" -ne 0 ]; then
+  pass 'Parquet tooling rejects a malformed uv tool directory'
+else
+  fail 'Parquet tooling rejects a malformed uv tool directory'
+fi
+
+for parquet_missing_executable in python vd; do
+  parquet_missing_root=$parquet_probe_root/missing-$parquet_missing_executable
+  mkdir -p "$parquet_missing_root/visidata/bin"
+  case "$parquet_missing_executable" in
+    python)
+      cp "$parquet_probe_tools/visidata/bin/vd" \
+        "$parquet_missing_root/visidata/bin/vd"
+      ;;
+    vd)
+      cp "$parquet_probe_tools/visidata/bin/python" \
+        "$parquet_missing_root/visidata/bin/python"
+      ;;
+  esac
+  run_capture "$parquet_probe_root/missing-$parquet_missing_executable.output" env \
+    PATH="$parquet_probe_bin:/usr/bin:/bin" \
+    HOME="$parquet_probe_root/home" \
+    DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=viewer-satisfied \
+    DOTFILES_BOOTSTRAP_TEST_PARQUET_TOOL_ROOT="$parquet_missing_root" \
+    DOTFILES_BOOTSTRAP_TEST_PARQUET_PROBE_MARKER="$parquet_probe_marker" \
+    "$parquet_function_bootstrap"
+  if [ "$run_status" -ne 0 ]; then
+    pass "Parquet tooling rejects a managed environment missing bin/$parquet_missing_executable"
+  else
+    fail "Parquet tooling rejects a managed environment missing bin/$parquet_missing_executable"
+  fi
+done
+
+parquet_install_actions=$parquet_probe_root/install.actions
+: >"$parquet_install_actions"
+run_capture "$parquet_probe_root/install-failure.output" env \
+  PATH="$parquet_probe_bin:/usr/bin:/bin" \
+  HOME="$parquet_probe_root/home" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=install \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_TOOL_ROOT="$parquet_probe_tools" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_PROBE_MARKER="$parquet_probe_root/missing.marker" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_INSTALL_BEHAVIOR=fail \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_ACTIONS="$parquet_install_actions" \
+  "$parquet_function_bootstrap"
+if [ "$run_status" -eq 42 ] && [ ! -s "$parquet_install_actions" ]; then
+  pass 'Parquet installation propagates a real uv command failure before journaling'
+else
+  fail 'Parquet installation propagates a real uv command failure before journaling'
+fi
+
+: >"$parquet_install_actions"
+run_capture "$parquet_probe_root/install-mismatch.output" env \
+  PATH="$parquet_probe_bin:/usr/bin:/bin" \
+  HOME="$parquet_probe_root/home" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=install \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_TOOL_ROOT="$parquet_probe_tools" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_PROBE_MARKER="$parquet_probe_root/missing.marker" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_INSTALL_BEHAVIOR=succeed \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_ACTIONS="$parquet_install_actions" \
+  "$parquet_function_bootstrap"
+if [ "$run_status" -ne 0 ] && [ ! -s "$parquet_install_actions" ]; then
+  pass 'Parquet installation verifies the exact environment before journaling'
+else
+  fail 'Parquet installation verifies the exact environment before journaling'
+fi
+
+parquet_unsafe_install_marker=$parquet_probe_root/unsafe-install.invoked
+: >"$parquet_install_actions"
+run_capture "$parquet_probe_root/unsafe-tool-root.output" env \
+  PATH="$parquet_probe_bin:/usr/bin:/bin" \
+  HOME="$parquet_probe_root/home" \
+  UV_TOOL_DIR=/ \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=install \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_TOOL_ROOT="$parquet_probe_tools" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_PROBE_MARKER="$parquet_probe_root/missing.marker" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_INSTALL_BEHAVIOR=succeed \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_INSTALL_MARKER="$parquet_unsafe_install_marker" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_ACTIONS="$parquet_install_actions" \
+  "$parquet_function_bootstrap"
+if [ "$run_status" -ne 0 ] \
+  && [ ! -e "$parquet_unsafe_install_marker" ] \
+  && [ ! -s "$parquet_install_actions" ]; then
+  pass 'Parquet installation rejects a root uv tool directory before invocation'
+else
+  fail 'Parquet installation rejects a root uv tool directory before invocation'
+fi
+
+run_parquet_unsafe_target_case \
+  'a root uv tool executable directory' \
+  "$parquet_probe_tools" / 0 0
+run_parquet_unsafe_target_case \
+  'a relative uv tool directory' \
+  relative/tools "$parquet_probe_root/custom-bin" 0 0
+run_parquet_unsafe_target_case \
+  'a non-normalized uv tool executable directory' \
+  "$parquet_probe_tools" "$parquet_probe_root/custom/../bin" 0 0
+run_parquet_unsafe_target_case \
+  'a failing uv tool directory probe' \
+  "$parquet_probe_tools" "$parquet_probe_root/custom-bin" 1 0
+run_parquet_unsafe_target_case \
+  'a failing uv tool executable directory probe' \
+  "$parquet_probe_tools" "$parquet_probe_root/custom-bin" 0 1
+
+mkdir -p "$parquet_probe_root/custom-bin"
+run_parquet_trailing_slash_target_case \
+  'a trailing slash in a custom uv tool directory' \
+  "$parquet_probe_tools/" "$parquet_probe_root/custom-bin"
+run_parquet_trailing_slash_target_case \
+  'a trailing slash in a custom uv tool executable directory' \
+  "$parquet_probe_tools" "$parquet_probe_root/custom-bin/"
+
+: >"$parquet_install_actions"
+parquet_caller_env_log=$parquet_probe_root/caller-uv-environment.log
+run_capture "$parquet_probe_root/install-sanitized.output" env \
+  PATH="$parquet_probe_bin:/usr/bin:/bin" \
+  HOME="$parquet_probe_root/home" \
+  UV_TOOL_DIR="$parquet_probe_tools" \
+  UV_TOOL_BIN_DIR="$parquet_probe_root/custom-bin" \
+  UV_BUILD_CONSTRAINT="$parquet_probe_root/build-constraints.txt" \
+  UV_CONSTRAINT="$parquet_probe_root/constraints.txt" \
+  UV_DEFAULT_INDEX=https://default-index.invalid/simple \
+  UV_EXCLUDE=visidata \
+  UV_EXCLUDE_NEWER=2020-01-01T00:00:00Z \
+  UV_EXTRA_INDEX_URL=https://extra-index.invalid/simple \
+  UV_FIND_LINKS=https://find-links.invalid/packages \
+  UV_FORK_STRATEGY=fewest \
+  UV_INDEX=https://named-index.invalid/simple \
+  UV_INDEX_STRATEGY=unsafe-best-match \
+  UV_INDEX_URL=https://index-url.invalid/simple \
+  UV_OVERRIDE="$parquet_probe_root/overrides.txt" \
+  UV_PRERELEASE=disallow \
+  UV_RESOLUTION=lowest \
+  UV_TORCH_BACKEND=cpu \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=install-preserves-environment \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_TOOL_ROOT="$parquet_probe_tools" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_PROBE_MARKER="$parquet_probe_root/sanitized.marker" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_INSTALL_BEHAVIOR=repair-if-sanitized \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_ACTIONS="$parquet_install_actions" \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_CALLER_ENV_LOG="$parquet_caller_env_log" \
+  "$parquet_function_bootstrap"
+parquet_expected_caller_env="UV_BUILD_CONSTRAINT=$parquet_probe_root/build-constraints.txt
+UV_CONSTRAINT=$parquet_probe_root/constraints.txt
+UV_DEFAULT_INDEX=https://default-index.invalid/simple
+UV_EXCLUDE=visidata
+UV_EXCLUDE_NEWER=2020-01-01T00:00:00Z
+UV_EXTRA_INDEX_URL=https://extra-index.invalid/simple
+UV_FIND_LINKS=https://find-links.invalid/packages
+UV_FORK_STRATEGY=fewest
+UV_INDEX=https://named-index.invalid/simple
+UV_INDEX_STRATEGY=unsafe-best-match
+UV_INDEX_URL=https://index-url.invalid/simple
+UV_OVERRIDE=$parquet_probe_root/overrides.txt
+UV_PRERELEASE=disallow
+UV_RESOLUTION=lowest
+UV_TORCH_BACKEND=cpu"
+if [ "$run_status" -eq 0 ] \
+  && grep -Fqx 'uv-tool visidata@3.4+pyarrow@25.0.0' "$parquet_install_actions" \
+  && [ "$(cat "$parquet_caller_env_log" 2>/dev/null || true)" = "$parquet_expected_caller_env" ]; then
+  pass 'Parquet installation clears resolver variables without mutating its caller'
+else
+  fail 'Parquet installation clears resolver variables without mutating its caller'
+fi
+
 run_capture "$test_tmp/help" "$bootstrap" --help
 if [ "$run_status" -eq 0 ]; then
   pass '--help exits successfully'
@@ -1085,6 +1591,9 @@ require_contains "$linux_output" 'install pacman imagemagick' \
   'pacman plan includes ImageMagick'
 require_contains "$linux_output" 'install pacman uv' \
   'pacman plan includes uv'
+require_contains "$linux_output" \
+  'ensure uv-tool visidata==3.4 with pyarrow==25.0.0' \
+  'pacman plan includes the exact Parquet viewer tool'
 require_contains "$linux_output" 'manual sudo pacman -Syu --needed' 'pacman plan requires an explicit full upgrade'
 require_contains "$linux_output" 'install upstream herdr' 'pacman plan uses the official Herdr installer'
 for provider in \
@@ -1115,6 +1624,9 @@ require_contains "$apt_output" 'install upstream herdr' 'apt plan uses the offic
 require_contains "$apt_output" \
   'ensure upstream uv >=0.11.6 (fallback uv 0.12.5)' \
   'apt plan preserves the uv version floor and pinned fallback'
+require_contains "$apt_output" \
+  'ensure uv-tool visidata==3.4 with pyarrow==25.0.0' \
+  'apt plan includes the exact Parquet viewer tool'
 require_contains "$apt_output" 'blocked community ghostty' 'apt plan blocks community Ghostty without consent'
 apt_lsp_plan=$(printf '%s\n' "$apt_output" | sed -n '/ensure upstream node >=22.0.0/,/ensure npm yaml-language-server@1.24.0/p')
 expected_apt_lsp_plan='  ensure upstream node >=22.0.0 with npm >=10.0.0 (fallback node 24.19.0)
@@ -1174,6 +1686,9 @@ require_contains "$macos_output" \
   'macOS dry-run reports LaunchAgent kickstart'
 require_contains "$macos_output" 'install homebrew-formula neovim' 'Homebrew plan includes Neovim formula'
 require_contains "$macos_output" 'install homebrew-cask ghostty' 'Homebrew plan includes Ghostty cask'
+require_contains "$macos_output" \
+  'ensure uv-tool visidata==3.4 with pyarrow==25.0.0' \
+  'Homebrew plan includes the exact Parquet viewer tool'
 for provider in \
   bash-language-server \
   vscode-langservers-extracted \
@@ -1257,6 +1772,35 @@ require_contains "$apt_apply_commands" 'direct-install neovim' 'apt package phas
 require_contains "$apt_apply_commands" 'direct-install uv' \
   'apt package phase installs the supported uv fallback'
 require_contains "$apt_apply_commands" 'community-installer ghostty' 'apt package phase records the consented Ghostty installer'
+require_contains "$apt_apply_commands" \
+  'uv tool install --force --with pyarrow==25.0.0 --no-config visidata==3.4' \
+  'apt apply installs the exact Parquet viewer tool'
+
+parquet_failure_log=$test_tmp/parquet-failure.commands
+run_capture "$test_tmp/parquet-failure.output" env \
+  HOME="$test_tmp/parquet-failure-home" \
+  XDG_STATE_HOME="$test_tmp/parquet-failure-state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+  DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+  DOTFILES_BOOTSTRAP_TEST_PARQUET_INSTALL_FAIL=1 \
+  DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$parquet_failure_log" \
+  "$bootstrap" --apply
+parquet_failure_output=$(cat "$test_tmp/parquet-failure.output")
+if [ "$run_status" -ne 0 ] \
+  && printf '%s\n' "$parquet_failure_output" \
+    | grep -Fq 'Parquet viewer installation failed'; then
+  pass 'Parquet viewer installation failure stops the bootstrap'
+else
+  fail 'Parquet viewer installation failure stops the bootstrap'
+fi
+require_contains "$(cat "$parquet_failure_log" 2>/dev/null || true)" \
+  'uv tool install --force --with pyarrow==25.0.0 --no-config visidata==3.4' \
+  'Parquet viewer failure records the attempted exact install'
+
 apt_update_line=$(printf '%s\n' "$apt_apply_commands" | grep -nF 'sudo apt-get update' | head -n 1 | cut -d: -f1)
 apt_install_line=$(printf '%s\n' "$apt_apply_commands" | grep -nF 'sudo apt-get install ' | head -n 1 | cut -d: -f1)
 managed_node_line=$(printf '%s\n' "$apt_apply_commands" | grep -nF 'direct-install node' | head -n 1 | cut -d: -f1)
@@ -2255,7 +2799,7 @@ run_capture "$idempotent_root/output" env \
   DOTFILES_BOOTSTRAP_TESTING=1 \
   DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
   DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
-  DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS='node,npm,bash-language-server,vscode-json-language-server,lua-language-server,pyright-langserver,yaml-language-server,uv,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd' \
+  DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS='node,npm,bash-language-server,vscode-json-language-server,lua-language-server,pyright-langserver,yaml-language-server,uv,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd,visidata' \
   DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
   DOTFILES_BOOTSTRAP_TEST_REAL_MANAGED_INSTALL=1 \
   DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT="$managed_fixture_download" \
@@ -2321,6 +2865,9 @@ brew_apply_commands=$(cat "$brew_apply_log" 2>/dev/null || true)
 require_contains "$brew_apply_commands" 'pinned-installer homebrew a34ae4ee9151cbce4c3b33bca7043a972b7ae9a5' 'Homebrew bootstrap uses the pinned installer revision'
 require_contains "$brew_apply_commands" 'brew install neovim' 'Homebrew package phase installs missing formulae'
 require_contains "$brew_apply_commands" 'brew install --cask ghostty' 'Homebrew package phase installs missing casks'
+require_contains "$brew_apply_commands" \
+  'uv tool install --force --with pyarrow==25.0.0 --no-config visidata==3.4' \
+  'Homebrew apply installs the exact Parquet viewer tool'
 if printf '%s\n' "$brew_apply_commands" | grep -Fqx 'brew install bash-language-server' \
   && printf '%s\n' "$brew_apply_commands" | grep -Fqx 'brew install vscode-langservers-extracted' \
   && printf '%s\n' "$brew_apply_commands" | grep -Fqx 'brew install lua-language-server' \
@@ -3640,6 +4187,12 @@ else
   fail 'configuration transaction succeeds after simulated package installation'
 fi
 package_report=$(cat "$package_report_state/dotfiles-bootstrap/package-report/packages-retained.txt" 2>/dev/null || true)
+if printf '%s\n' "$package_report" \
+  | grep -Fqx 'uv-tool visidata@3.4+pyarrow@25.0.0'; then
+  pass 'transaction journals the exact retained Parquet viewer action'
+else
+  fail 'transaction journals the exact retained Parquet viewer action'
+fi
 if printf '%s\n' "$package_report" | grep -Fq 'apt git' \
   && printf '%s\n' "$package_report" | grep -Fq 'apt i3-wm' \
   && printf '%s\n' "$package_report" | grep -Fq 'direct neovim' \
@@ -3657,6 +4210,12 @@ run_capture "$test_tmp/package-report-rollback.output" env \
   DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
   "$bootstrap" --rollback package-report
 package_rollback_output=$(cat "$test_tmp/package-report-rollback.output")
+if printf '%s\n' "$package_rollback_output" \
+  | grep -Fqx 'uv-tool visidata@3.4+pyarrow@25.0.0'; then
+  pass 'rollback reports the exact retained Parquet viewer action'
+else
+  fail 'rollback reports the exact retained Parquet viewer action'
+fi
 if [ "$run_status" -eq 0 ] \
   && printf '%s\n' "$package_rollback_output" | grep -Fq 'apt git' \
   && printf '%s\n' "$package_rollback_output" | grep -Fq 'apt i3-wm' \

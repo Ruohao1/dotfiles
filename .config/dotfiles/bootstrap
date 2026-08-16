@@ -422,6 +422,7 @@ emit_package_plan() {
       ;;
     *) die "unsupported package manager: $selected_manager" ;;
   esac
+  printf '%s\n' '  ensure uv-tool visidata==3.4 with pyarrow==25.0.0'
 }
 
 record_test_command() {
@@ -455,7 +456,7 @@ record_package_action() {
   package_action_name=$2
   [ -n "$package_actions_file" ] || return 0
   case "$package_action_kind" in
-    apt|direct|homebrew-cask|homebrew-formula|installer|community|npm) ;;
+    apt|direct|homebrew-cask|homebrew-formula|installer|community|npm|uv-tool) ;;
     *) die "unsupported package action kind: $package_action_kind" ;;
   esac
   validate_package_name "$package_action_name" \
@@ -1819,6 +1820,162 @@ install_pacman_packages() {
   install_direct_tool herdr 0.8.0 "$manifest_root"
 }
 
+parquet_uv_candidate_is_satisfied() {
+  parquet_uv_candidate=$1
+  case "$parquet_uv_candidate" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  [ -x "$parquet_uv_candidate" ] || return 1
+  parquet_uv_candidate_output=$(
+    "$parquet_uv_candidate" --version 2>/dev/null
+  ) || return 1
+  parquet_uv_candidate_version=$(
+    printf '%s\n' "$parquet_uv_candidate_output" \
+      | awk '
+          NR != 1 { exit 1 }
+          {
+            sub(/^[[:space:]]+/, "")
+            sub(/[[:space:]]+$/, "")
+            if ($0 !~ /^uv [0-9]+\.[0-9]+\.[0-9]+( \([^()[:cntrl:]]+\))?$/) exit 1
+            print $2
+          }
+        '
+  ) || return 1
+  [ -n "$parquet_uv_candidate_version" ] || return 1
+  version_at_least "$parquet_uv_candidate_version" 0.11.6
+}
+
+parquet_uv_executable() {
+  parquet_uv_path=$(command -v uv 2>/dev/null || true)
+  if [ -n "$parquet_uv_path" ] \
+    && parquet_uv_candidate_is_satisfied "$parquet_uv_path"; then
+    printf '%s\n' "$parquet_uv_path"
+    return 0
+  fi
+  parquet_uv_managed=$HOME/.local/bin/uv
+  if parquet_uv_candidate_is_satisfied "$parquet_uv_managed"; then
+    printf '%s\n' "$parquet_uv_managed"
+    return 0
+  fi
+  return 1
+}
+
+parquet_viewer_is_satisfied() {
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ]; then
+    tool_is_satisfied visidata 3.4
+    return
+  fi
+
+  parquet_uv=$(parquet_uv_executable) || return 1
+  parquet_tool_root=$(UV_OFFLINE=1 "$parquet_uv" tool dir --no-config 2>/dev/null) \
+    || return 1
+  case "$parquet_tool_root" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  [ -d "$parquet_tool_root" ] || return 1
+  parquet_tool_root=$(CDPATH='' cd -- "$parquet_tool_root" 2>/dev/null && pwd -P) \
+    || return 1
+  [ "$parquet_tool_root" != / ] || return 1
+
+  parquet_tool_environment=$parquet_tool_root/visidata
+  parquet_tool_python=$parquet_tool_environment/bin/python
+  parquet_tool_viewer=$parquet_tool_environment/bin/vd
+  [ -x "$parquet_tool_python" ] && [ -x "$parquet_tool_viewer" ] || return 1
+
+  PYTHONDONTWRITEBYTECODE=1 "$parquet_tool_python" -I -B -c \
+    'import importlib.metadata as m,pyarrow; expected={"visidata":"3.4","pyarrow":"25.0.0"}; actual={name:m.version(name) for name in expected}; assert actual == expected, (actual, expected)' \
+    >/dev/null 2>&1
+}
+
+parquet_install_target_is_safe() {
+  parquet_install_target=$1
+  case "$parquet_install_target" in
+    ''|/|*"
+"*|*""*|*"	"*) return 1 ;;
+    /*) ;;
+    *) return 1 ;;
+  esac
+  while [ "$parquet_install_target" != / ] \
+    && [ "${parquet_install_target%/}" != "$parquet_install_target" ]; do
+    parquet_install_target=${parquet_install_target%/}
+  done
+  [ "$parquet_install_target" != / ] || return 1
+  parquet_install_target_components=/${parquet_install_target#/}/
+  case "$parquet_install_target_components" in
+    *'//'*|*'/./'*|*'/../'*) return 1 ;;
+  esac
+  if [ -e "$parquet_install_target" ] || [ -L "$parquet_install_target" ]; then
+    [ -d "$parquet_install_target" ] || return 1
+    parquet_install_target_resolved=$(
+      CDPATH='' cd -- "$parquet_install_target" 2>/dev/null && pwd -P
+    ) || return 1
+    [ "$parquet_install_target_resolved" != / ] || return 1
+  fi
+}
+
+parquet_install_targets_are_safe() {
+  parquet_install_uv=$1
+  parquet_install_tool_root=$(
+    UV_OFFLINE=1 "$parquet_install_uv" tool dir --no-config 2>/dev/null
+  ) || return 1
+  parquet_install_target_is_safe "$parquet_install_tool_root" || return 1
+  parquet_install_bin_root=$(
+    UV_OFFLINE=1 "$parquet_install_uv" tool dir --bin --no-config 2>/dev/null
+  ) || return 1
+  parquet_install_target_is_safe "$parquet_install_bin_root"
+}
+
+install_parquet_viewer() {
+  if parquet_viewer_is_satisfied; then
+    printf '%s\n' '  skip uv-tool visidata (already exact)'
+    return 0
+  fi
+
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_PARQUET_INSTALL_FAIL:-0}" = 1 ]; then
+    record_test_command \
+      uv tool install --force --with pyarrow==25.0.0 --no-config visidata==3.4
+    return 42
+  fi
+
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ]; then
+    parquet_uv=uv
+  else
+    parquet_uv=$(parquet_uv_executable) || return 127
+  fi
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" != 1 ]; then
+    parquet_install_targets_are_safe "$parquet_uv" || return 1
+  fi
+
+  (
+    unset \
+      UV_BUILD_CONSTRAINT \
+      UV_CONSTRAINT \
+      UV_DEFAULT_INDEX \
+      UV_EXCLUDE \
+      UV_EXCLUDE_NEWER \
+      UV_EXTRA_INDEX_URL \
+      UV_FIND_LINKS \
+      UV_FORK_STRATEGY \
+      UV_INDEX \
+      UV_INDEX_STRATEGY \
+      UV_INDEX_URL \
+      UV_OVERRIDE \
+      UV_PRERELEASE \
+      UV_RESOLUTION \
+      UV_TORCH_BACKEND
+    run_command \
+      "$parquet_uv" tool install --force --with pyarrow==25.0.0 --no-config visidata==3.4
+  ) || return $?
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" != 1 ]; then
+    parquet_viewer_is_satisfied || return 1
+  fi
+  record_package_action uv-tool visidata@3.4+pyarrow@25.0.0
+  printf '%s\n' '  installed uv-tool visidata 3.4 with pyarrow 25.0.0'
+}
+
 install_packages() {
   selected_manager=$1
   selected_window_manager=$2
@@ -1830,6 +1987,7 @@ install_packages() {
     pacman) install_pacman_packages "$manifest_root" "$selected_window_manager" ;;
     *) die "unsupported package manager: $selected_manager" ;;
   esac
+  install_parquet_viewer || die 'Parquet viewer installation failed'
 }
 
 path_exists() {
