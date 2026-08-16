@@ -92,6 +92,131 @@ make_stdio_command() {
   chmod 0755 "$command_path"
 }
 
+make_term_ignoring_stdio_command() {
+  command_path=$1
+  probe_pid_file=$2
+  probe_ready_file=$3
+  mkdir -p "$(dirname "$command_path")"
+  printf '%s\n' \
+    '#!/bin/sh' \
+    "trap '' TERM" \
+    "printf '%s\\n' \"\$\$\" >'$probe_pid_file'" \
+    "printf '%s\\n' ready >'$probe_ready_file'" \
+    "kill -TERM \"\$PPID\"" \
+    'while :; do :; done' \
+    >"$command_path"
+  chmod 0755 "$command_path"
+}
+
+kill_matching_test_process() {
+  matching_test_pid=$1
+  matching_test_path=$2
+  matching_test_command=$(
+    ps -p "$matching_test_pid" -o command= 2>/dev/null || true
+  )
+  case "$matching_test_command" in
+    *"$matching_test_path"*)
+      kill -KILL "$matching_test_pid" >/dev/null 2>&1 || true
+      ;;
+  esac
+}
+
+make_signal_boundary_command() {
+  boundary_command_path=$1
+  boundary_real_command=$2
+  mkdir -p "$(dirname "$boundary_command_path")"
+  # shellcheck disable=SC2016 # The generated wrapper expands these values at runtime.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    "real_command='$boundary_real_command'" \
+    'command_target=' \
+    'for command_argument do' \
+    '  command_target=$command_argument' \
+    'done' \
+    '"$real_command" "$@"' \
+    'command_status=$?' \
+    '[ "$command_status" -eq 0 ] || exit "$command_status"' \
+    'if [ "${DOTFILES_BOOTSTRAP_TEST_SIGNAL_COMMAND:-}" = "${0##*/}" ] \
+      && [ "${DOTFILES_BOOTSTRAP_TEST_SIGNAL_TARGET:-}" = "$command_target" ]; then' \
+    '  boundary_signal=${DOTFILES_BOOTSTRAP_TEST_MANAGED_SIGNAL:-TERM}' \
+    '  case "$boundary_signal" in' \
+    '    HUP|INT|TERM) ;;' \
+    '    *) exit 2 ;;' \
+    '  esac' \
+    '  kill -s "$boundary_signal" "$PPID" || exit 1' \
+    'fi' \
+    'exit 0' \
+    >"$boundary_command_path"
+  chmod 0755 "$boundary_command_path"
+}
+
+make_probe_spawn_signal_bootstrap() {
+  probe_spawn_source=$1
+  probe_spawn_target=$2
+  awk '
+    { print }
+    $0 == "    >\"$stdio_probe_tmp/stdout\" 2>\"$stdio_probe_tmp/stderr\" &" {
+      print "  printf \"%s\\n\" \"$!\" >\"$DOTFILES_BOOTSTRAP_TEST_PROBE_RACE_PID_FILE\""
+      print "  kill -TERM \"$$\""
+      injected += 1
+    }
+    END {
+      if (injected != 1) exit 1
+    }
+  ' "$probe_spawn_source" >"$probe_spawn_target"
+  chmod 0755 "$probe_spawn_target"
+}
+
+make_probe_temp_signal_bootstrap() {
+  probe_temp_source=$1
+  probe_temp_target=$2
+  awk '
+    $0 == "  active_probe_tmp=$stdio_probe_tmp" {
+      print "  printf \"%s\\n\" \"$stdio_probe_tmp\" >\"$DOTFILES_BOOTSTRAP_TEST_PROBE_TEMP_RACE_PATH_FILE\""
+      print "  kill -TERM \"$$\""
+      injected += 1
+    }
+    { print }
+    END {
+      if (injected != 1) exit 1
+    }
+  ' "$probe_temp_source" >"$probe_temp_target"
+  chmod 0755 "$probe_temp_target"
+}
+
+make_managed_stage_signal_bootstrap() {
+  managed_stage_source=$1
+  managed_stage_target=$2
+  awk '
+    $0 == "  active_package_tmp=$managed_stage_root" {
+      print "  printf \"%s\\n\" \"$managed_stage_root\" >\"$DOTFILES_BOOTSTRAP_TEST_MANAGED_STAGE_RACE_PATH_FILE\""
+      print "  kill -TERM \"$$\""
+      injected += 1
+    }
+    { print }
+    END {
+      if (injected != 1) exit 1
+    }
+  ' "$managed_stage_source" >"$managed_stage_target"
+  chmod 0755 "$managed_stage_target"
+}
+
+make_exit_repeat_signal_bootstrap() {
+  exit_repeat_source=$1
+  exit_repeat_target=$2
+  awk '
+    { print }
+    $0 == "  trap - 0" || $0 == "  trap \047\047 0 HUP INT TERM" {
+      print "  kill -TERM \"$$\""
+      injected += 1
+    }
+    END {
+      if (injected != 1) exit 1
+    }
+  ' "$exit_repeat_source" >"$exit_repeat_target"
+  chmod 0755 "$exit_repeat_target"
+}
+
 prepare_satisfaction_commands() {
   satisfaction_bin=$1
   satisfaction_node_version=$2
@@ -195,12 +320,14 @@ create_fake_node_archive() {
     '  done' \
     "  printf '\\n' >>\"\$DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG\"" \
     'fi' \
+    '[ "${DOTFILES_BOOTSTRAP_TEST_NPM_FAIL:-0}" != 1 ] || exit 42' \
     'mkdir -p node_modules/.bin' \
     'for package_name in bash-language-server pyright vscode-langservers-extracted yaml-language-server; do' \
     '  mkdir -p "node_modules/$package_name"' \
     "  printf '%s\\n' '{}' >\"node_modules/\$package_name/package.json\"" \
     'done' \
     'for command_name in bash-language-server vscode-json-language-server pyright-langserver yaml-language-server vscode-css-language-server vscode-html-language-server vscode-eslint-language-server pyright npx corepack; do' \
+    '  [ "$command_name" != "${DOTFILES_BOOTSTRAP_TEST_NPM_MISSING_COMMAND:-}" ] || continue' \
     "  printf '%s\\n' '#!/bin/sh' 'exit 0' >\"node_modules/.bin/\$command_name\"" \
     '  chmod 0755 "node_modules/.bin/$command_name"' \
     'done' \
@@ -277,6 +404,568 @@ run_managed_architecture_case() {
     "$managed_fixture_root/bootstrap" --apply
   managed_case_status=$run_status
   managed_case_commands=$(cat "$managed_case_log" 2>/dev/null || true)
+}
+
+path_exists_for_test() {
+  [ -e "$1" ] || [ -L "$1" ]
+}
+
+managed_outputs_are_absent_except() {
+  managed_absence_home=$1
+  managed_absence_allowed=${2:-}
+
+  for managed_absence_path in \
+    "$managed_absence_home/.local/bin/node" \
+    "$managed_absence_home/.local/bin/npm" \
+    "$managed_absence_home/.local/bin/lua-language-server" \
+    "$managed_absence_home/.local/bin/bash-language-server" \
+    "$managed_absence_home/.local/bin/vscode-json-language-server" \
+    "$managed_absence_home/.local/bin/pyright-langserver" \
+    "$managed_absence_home/.local/bin/yaml-language-server" \
+    "$managed_absence_home/.local/opt"/node-* \
+    "$managed_absence_home/.local/opt"/lua-language-server-* \
+    "$managed_absence_home/.local/opt"/dotfiles-lsp-node-*
+  do
+    if path_exists_for_test "$managed_absence_path" \
+      && [ "$managed_absence_path" != "$managed_absence_allowed" ]; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+prepare_managed_failure_case() {
+  managed_failure_name=$1
+  managed_failure_root=$test_tmp/managed-failure-$managed_failure_name
+  managed_failure_harness=$managed_failure_root/harness
+  managed_failure_download=$managed_failure_root/downloads
+  managed_failure_source=$managed_failure_root/source
+  managed_failure_home=$managed_failure_root/home
+  managed_failure_state=$managed_failure_root/state
+  managed_failure_tmp=$managed_failure_root/tmp
+  managed_failure_log=$managed_failure_root/commands
+  managed_failure_bin=$managed_failure_root/bin
+  mkdir -p \
+    "$managed_failure_bin" \
+    "$managed_failure_harness" \
+    "$managed_failure_download" \
+    "$managed_failure_source" \
+    "$managed_failure_home" \
+    "$managed_failure_tmp"
+  cp -R "$managed_fixture_root/." "$managed_failure_harness/"
+  cp -R "$managed_fixture_download/." "$managed_failure_download/"
+  cp -R "$managed_fixture_source/x86_64/." "$managed_failure_source/"
+}
+
+set_failure_case_direct_asset() {
+  failure_asset_tool=$1
+  failure_asset_url=$2
+  failure_asset_sha256=$3
+  failure_asset_manifest=$managed_failure_harness/manifests/packages-direct.tsv
+  awk -F '\t' -v OFS='\t' \
+    -v tool="$failure_asset_tool" \
+    -v url="$failure_asset_url" \
+    -v sha256="$failure_asset_sha256" '
+    $1 == tool && $2 == "linux" && $3 == "x86_64" {
+      $6 = url
+      $7 = sha256
+    }
+    { print }
+  ' "$failure_asset_manifest" >"$failure_asset_manifest.new"
+  mv "$failure_asset_manifest.new" "$failure_asset_manifest"
+}
+
+refresh_failure_case_lock_hash() {
+  failure_lock_path=$managed_failure_harness/manifests/packages-npm-language-servers-lock.json
+  failure_lock_sha256=$(file_sha256_for_test "$failure_lock_path")
+  awk -v sha256="$failure_lock_sha256" '
+    /^npm_language_servers_lock_sha256=/ {
+      print "npm_language_servers_lock_sha256=" sha256
+      next
+    }
+    { print }
+  ' "$managed_failure_harness/bootstrap" \
+    >"$managed_failure_harness/bootstrap.new"
+  mv "$managed_failure_harness/bootstrap.new" \
+    "$managed_failure_harness/bootstrap"
+  chmod 0755 "$managed_failure_harness/bootstrap"
+}
+
+run_managed_failure_case() {
+  managed_failure_expected=$1
+  managed_failure_publish_token=${2:-}
+  managed_failure_npm_fail=${3:-0}
+  managed_failure_missing_command=${4:-}
+  managed_failure_architecture=${5:-x86_64}
+  managed_failure_signal_token=${6:-}
+
+  managed_failure_signal_command=
+  managed_failure_signal_target=
+  case "$managed_failure_signal_token" in
+    '')
+      ;;
+    parent-directory)
+      managed_failure_signal_command='mkdir'
+      managed_failure_signal_target=$managed_failure_home/.local
+      ;;
+    managed-directory)
+      managed_failure_signal_command='mv'
+      managed_failure_signal_target=$managed_failure_home/.local/opt/node-24.19.0-$managed_failure_architecture
+      ;;
+    managed-link)
+      managed_failure_signal_command='ln'
+      managed_failure_signal_target=$managed_failure_home/.local/bin/node
+      ;;
+    lua-wrapper)
+      managed_failure_signal_command='mv'
+      managed_failure_signal_target=$managed_failure_home/.local/bin/lua-language-server
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  if [ -n "$managed_failure_signal_command" ]; then
+    managed_failure_real_command=$(command -v "$managed_failure_signal_command")
+    make_signal_boundary_command \
+      "$managed_failure_bin/$managed_failure_signal_command" \
+      "$managed_failure_real_command"
+  fi
+
+  run_capture "$managed_failure_root/output" env \
+    PATH="$managed_failure_bin:$PATH" \
+    TMPDIR="$managed_failure_tmp" \
+    HOME="$managed_failure_home" \
+    XDG_STATE_HOME="$managed_failure_state" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+    DOTFILES_BOOTSTRAP_TEST_ARCH="$managed_failure_architecture" \
+    DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+    DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS= \
+    DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+    DOTFILES_BOOTSTRAP_TEST_REAL_MANAGED_INSTALL=1 \
+    DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT="$managed_failure_download" \
+    DOTFILES_BOOTSTRAP_TEST_PUBLISH_FAIL_AFTER="$managed_failure_publish_token" \
+    DOTFILES_BOOTSTRAP_TEST_SIGNAL_COMMAND="$managed_failure_signal_command" \
+    DOTFILES_BOOTSTRAP_TEST_SIGNAL_TARGET="$managed_failure_signal_target" \
+    DOTFILES_BOOTSTRAP_TEST_NPM_FAIL="$managed_failure_npm_fail" \
+    DOTFILES_BOOTSTRAP_TEST_NPM_MISSING_COMMAND="$managed_failure_missing_command" \
+    DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+    DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$managed_failure_log" \
+    "$managed_failure_harness/bootstrap" --apply
+  managed_failure_status=$run_status
+  managed_failure_output=$(cat "$managed_failure_root/output")
+  managed_failure_commands=$(cat "$managed_failure_log" 2>/dev/null || true)
+  managed_failure_pass=true
+  [ "$managed_failure_status" -ne 0 ] || managed_failure_pass=false
+  printf '%s\n' "$managed_failure_output" \
+    | grep -Fq "$managed_failure_expected" \
+    || managed_failure_pass=false
+  managed_outputs_are_absent_except "$managed_failure_home" \
+    || managed_failure_pass=false
+  if find "$managed_failure_tmp" -mindepth 1 -maxdepth 1 \
+    -name 'dotfiles-bootstrap.*' -print -quit \
+    | grep -q .; then
+    managed_failure_pass=false
+  fi
+
+  if [ "$managed_failure_pass" = true ]; then
+    pass "$managed_failure_name rejects invalid managed provisioning without publication"
+  else
+    fail "$managed_failure_name rejects invalid managed provisioning without publication"
+    sed "s/^/  $managed_failure_name output: /" \
+      "$managed_failure_root/output" >&2
+  fi
+}
+
+create_failure_node_archive() {
+  failure_node_variant=$1
+  failure_node_root=$managed_failure_source/node-v24.19.0-linux-x64
+  failure_node_asset=node-$managed_failure_name.tar.xz
+  failure_node_path=$managed_failure_download/$failure_node_asset
+
+  case "$failure_node_variant" in
+    absolute)
+      tar -cJf "$failure_node_path" --transform='s,^,/,' \
+        -C "$managed_failure_source" node-v24.19.0-linux-x64
+      ;;
+    parent-traversal)
+      tar -cJf "$failure_node_path" \
+        --transform='s,^node-v24.19.0-linux-x64,../node-v24.19.0-linux-x64,' \
+        -C "$managed_failure_source" node-v24.19.0-linux-x64
+      ;;
+    outside-root)
+      : >"$managed_failure_source/outside-node-root"
+      tar -cJf "$failure_node_path" -C "$managed_failure_source" \
+        node-v24.19.0-linux-x64 outside-node-root
+      ;;
+    missing-node)
+      chmod 0644 "$failure_node_root/bin/node"
+      tar -cJf "$failure_node_path" -C "$managed_failure_source" \
+        node-v24.19.0-linux-x64
+      ;;
+    missing-npm-cli)
+      mv "$failure_node_root/lib/node_modules/npm/bin/npm-cli.js" \
+        "$managed_failure_source/npm-cli.js.omitted"
+      tar -cJf "$failure_node_path" -C "$managed_failure_source" \
+        node-v24.19.0-linux-x64
+      ;;
+    *) return 1 ;;
+  esac
+  failure_node_sha256=$(file_sha256_for_test "$failure_node_path")
+  set_failure_case_direct_asset node \
+    "https://fixtures.invalid/$failure_node_asset" "$failure_node_sha256"
+}
+
+create_failure_lua_archive() {
+  failure_lua_variant=$1
+  failure_lua_root=$managed_failure_source/lua-x86_64
+  failure_lua_asset=lua-$managed_failure_name.tar.gz
+  failure_lua_path=$managed_failure_download/$failure_lua_asset
+
+  case "$failure_lua_variant" in
+    absolute)
+      (
+        cd "$failure_lua_root"
+        tar -czf "$failure_lua_path" --transform='s,^,/,' \
+          LICENSE bin changelog.md debugger.lua locale main.lua meta script
+      )
+      ;;
+    parent-traversal)
+      (
+        cd "$failure_lua_root"
+        tar -czf "$failure_lua_path" --transform='s,^,../,' \
+          LICENSE bin changelog.md debugger.lua locale main.lua meta script
+      )
+      ;;
+    unexpected-root)
+      : >"$failure_lua_root/unexpected-root"
+      (
+        cd "$failure_lua_root"
+        tar -czf "$failure_lua_path" \
+          LICENSE bin changelog.md debugger.lua locale main.lua meta script \
+          unexpected-root
+      )
+      ;;
+    missing-executable)
+      chmod 0644 "$failure_lua_root/bin/lua-language-server"
+      (
+        cd "$failure_lua_root"
+        tar -czf "$failure_lua_path" \
+          LICENSE bin changelog.md debugger.lua locale main.lua meta script
+      )
+      ;;
+    missing-main)
+      mv "$failure_lua_root/main.lua" "$managed_failure_source/main.lua.omitted"
+      mkdir "$failure_lua_root/main.lua"
+      (
+        cd "$failure_lua_root"
+        tar -czf "$failure_lua_path" \
+          LICENSE bin changelog.md debugger.lua locale main.lua meta script
+      )
+      ;;
+    missing-script-directory)
+      mv "$failure_lua_root/script" "$managed_failure_source/script.omitted"
+      : >"$failure_lua_root/script"
+      (
+        cd "$failure_lua_root"
+        tar -czf "$failure_lua_path" \
+          LICENSE bin changelog.md debugger.lua locale main.lua meta script
+      )
+      ;;
+    *) return 1 ;;
+  esac
+  failure_lua_sha256=$(file_sha256_for_test "$failure_lua_path")
+  set_failure_case_direct_asset lua-language-server \
+    "https://fixtures.invalid/$failure_lua_asset" "$failure_lua_sha256"
+}
+
+mutate_failure_npm_manifest() {
+  failure_npm_mutation=$1
+  failure_package_path=$managed_failure_harness/manifests/packages-npm-language-servers.json
+  failure_package_lock_path=$managed_failure_harness/manifests/packages-npm-language-servers-lock.json
+  case "$failure_npm_mutation" in
+    malformed-package)
+      printf '%s\n' '{' >"$failure_package_path"
+      ;;
+    private-false)
+      node -e '
+const fs = require("fs");
+const path = process.argv[1];
+const value = JSON.parse(fs.readFileSync(path, "utf8"));
+value.private = false;
+fs.writeFileSync(path, JSON.stringify(value, null, 2) + "\n");
+' "$failure_package_path"
+      ;;
+    ranged-version)
+      node -e '
+const fs = require("fs");
+const path = process.argv[1];
+const value = JSON.parse(fs.readFileSync(path, "utf8"));
+value.dependencies["bash-language-server"] = "^5.6.0";
+fs.writeFileSync(path, JSON.stringify(value, null, 2) + "\n");
+' "$failure_package_path"
+      ;;
+    lock-root-mismatch)
+      node -e '
+const fs = require("fs");
+const path = process.argv[1];
+const value = JSON.parse(fs.readFileSync(path, "utf8"));
+value.packages[""].dependencies["bash-language-server"] = "5.5.0";
+fs.writeFileSync(path, JSON.stringify(value, null, 2) + "\n");
+' "$failure_package_lock_path"
+      refresh_failure_case_lock_hash
+      ;;
+    lockfile-version)
+      node -e '
+const fs = require("fs");
+const path = process.argv[1];
+const value = JSON.parse(fs.readFileSync(path, "utf8"));
+value.lockfileVersion = 2;
+fs.writeFileSync(path, JSON.stringify(value, null, 2) + "\n");
+' "$failure_package_lock_path"
+      refresh_failure_case_lock_hash
+      ;;
+    missing-resolved)
+      node -e '
+const fs = require("fs");
+const path = process.argv[1];
+const value = JSON.parse(fs.readFileSync(path, "utf8"));
+delete value.packages["node_modules/bash-language-server"].resolved;
+fs.writeFileSync(path, JSON.stringify(value, null, 2) + "\n");
+' "$failure_package_lock_path"
+      refresh_failure_case_lock_hash
+      ;;
+    invalid-resolved)
+      node -e '
+const fs = require("fs");
+const path = process.argv[1];
+const value = JSON.parse(fs.readFileSync(path, "utf8"));
+value.packages["node_modules/bash-language-server"].resolved = "http://registry.npmjs.org/bash-language-server.tgz";
+fs.writeFileSync(path, JSON.stringify(value, null, 2) + "\n");
+' "$failure_package_lock_path"
+      refresh_failure_case_lock_hash
+      ;;
+    missing-integrity)
+      node -e '
+const fs = require("fs");
+const path = process.argv[1];
+const value = JSON.parse(fs.readFileSync(path, "utf8"));
+delete value.packages["node_modules/bash-language-server"].integrity;
+fs.writeFileSync(path, JSON.stringify(value, null, 2) + "\n");
+' "$failure_package_lock_path"
+      refresh_failure_case_lock_hash
+      ;;
+    malformed-integrity)
+      node -e '
+const fs = require("fs");
+const path = process.argv[1];
+const value = JSON.parse(fs.readFileSync(path, "utf8"));
+value.packages["node_modules/bash-language-server"].integrity = "sha512-not valid";
+fs.writeFileSync(path, JSON.stringify(value, null, 2) + "\n");
+' "$failure_package_lock_path"
+      refresh_failure_case_lock_hash
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+run_managed_collision_case() {
+  managed_collision_name=$1
+  managed_collision_relative=$2
+  managed_collision_type=$3
+  prepare_managed_failure_case "collision-$managed_collision_name"
+  managed_collision_path=$managed_failure_home/$managed_collision_relative
+  managed_collision_marker="occupied-$managed_collision_name"
+  mkdir -p "$(dirname "$managed_collision_path")"
+  case "$managed_collision_type" in
+    directory)
+      mkdir "$managed_collision_path"
+      printf '%s\n' "$managed_collision_marker" \
+        >"$managed_collision_path/sentinel"
+      ;;
+    file)
+      printf '%s\n' "$managed_collision_marker" >"$managed_collision_path"
+      ;;
+    symlink)
+      managed_collision_source=$managed_failure_root/symlink-target
+      mkdir "$managed_collision_source"
+      ln -s "$managed_collision_source" "$managed_collision_path"
+      ;;
+    *) return 1 ;;
+  esac
+
+  run_capture "$managed_failure_root/output" env \
+    HOME="$managed_failure_home" \
+    XDG_STATE_HOME="$managed_failure_state" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+    DOTFILES_BOOTSTRAP_TEST_ARCH=x86_64 \
+    DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+    DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS= \
+    DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+    DOTFILES_BOOTSTRAP_TEST_REAL_MANAGED_INSTALL=1 \
+    DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT="$managed_failure_download" \
+    DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+    DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$managed_failure_log" \
+    "$managed_failure_harness/bootstrap" --apply
+  managed_collision_status=$run_status
+  managed_collision_output=$(cat "$managed_failure_root/output")
+  managed_collision_pass=true
+  [ "$managed_collision_status" -ne 0 ] || managed_collision_pass=false
+  printf '%s\n' "$managed_collision_output" \
+    | grep -Fq "$managed_collision_path" \
+    || managed_collision_pass=false
+  [ ! -e "$managed_failure_log" ] || managed_collision_pass=false
+  managed_outputs_are_absent_except \
+    "$managed_failure_home" "$managed_collision_path" \
+    || managed_collision_pass=false
+  case "$managed_collision_type" in
+    directory)
+      [ "$(cat "$managed_collision_path/sentinel" 2>/dev/null || true)" \
+        = "$managed_collision_marker" ] || managed_collision_pass=false
+      ;;
+    file)
+      [ "$(cat "$managed_collision_path" 2>/dev/null || true)" \
+        = "$managed_collision_marker" ] || managed_collision_pass=false
+      ;;
+    symlink)
+      [ "$(readlink "$managed_collision_path" 2>/dev/null || true)" \
+        = "$managed_collision_source" ] || managed_collision_pass=false
+      ;;
+  esac
+
+  if [ "$managed_collision_pass" = true ]; then
+    pass "$managed_collision_name collision fails before every package mutation"
+  else
+    fail "$managed_collision_name collision fails before every package mutation"
+    sed "s/^/  $managed_collision_name output: /" \
+      "$managed_failure_root/output" >&2
+  fi
+}
+
+run_selective_managed_case() {
+  selective_name=$1
+  selective_satisfied_tools=$2
+  selective_expected_links=$3
+  selective_kind=$4
+  selective_root=$test_tmp/managed-selective-$selective_name
+  selective_home=$selective_root/home
+  selective_state=$selective_root/state
+  selective_bin=$selective_root/bin
+  selective_log=$selective_root/commands
+  mkdir -p "$selective_home" "$selective_bin"
+  printf '%s\n' '#!/bin/sh' "printf '%s\\n' 'install ok installed'" \
+    >"$selective_bin/dpkg-query"
+  printf '%s\n' '#!/bin/sh' 'exit 0' >"$selective_bin/apt-cache"
+  chmod 0755 "$selective_bin/dpkg-query" "$selective_bin/apt-cache"
+  selective_node_bin=$managed_fixture_source/x86_64/node-v24.19.0-linux-x64/bin
+
+  run_capture "$selective_root/output" env \
+    PATH="$selective_bin:$selective_node_bin:/usr/bin:/bin" \
+    HOME="$selective_home" \
+    XDG_STATE_HOME="$selective_state" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+    DOTFILES_BOOTSTRAP_TEST_ARCH=x86_64 \
+    DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS="$selective_satisfied_tools" \
+    DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+    DOTFILES_BOOTSTRAP_TEST_REAL_MANAGED_INSTALL=1 \
+    DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT="$managed_fixture_download" \
+    DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+    DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$selective_log" \
+    "$managed_fixture_root/bootstrap" --apply
+  selective_status=$run_status
+  selective_pass=true
+  [ "$selective_status" -eq 0 ] || selective_pass=false
+  selective_npm_target=$selective_home/.local/opt/dotfiles-lsp-node-$actual_npm_lock_sha256
+  selective_lua_target=$selective_home/.local/opt/lua-language-server-3.19.1-x86_64
+  [ ! -e "$selective_home/.local/opt/node-24.19.0-x86_64" ] \
+    || selective_pass=false
+  [ ! -e "$selective_home/.local/bin/node" ] \
+    && [ ! -L "$selective_home/.local/bin/node" ] \
+    || selective_pass=false
+  [ ! -e "$selective_home/.local/bin/npm" ] \
+    && [ ! -L "$selective_home/.local/bin/npm" ] \
+    || selective_pass=false
+
+  case "$selective_kind" in
+    lua)
+      [ -d "$selective_lua_target" ] || selective_pass=false
+      [ -x "$selective_home/.local/bin/lua-language-server" ] \
+        && [ ! -L "$selective_home/.local/bin/lua-language-server" ] \
+        || selective_pass=false
+      [ ! -e "$selective_npm_target" ] || selective_pass=false
+      ;;
+    npm)
+      [ ! -e "$selective_lua_target" ] || selective_pass=false
+      [ -d "$selective_npm_target" ] || selective_pass=false
+      for selective_package in \
+        bash-language-server \
+        vscode-langservers-extracted \
+        pyright \
+        yaml-language-server
+      do
+        [ -d "$selective_npm_target/node_modules/$selective_package" ] \
+          || selective_pass=false
+      done
+      ;;
+    *) selective_pass=false ;;
+  esac
+
+  for selective_command in \
+    bash-language-server \
+    vscode-json-language-server \
+    lua-language-server \
+    pyright-langserver \
+    yaml-language-server
+  do
+    case ",$selective_expected_links," in
+      *,"$selective_command",*)
+        path_exists_for_test "$selective_home/.local/bin/$selective_command" \
+          || selective_pass=false
+        ;;
+      *)
+        if path_exists_for_test "$selective_home/.local/bin/$selective_command"; then
+          selective_pass=false
+        fi
+        ;;
+    esac
+  done
+
+  if [ "$selective_pass" = true ]; then
+    pass "$selective_name publishes only its selected managed server commands"
+  else
+    fail "$selective_name publishes only its selected managed server commands"
+    sed "s/^/  $selective_name output: /" "$selective_root/output" >&2
+  fi
+}
+
+managed_tree_digest() {
+  managed_digest_home=$1
+  if command -v sha256sum >/dev/null 2>&1; then
+    tar -cf - -C "$managed_digest_home" .local | sha256sum | awk '{ print $1 }'
+  else
+    tar -cf - -C "$managed_digest_home" .local | shasum -a 256 | awk '{ print $1 }'
+  fi
+}
+
+retained_language_server_actions_are_present() {
+  retained_language_server_text=$1
+  for retained_language_server_action in \
+    'direct node' \
+    'direct lua-language-server' \
+    'npm bash-language-server@5.6.0' \
+    'npm vscode-langservers-extracted@4.10.0' \
+    'npm pyright@1.1.411' \
+    'npm yaml-language-server@1.24.0'
+  do
+    printf '%s\n' "$retained_language_server_text" \
+      | grep -Fqx "$retained_language_server_action" \
+      || return 1
+  done
 }
 
 test_tmp=$(mktemp -d "${TMPDIR:-/tmp}/dotfiles-bootstrap-test.XXXXXX")
@@ -631,6 +1320,423 @@ else
   fail 'stdio startup and the Pyright companion floor select managed fallbacks'
 fi
 
+probe_signal_root=$test_tmp/stdio-probe-signal
+probe_signal_bin=$probe_signal_root/bin
+probe_signal_home=$probe_signal_root/home
+probe_signal_state=$probe_signal_root/state
+probe_signal_tmp=$probe_signal_root/tmp
+probe_signal_pid_file=$probe_signal_root/probe.pid
+probe_signal_ready_file=$probe_signal_root/probe.ready
+probe_signal_deadline_file=$probe_signal_root/watchdog-fired
+mkdir -p \
+  "$probe_signal_home" \
+  "$probe_signal_state" \
+  "$probe_signal_tmp"
+prepare_satisfaction_commands "$probe_signal_bin" \
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0
+make_term_ignoring_stdio_command \
+  "$probe_signal_bin/vscode-json-language-server" \
+  "$probe_signal_pid_file" \
+  "$probe_signal_ready_file"
+set +e
+env \
+  PATH="$probe_signal_bin:/usr/bin:/bin" \
+  TMPDIR="$probe_signal_tmp" \
+  HOME="$probe_signal_home" \
+  XDG_STATE_HOME="$probe_signal_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+  DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+  "$bootstrap" --apply \
+  >"$probe_signal_root/output" 2>&1 &
+probe_signal_bootstrap_pid=$!
+set -e
+probe_signal_ready=false
+probe_signal_attempt=0
+while [ "$probe_signal_attempt" -lt 5 ]; do
+  if [ -s "$probe_signal_ready_file" ]; then
+    probe_signal_ready=true
+    break
+  fi
+  sleep 1
+  probe_signal_attempt=$((probe_signal_attempt + 1))
+done
+probe_signal_pass=true
+probe_signal_status=not-run
+probe_signal_server_command=
+if [ "$probe_signal_ready" != true ]; then
+  probe_signal_pass=false
+  kill_matching_test_process "$probe_signal_bootstrap_pid" "$bootstrap"
+  set +e
+  wait "$probe_signal_bootstrap_pid" >/dev/null 2>&1
+  set -e
+else
+  probe_signal_server_pid=$(cat "$probe_signal_pid_file")
+  case "$probe_signal_server_pid" in
+    ''|*[!0-9]*)
+      probe_signal_pass=false
+      kill_matching_test_process "$probe_signal_bootstrap_pid" "$bootstrap"
+      set +e
+      wait "$probe_signal_bootstrap_pid" >/dev/null 2>&1
+      set -e
+      ;;
+    *)
+      (
+        probe_watchdog_sleep_pid=
+        trap '[ -z "$probe_watchdog_sleep_pid" ] || kill "$probe_watchdog_sleep_pid" >/dev/null 2>&1; exit 0' HUP INT TERM
+        sleep 5 &
+        probe_watchdog_sleep_pid=$!
+        wait "$probe_watchdog_sleep_pid" || exit 0
+        : >"$probe_signal_deadline_file"
+        kill_matching_test_process \
+          "$probe_signal_server_pid" \
+          "$probe_signal_bin/vscode-json-language-server"
+        sleep 2 &
+        probe_watchdog_sleep_pid=$!
+        wait "$probe_watchdog_sleep_pid" || exit 0
+        kill_matching_test_process "$probe_signal_bootstrap_pid" "$bootstrap"
+      ) &
+      probe_signal_watchdog_pid=$!
+      set +e
+      wait "$probe_signal_bootstrap_pid"
+      probe_signal_status=$?
+      kill "$probe_signal_watchdog_pid" >/dev/null 2>&1
+      wait "$probe_signal_watchdog_pid" >/dev/null 2>&1
+      set -e
+      [ "$probe_signal_status" -eq 143 ] || probe_signal_pass=false
+      [ ! -e "$probe_signal_deadline_file" ] || probe_signal_pass=false
+      probe_signal_server_command=$(
+        ps -p "$probe_signal_server_pid" -o command= 2>/dev/null || true
+      )
+      case "$probe_signal_server_command" in
+        *"$probe_signal_bin/vscode-json-language-server"*)
+          probe_signal_pass=false
+          kill_matching_test_process \
+            "$probe_signal_server_pid" \
+            "$probe_signal_bin/vscode-json-language-server"
+          ;;
+      esac
+      grep -Fq 'received TERM; stopping safely' "$probe_signal_root/output" \
+        || probe_signal_pass=false
+      if find "$probe_signal_tmp" -mindepth 1 -maxdepth 1 \
+        -name 'dotfiles-bootstrap.*' -print -quit \
+        | grep -q .; then
+        probe_signal_pass=false
+      fi
+      ;;
+  esac
+fi
+if [ "$probe_signal_pass" = true ]; then
+  pass 'termination force-stops a TERM-ignoring stdio probe and removes probe state'
+else
+  fail 'termination force-stops a TERM-ignoring stdio probe and removes probe state'
+  printf '  stdio probe signal status: %s\n' "$probe_signal_status" >&2
+  if [ -e "$probe_signal_deadline_file" ]; then
+    printf '%s\n' '  stdio probe watchdog: fired' >&2
+  else
+    printf '%s\n' '  stdio probe watchdog: not fired' >&2
+  fi
+  printf '  stdio probe remaining command: %s\n' \
+    "${probe_signal_server_command:-none}" >&2
+  sed 's/^/  stdio probe signal output: /' \
+    "$probe_signal_root/output" >&2
+fi
+
+probe_race_root=$test_tmp/stdio-probe-spawn-race
+probe_race_harness=$probe_race_root/harness
+probe_race_bootstrap=$probe_race_harness/bootstrap
+probe_race_bin=$probe_race_root/bin
+probe_race_home=$probe_race_root/home
+probe_race_state=$probe_race_root/state
+probe_race_tmp=$probe_race_root/tmp
+probe_race_pid_file=$probe_race_root/probe.pid
+probe_race_deadline_file=$probe_race_root/watchdog-fired
+mkdir -p \
+  "$probe_race_harness" \
+  "$probe_race_home" \
+  "$probe_race_state" \
+  "$probe_race_tmp"
+cp -R "$dotfiles_dir/manifests" "$probe_race_harness/manifests"
+make_probe_spawn_signal_bootstrap "$bootstrap" "$probe_race_bootstrap"
+prepare_satisfaction_commands "$probe_race_bin" \
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0
+set +e
+env \
+  PATH="$probe_race_bin:/usr/bin:/bin" \
+  TMPDIR="$probe_race_tmp" \
+  HOME="$probe_race_home" \
+  XDG_STATE_HOME="$probe_race_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+  DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_PROBE_RACE_PID_FILE="$probe_race_pid_file" \
+  "$probe_race_bootstrap" --apply \
+  >"$probe_race_root/output" 2>&1 &
+probe_race_bootstrap_pid=$!
+set -e
+(
+  probe_race_watchdog_sleep_pid=
+  trap '[ -z "$probe_race_watchdog_sleep_pid" ] || kill "$probe_race_watchdog_sleep_pid" >/dev/null 2>&1; exit 0' HUP INT TERM
+  sleep 8 &
+  probe_race_watchdog_sleep_pid=$!
+  wait "$probe_race_watchdog_sleep_pid" || exit 0
+  : >"$probe_race_deadline_file"
+  probe_race_watchdog_child_pid=$(cat "$probe_race_pid_file" 2>/dev/null || true)
+  case "$probe_race_watchdog_child_pid" in
+    ''|*[!0-9]*)
+      ;;
+    *)
+      kill_matching_test_process \
+        "$probe_race_watchdog_child_pid" "$probe_race_bootstrap"
+      kill_matching_test_process \
+        "$probe_race_watchdog_child_pid" \
+        "$probe_race_bin/vscode-json-language-server"
+      ;;
+  esac
+  kill_matching_test_process "$probe_race_bootstrap_pid" "$probe_race_bootstrap"
+) &
+probe_race_watchdog_pid=$!
+set +e
+wait "$probe_race_bootstrap_pid"
+probe_race_status=$?
+kill "$probe_race_watchdog_pid" >/dev/null 2>&1
+wait "$probe_race_watchdog_pid" >/dev/null 2>&1
+set -e
+probe_race_pass=true
+probe_race_pid=$(cat "$probe_race_pid_file" 2>/dev/null || true)
+probe_race_command=
+case "$probe_race_pid" in
+  ''|*[!0-9]*)
+    probe_race_pass=false
+    ;;
+  *)
+    probe_race_command=$(ps -p "$probe_race_pid" -o command= 2>/dev/null || true)
+    if kill -0 "$probe_race_pid" >/dev/null 2>&1; then
+      probe_race_pass=false
+      kill_matching_test_process "$probe_race_pid" "$probe_race_bootstrap"
+      kill_matching_test_process \
+        "$probe_race_pid" "$probe_race_bin/vscode-json-language-server"
+    fi
+    ;;
+esac
+[ "$probe_race_status" -eq 143 ] || probe_race_pass=false
+[ ! -e "$probe_race_deadline_file" ] || probe_race_pass=false
+grep -Fq 'received TERM; stopping safely' "$probe_race_root/output" \
+  || probe_race_pass=false
+if find "$probe_race_tmp" -mindepth 1 -maxdepth 1 \
+  -name 'dotfiles-bootstrap.*' -print -quit \
+  | grep -q .; then
+  probe_race_pass=false
+fi
+if [ "$probe_race_pass" = true ]; then
+  pass 'termination during stdio probe spawn registers and removes the exact child'
+else
+  fail 'termination during stdio probe spawn registers and removes the exact child'
+  printf '  stdio probe race status: %s\n' "$probe_race_status" >&2
+  printf '  stdio probe race PID: %s\n' "${probe_race_pid:-none}" >&2
+  printf '  stdio probe race command: %s\n' \
+    "${probe_race_command:-none}" >&2
+  if [ -e "$probe_race_deadline_file" ]; then
+    printf '%s\n' '  stdio probe race watchdog: fired' >&2
+  else
+    printf '%s\n' '  stdio probe race watchdog: not fired' >&2
+  fi
+  sed 's/^/  stdio probe race output: /' "$probe_race_root/output" >&2
+fi
+
+probe_temp_root=$test_tmp/stdio-probe-temp-race
+probe_temp_harness=$probe_temp_root/harness
+probe_temp_bootstrap=$probe_temp_harness/bootstrap
+probe_temp_bin=$probe_temp_root/bin
+probe_temp_home=$probe_temp_root/home
+probe_temp_state=$probe_temp_root/state
+probe_temp_tmp=$probe_temp_root/tmp
+probe_temp_path_file=$probe_temp_root/probe-temp.path
+mkdir -p \
+  "$probe_temp_harness" \
+  "$probe_temp_home" \
+  "$probe_temp_state" \
+  "$probe_temp_tmp"
+cp -R "$dotfiles_dir/manifests" "$probe_temp_harness/manifests"
+make_probe_temp_signal_bootstrap "$bootstrap" "$probe_temp_bootstrap"
+prepare_satisfaction_commands "$probe_temp_bin" \
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0
+run_capture "$probe_temp_root/output" env \
+  PATH="$probe_temp_bin:/usr/bin:/bin" \
+  TMPDIR="$probe_temp_tmp" \
+  HOME="$probe_temp_home" \
+  XDG_STATE_HOME="$probe_temp_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+  DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_PROBE_TEMP_RACE_PATH_FILE="$probe_temp_path_file" \
+  "$probe_temp_bootstrap" --apply
+probe_temp_status=$run_status
+probe_temp_pass=true
+probe_temp_path=$(cat "$probe_temp_path_file" 2>/dev/null || true)
+[ "$probe_temp_status" -eq 143 ] || probe_temp_pass=false
+grep -Fq 'received TERM; stopping safely' "$probe_temp_root/output" \
+  || probe_temp_pass=false
+case "$probe_temp_path" in
+  "$probe_temp_tmp"/dotfiles-bootstrap.*)
+    path_exists_for_test "$probe_temp_path" && probe_temp_pass=false
+    ;;
+  *)
+    probe_temp_pass=false
+    ;;
+esac
+if find "$probe_temp_tmp" -mindepth 1 -maxdepth 1 \
+  -name 'dotfiles-bootstrap.*' -print -quit \
+  | grep -q .; then
+  probe_temp_pass=false
+fi
+if [ "$probe_temp_pass" = true ]; then
+  pass 'termination during probe temp registration removes the exact temporary root'
+else
+  fail 'termination during probe temp registration removes the exact temporary root'
+  printf '  stdio probe temp status: %s\n' "$probe_temp_status" >&2
+  printf '  stdio probe temp path: %s\n' "${probe_temp_path:-none}" >&2
+  sed 's/^/  stdio probe temp output: /' "$probe_temp_root/output" >&2
+fi
+
+probe_repeat_root=$test_tmp/stdio-probe-repeat-signal
+probe_repeat_harness=$probe_repeat_root/harness
+probe_repeat_bootstrap=$probe_repeat_harness/bootstrap
+probe_repeat_bin=$probe_repeat_root/bin
+probe_repeat_home=$probe_repeat_root/home
+probe_repeat_state=$probe_repeat_root/state
+probe_repeat_tmp=$probe_repeat_root/tmp
+probe_repeat_pid_file=$probe_repeat_root/probe.pid
+probe_repeat_ready_file=$probe_repeat_root/probe.ready
+probe_repeat_deadline_file=$probe_repeat_root/watchdog-fired
+mkdir -p \
+  "$probe_repeat_harness" \
+  "$probe_repeat_home" \
+  "$probe_repeat_state" \
+  "$probe_repeat_tmp"
+cp -R "$dotfiles_dir/manifests" "$probe_repeat_harness/manifests"
+make_exit_repeat_signal_bootstrap "$bootstrap" "$probe_repeat_bootstrap"
+prepare_satisfaction_commands "$probe_repeat_bin" \
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0
+make_term_ignoring_stdio_command \
+  "$probe_repeat_bin/vscode-json-language-server" \
+  "$probe_repeat_pid_file" \
+  "$probe_repeat_ready_file"
+set +e
+env \
+  PATH="$probe_repeat_bin:/usr/bin:/bin" \
+  TMPDIR="$probe_repeat_tmp" \
+  HOME="$probe_repeat_home" \
+  XDG_STATE_HOME="$probe_repeat_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+  DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+  "$probe_repeat_bootstrap" --apply \
+  >"$probe_repeat_root/output" 2>&1 &
+probe_repeat_bootstrap_pid=$!
+set -e
+probe_repeat_ready=false
+probe_repeat_attempt=0
+while [ "$probe_repeat_attempt" -lt 5 ]; do
+  if [ -s "$probe_repeat_ready_file" ]; then
+    probe_repeat_ready=true
+    break
+  fi
+  sleep 1
+  probe_repeat_attempt=$((probe_repeat_attempt + 1))
+done
+probe_repeat_pass=true
+probe_repeat_status=not-run
+probe_repeat_server_command=
+if [ "$probe_repeat_ready" != true ]; then
+  probe_repeat_pass=false
+  kill_matching_test_process \
+    "$probe_repeat_bootstrap_pid" "$probe_repeat_bootstrap"
+  set +e
+  wait "$probe_repeat_bootstrap_pid" >/dev/null 2>&1
+  set -e
+else
+  probe_repeat_server_pid=$(cat "$probe_repeat_pid_file")
+  case "$probe_repeat_server_pid" in
+    ''|*[!0-9]*)
+      probe_repeat_pass=false
+      kill_matching_test_process \
+        "$probe_repeat_bootstrap_pid" "$probe_repeat_bootstrap"
+      set +e
+      wait "$probe_repeat_bootstrap_pid" >/dev/null 2>&1
+      set -e
+      ;;
+    *)
+      (
+        probe_repeat_watchdog_sleep_pid=
+        trap '[ -z "$probe_repeat_watchdog_sleep_pid" ] || kill "$probe_repeat_watchdog_sleep_pid" >/dev/null 2>&1; exit 0' HUP INT TERM
+        sleep 5 &
+        probe_repeat_watchdog_sleep_pid=$!
+        wait "$probe_repeat_watchdog_sleep_pid" || exit 0
+        : >"$probe_repeat_deadline_file"
+        kill_matching_test_process \
+          "$probe_repeat_server_pid" \
+          "$probe_repeat_bin/vscode-json-language-server"
+        sleep 2 &
+        probe_repeat_watchdog_sleep_pid=$!
+        wait "$probe_repeat_watchdog_sleep_pid" || exit 0
+        kill_matching_test_process \
+          "$probe_repeat_bootstrap_pid" "$probe_repeat_bootstrap"
+      ) &
+      probe_repeat_watchdog_pid=$!
+      set +e
+      wait "$probe_repeat_bootstrap_pid"
+      probe_repeat_status=$?
+      kill "$probe_repeat_watchdog_pid" >/dev/null 2>&1
+      wait "$probe_repeat_watchdog_pid" >/dev/null 2>&1
+      set -e
+      [ "$probe_repeat_status" -eq 143 ] || probe_repeat_pass=false
+      [ ! -e "$probe_repeat_deadline_file" ] || probe_repeat_pass=false
+      probe_repeat_server_command=$(
+        ps -p "$probe_repeat_server_pid" -o command= 2>/dev/null || true
+      )
+      case "$probe_repeat_server_command" in
+        *"$probe_repeat_bin/vscode-json-language-server"*)
+          probe_repeat_pass=false
+          kill_matching_test_process \
+            "$probe_repeat_server_pid" \
+            "$probe_repeat_bin/vscode-json-language-server"
+          ;;
+      esac
+      [ "$(grep -Fc 'received TERM; stopping safely' \
+        "$probe_repeat_root/output")" -eq 1 ] \
+        || probe_repeat_pass=false
+      if find "$probe_repeat_tmp" -mindepth 1 -maxdepth 1 \
+        -name 'dotfiles-bootstrap.*' -print -quit \
+        | grep -q .; then
+        probe_repeat_pass=false
+      fi
+      ;;
+  esac
+fi
+if [ "$probe_repeat_pass" = true ]; then
+  pass 'repeat termination during EXIT cleanup preserves status and removes probe state'
+else
+  fail 'repeat termination during EXIT cleanup preserves status and removes probe state'
+  printf '  repeat signal status: %s\n' "$probe_repeat_status" >&2
+  if [ -e "$probe_repeat_deadline_file" ]; then
+    printf '%s\n' '  repeat signal watchdog: fired' >&2
+  else
+    printf '%s\n' '  repeat signal watchdog: not fired' >&2
+  fi
+  printf '  repeat signal remaining command: %s\n' \
+    "${probe_repeat_server_command:-none}" >&2
+  sed 's/^/  repeat signal output: /' "$probe_repeat_root/output" >&2
+fi
+
 collision_home=$test_tmp/lsp-collision-home
 collision_log=$test_tmp/lsp-collision.commands
 mkdir -p "$collision_home/.local/bin"
@@ -711,6 +1817,70 @@ awk -F '\t' -v OFS='\t' \
   >"$managed_fixture_root/manifests/packages-direct.tsv.new"
 mv "$managed_fixture_root/manifests/packages-direct.tsv.new" \
   "$managed_fixture_root/manifests/packages-direct.tsv"
+
+managed_stage_race_root=$test_tmp/managed-stage-registration-race
+managed_stage_race_harness=$managed_stage_race_root/harness
+managed_stage_race_home=$managed_stage_race_root/home
+managed_stage_race_state=$managed_stage_race_root/state
+managed_stage_race_tmp=$managed_stage_race_root/tmp
+managed_stage_race_path_file=$managed_stage_race_root/stage.path
+managed_stage_race_log=$managed_stage_race_root/commands
+mkdir -p \
+  "$managed_stage_race_harness" \
+  "$managed_stage_race_home" \
+  "$managed_stage_race_state" \
+  "$managed_stage_race_tmp"
+cp -R "$managed_fixture_root/." "$managed_stage_race_harness/"
+make_managed_stage_signal_bootstrap \
+  "$managed_fixture_root/bootstrap" \
+  "$managed_stage_race_harness/bootstrap"
+run_capture "$managed_stage_race_root/output" env \
+  HOME="$managed_stage_race_home" \
+  TMPDIR="$managed_stage_race_tmp" \
+  XDG_STATE_HOME="$managed_stage_race_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_ARCH=x86_64 \
+  DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+  DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS= \
+  DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+  DOTFILES_BOOTSTRAP_TEST_REAL_MANAGED_INSTALL=1 \
+  DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT="$managed_fixture_download" \
+  DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$managed_stage_race_log" \
+  DOTFILES_BOOTSTRAP_TEST_MANAGED_STAGE_RACE_PATH_FILE="$managed_stage_race_path_file" \
+  "$managed_stage_race_harness/bootstrap" --apply
+managed_stage_race_status=$run_status
+managed_stage_race_path=$(cat "$managed_stage_race_path_file" 2>/dev/null || true)
+managed_stage_race_pass=true
+[ "$managed_stage_race_status" -eq 143 ] || managed_stage_race_pass=false
+grep -Fq 'received TERM; stopping safely' "$managed_stage_race_root/output" \
+  || managed_stage_race_pass=false
+case "$managed_stage_race_path" in
+  "$managed_stage_race_tmp"/dotfiles-bootstrap.*)
+    path_exists_for_test "$managed_stage_race_path" \
+      && managed_stage_race_pass=false
+    ;;
+  *)
+    managed_stage_race_pass=false
+    ;;
+esac
+if find "$managed_stage_race_tmp" -mindepth 1 -maxdepth 1 \
+  -name 'dotfiles-bootstrap.*' -print -quit \
+  | grep -q .; then
+  managed_stage_race_pass=false
+fi
+if [ "$managed_stage_race_pass" = true ]; then
+  pass 'termination during managed staging registration removes the exact temporary root'
+else
+  fail 'termination during managed staging registration removes the exact temporary root'
+  printf '  managed stage status: %s\n' "$managed_stage_race_status" >&2
+  printf '  managed stage path: %s\n' \
+    "${managed_stage_race_path:-none}" >&2
+  sed 's/^/  managed stage output: /' \
+    "$managed_stage_race_root/output" >&2
+fi
 
 for managed_test_architecture in x86_64 arm64; do
   run_managed_architecture_case "$managed_test_architecture"
@@ -794,6 +1964,302 @@ for managed_test_architecture in x86_64 arm64; do
       "$test_tmp/managed-$managed_test_architecture.output" >&2
   fi
 done
+
+prepare_managed_failure_case unsupported-architecture
+run_managed_failure_case 'unsupported architecture: riscv64' '' 0 '' riscv64
+if [ -z "$managed_failure_commands" ]; then
+  pass 'unsupported architecture fails before apt download and npm commands'
+else
+  fail 'unsupported architecture fails before apt download and npm commands'
+  printf '  unexpected command: %s\n' "$managed_failure_commands" >&2
+fi
+
+prepare_managed_failure_case non-https-asset
+set_failure_case_direct_asset node \
+  'http://fixtures.invalid/node-v24.19.0-linux-x64.tar.xz' \
+  "$fake_node_x86_sha"
+run_managed_failure_case 'direct asset URL must use HTTPS: node'
+
+prepare_managed_failure_case invalid-sha-length
+set_failure_case_direct_asset node \
+  'https://fixtures.invalid/node-v24.19.0-linux-x64.tar.xz' abc
+run_managed_failure_case 'invalid SHA-256 length'
+
+prepare_managed_failure_case invalid-sha-character
+set_failure_case_direct_asset node \
+  'https://fixtures.invalid/node-v24.19.0-linux-x64.tar.xz' \
+  'g000000000000000000000000000000000000000000000000000000000000000'
+run_managed_failure_case 'invalid SHA-256'
+
+prepare_managed_failure_case node-checksum-mismatch
+set_failure_case_direct_asset node \
+  'https://fixtures.invalid/node-v24.19.0-linux-x64.tar.xz' \
+  '0000000000000000000000000000000000000000000000000000000000000000'
+run_managed_failure_case 'checksum mismatch for https://fixtures.invalid/node-v24.19.0-linux-x64.tar.xz'
+
+prepare_managed_failure_case lua-checksum-mismatch
+set_failure_case_direct_asset lua-language-server \
+  'https://fixtures.invalid/lua-language-server-3.19.1-linux-x64.tar.gz' \
+  '0000000000000000000000000000000000000000000000000000000000000000'
+run_managed_failure_case 'checksum mismatch for https://fixtures.invalid/lua-language-server-3.19.1-linux-x64.tar.gz'
+
+while IFS='|' read -r failure_case_name failure_case_variant failure_case_diagnostic; do
+  prepare_managed_failure_case "$failure_case_name"
+  create_failure_node_archive "$failure_case_variant"
+  run_managed_failure_case "$failure_case_diagnostic"
+done <<'NODE_FAILURE_CASES'
+node-absolute-member|absolute|verified Node archive contains an unsafe member
+node-parent-traversal|parent-traversal|verified Node archive contains an unsafe member
+node-outside-root|outside-root|verified Node archive contains an unsafe member
+node-missing-executable|missing-node|verified Node archive is missing executable bin/node
+node-missing-npm-cli|missing-npm-cli|verified Node archive is missing npm-cli.js
+NODE_FAILURE_CASES
+
+while IFS='|' read -r failure_case_name failure_case_variant failure_case_diagnostic; do
+  prepare_managed_failure_case "$failure_case_name"
+  create_failure_lua_archive "$failure_case_variant"
+  run_managed_failure_case "$failure_case_diagnostic"
+done <<'LUA_FAILURE_CASES'
+lua-absolute-member|absolute|verified LuaLS archive contains an unsafe member
+lua-parent-traversal|parent-traversal|verified LuaLS archive contains an unsafe member
+lua-unexpected-root|unexpected-root|verified LuaLS archive has unexpected top-level content
+lua-missing-executable|missing-executable|verified LuaLS archive is missing executable bin/lua-language-server
+lua-missing-main|missing-main|verified LuaLS archive is missing main.lua
+lua-missing-script-directory|missing-script-directory|verified LuaLS archive is missing script
+LUA_FAILURE_CASES
+
+while IFS='|' read -r failure_case_name failure_case_mutation; do
+  prepare_managed_failure_case "$failure_case_name"
+  mutate_failure_npm_manifest "$failure_case_mutation"
+  run_managed_failure_case 'npm language-server manifests failed validation'
+done <<'NPM_MANIFEST_FAILURE_CASES'
+npm-malformed-package|malformed-package
+npm-private-false|private-false
+npm-ranged-version|ranged-version
+npm-lock-root-mismatch|lock-root-mismatch
+npm-lockfile-version|lockfile-version
+npm-missing-resolved|missing-resolved
+npm-invalid-resolved|invalid-resolved
+npm-missing-integrity|missing-integrity
+npm-malformed-integrity|malformed-integrity
+NPM_MANIFEST_FAILURE_CASES
+
+prepare_managed_failure_case npm-command-failure
+run_managed_failure_case 'npm language-server installation failed' '' 1
+if printf '%s\n' "$managed_failure_commands" \
+  | grep -Fqx 'npm-ci --ignore-scripts --omit=dev --no-audit --no-fund'; then
+  pass 'npm failure preserves every required npm ci hardening flag'
+else
+  fail 'npm failure preserves every required npm ci hardening flag'
+fi
+
+prepare_managed_failure_case npm-missing-staged-command
+run_managed_failure_case \
+  'npm language-server bundle is missing executable: yaml-language-server' \
+  '' 0 yaml-language-server
+
+while IFS='|' read -r collision_name collision_relative collision_type; do
+  run_managed_collision_case \
+    "$collision_name" "$collision_relative" "$collision_type"
+done <<COLLISION_CASES
+node-version-directory|.local/opt/node-24.19.0-x86_64|directory
+lua-version-directory|.local/opt/lua-language-server-3.19.1-x86_64|directory
+npm-bundle-directory|.local/opt/dotfiles-lsp-node-$actual_npm_lock_sha256|directory
+node-command-link|.local/bin/node|file
+npm-command-link|.local/bin/npm|file
+lua-wrapper-target|.local/bin/lua-language-server|file
+bash-command-target|.local/bin/bash-language-server|file
+json-command-target|.local/bin/vscode-json-language-server|file
+pyright-command-target|.local/bin/pyright-langserver|file
+yaml-command-target|.local/bin/yaml-language-server|file
+local-parent-file|.local|file
+local-parent-symlink|.local|symlink
+bin-parent-file|.local/bin|file
+bin-parent-symlink|.local/bin|symlink
+opt-parent-file|.local/opt|file
+opt-parent-symlink|.local/opt|symlink
+COLLISION_CASES
+
+standalone_collision_root=$test_tmp/managed-standalone-collision
+standalone_collision_home=$standalone_collision_root/home
+standalone_collision_bin=$standalone_collision_root/bin
+standalone_collision_log=$standalone_collision_root/commands
+standalone_collision_target=$standalone_collision_home/.local/opt/dotfiles-lsp-node-$actual_npm_lock_sha256
+mkdir -p \
+  "$standalone_collision_home" \
+  "$standalone_collision_bin" \
+  "$standalone_collision_target"
+cp "$bootstrap" "$standalone_collision_root/bootstrap"
+printf '%s\n' '#!/bin/sh' 'exit 1' >"$standalone_collision_bin/git"
+chmod 0755 "$standalone_collision_bin/git" "$standalone_collision_root/bootstrap"
+printf '%s\n' 'standalone collision sentinel' \
+  >"$standalone_collision_target/sentinel"
+run_capture "$standalone_collision_root/output" env \
+  PATH="$standalone_collision_bin:/usr/bin:/bin" \
+  HOME="$standalone_collision_home" \
+  XDG_STATE_HOME="$standalone_collision_root/state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_ARCH=x86_64 \
+  DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+  DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS= \
+  DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+  DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$standalone_collision_log" \
+  /bin/sh "$standalone_collision_root/bootstrap" --apply
+standalone_collision_output=$(cat "$standalone_collision_root/output")
+if [ "$run_status" -ne 0 ] \
+  && printf '%s\n' "$standalone_collision_output" \
+    | grep -Fq "$standalone_collision_target" \
+  && [ ! -e "$standalone_collision_log" ] \
+  && [ "$(cat "$standalone_collision_target/sentinel" 2>/dev/null || true)" \
+    = 'standalone collision sentinel' ]; then
+  pass 'standalone Debian collision fails before Git bootstrap apt commands'
+else
+  fail 'standalone Debian collision fails before Git bootstrap apt commands'
+fi
+
+for publication_token in node-directory lua-directory npm-directory command-links; do
+  prepare_managed_failure_case "publish-$publication_token"
+  publication_parent_one=
+  publication_parent_two=
+  case "$publication_token" in
+    node-directory)
+      mkdir "$managed_failure_home/.local"
+      publication_parent_one=$managed_failure_home/.local
+      ;;
+    lua-directory)
+      mkdir -p "$managed_failure_home/.local/bin"
+      publication_parent_one=$managed_failure_home/.local/bin
+      ;;
+    npm-directory)
+      mkdir -p "$managed_failure_home/.local/opt"
+      publication_parent_one=$managed_failure_home/.local/opt
+      ;;
+    command-links)
+      mkdir -p \
+        "$managed_failure_home/.local/bin" \
+        "$managed_failure_home/.local/opt"
+      publication_parent_one=$managed_failure_home/.local/bin
+      publication_parent_two=$managed_failure_home/.local/opt
+      ;;
+  esac
+  printf '%s\n' 'publication sentinel' \
+    >"$managed_failure_home/preexisting-sentinel"
+  run_managed_failure_case \
+    "forced managed publication failure after $publication_token" \
+    "$publication_token"
+  publication_cleanup_pass=true
+  [ "$(cat "$managed_failure_home/preexisting-sentinel" 2>/dev/null || true)" \
+    = 'publication sentinel' ] || publication_cleanup_pass=false
+  [ -d "$publication_parent_one" ] && [ ! -L "$publication_parent_one" ] \
+    || publication_cleanup_pass=false
+  if [ -n "$publication_parent_two" ]; then
+    [ -d "$publication_parent_two" ] && [ ! -L "$publication_parent_two" ] \
+      || publication_cleanup_pass=false
+  fi
+  if [ "$publication_cleanup_pass" = true ]; then
+    pass "$publication_token failure removes only invocation-created managed state"
+  else
+    fail "$publication_token failure removes only invocation-created managed state"
+  fi
+done
+
+for signal_token in parent-directory managed-directory managed-link lua-wrapper; do
+  prepare_managed_failure_case "signal-before-journal-$signal_token"
+  signal_parent_one=
+  signal_parent_two=
+  case "$signal_token" in
+    parent-directory)
+      ;;
+    managed-directory|managed-link|lua-wrapper)
+      mkdir -p \
+        "$managed_failure_home/.local/bin" \
+        "$managed_failure_home/.local/opt"
+      signal_parent_one=$managed_failure_home/.local/bin
+      signal_parent_two=$managed_failure_home/.local/opt
+      ;;
+  esac
+  printf '%s\n' 'pre-journal signal sentinel' \
+    >"$managed_failure_home/preexisting-sentinel"
+  run_managed_failure_case \
+    'received TERM; stopping safely' \
+    '' \
+    0 \
+    '' \
+    x86_64 \
+    "$signal_token"
+  signal_cleanup_pass=true
+  [ "$managed_failure_status" -eq 143 ] || signal_cleanup_pass=false
+  [ "$(cat "$managed_failure_home/preexisting-sentinel" 2>/dev/null || true)" \
+    = 'pre-journal signal sentinel' ] || signal_cleanup_pass=false
+  if [ "$signal_token" = parent-directory ]; then
+    path_exists_for_test "$managed_failure_home/.local" \
+      && signal_cleanup_pass=false
+  else
+    [ -d "$signal_parent_one" ] && [ ! -L "$signal_parent_one" ] \
+      || signal_cleanup_pass=false
+    [ -d "$signal_parent_two" ] && [ ! -L "$signal_parent_two" ] \
+      || signal_cleanup_pass=false
+  fi
+  if [ "$signal_cleanup_pass" = true ]; then
+    pass "$signal_token interruption removes only invocation-created managed state"
+  else
+    fail "$signal_token interruption removes only invocation-created managed state"
+  fi
+done
+
+while IFS='|' read -r selective_name selective_tools selective_links selective_kind; do
+  run_selective_managed_case \
+    "$selective_name" "$selective_tools" "$selective_links" "$selective_kind"
+done <<'SELECTIVE_CASES'
+bash-only|node,npm,vscode-json-language-server,lua-language-server,pyright-langserver,yaml-language-server,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd|bash-language-server|npm
+json-only|node,npm,bash-language-server,lua-language-server,pyright-langserver,yaml-language-server,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd|vscode-json-language-server|npm
+lua-only|node,npm,bash-language-server,vscode-json-language-server,pyright-langserver,yaml-language-server,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd|lua-language-server|lua
+pyright-only|node,npm,bash-language-server,vscode-json-language-server,lua-language-server,yaml-language-server,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd|pyright-langserver|npm
+yaml-only|node,npm,bash-language-server,vscode-json-language-server,lua-language-server,pyright-langserver,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd|yaml-language-server|npm
+json-and-pyright|node,npm,bash-language-server,lua-language-server,yaml-language-server,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd|vscode-json-language-server,pyright-langserver|npm
+SELECTIVE_CASES
+
+idempotent_home=$test_tmp/managed-x86_64-home
+idempotent_root=$test_tmp/managed-idempotent
+idempotent_bin=$idempotent_root/bin
+idempotent_log=$idempotent_root/commands
+mkdir -p "$idempotent_bin"
+printf '%s\n' '#!/bin/sh' "printf '%s\\n' 'install ok installed'" \
+  >"$idempotent_bin/dpkg-query"
+printf '%s\n' '#!/bin/sh' 'exit 0' >"$idempotent_bin/apt-cache"
+chmod 0755 "$idempotent_bin/dpkg-query" "$idempotent_bin/apt-cache"
+idempotent_before=$(managed_tree_digest "$idempotent_home")
+run_capture "$idempotent_root/output" env \
+  PATH="$idempotent_bin:/usr/bin:/bin" \
+  HOME="$idempotent_home" \
+  XDG_STATE_HOME="$idempotent_root/state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS='node,npm,bash-language-server,vscode-json-language-server,lua-language-server,pyright-langserver,yaml-language-server,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd' \
+  DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+  DOTFILES_BOOTSTRAP_TEST_REAL_MANAGED_INSTALL=1 \
+  DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT="$managed_fixture_download" \
+  DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$idempotent_log" \
+  "$managed_fixture_root/bootstrap" --apply
+idempotent_status=$run_status
+idempotent_after=$(managed_tree_digest "$idempotent_home")
+if [ "$idempotent_status" -eq 0 ] \
+  && [ "$idempotent_before" = "$idempotent_after" ] \
+  && [ ! -e "$idempotent_log" ]; then
+  pass 'completed managed provisioning is byte-stable and performs no work on rerun'
+else
+  fail 'completed managed provisioning is byte-stable and performs no work on rerun'
+  printf '  status: %s\n  digest before: %s\n  digest after: %s\n' \
+    "$idempotent_status" "$idempotent_before" "$idempotent_after" >&2
+  if [ -e "$idempotent_log" ]; then
+    sed 's/^/  command: /' "$idempotent_log" >&2
+  fi
+  sed 's/^/  output: /' "$idempotent_root/output" >&2
+fi
 
 pacman_apply_log=$test_tmp/pacman-apply.commands
 run_capture "$test_tmp/pacman-apply.output" env \
@@ -1859,10 +3325,16 @@ run_capture "$test_tmp/failure-apply.output" env \
   DOTFILES_BOOTSTRAP_TESTING=1 \
   DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
   DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
-  DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+  DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS= \
+  DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+  DOTFILES_BOOTSTRAP_TEST_REAL_MANAGED_INSTALL=1 \
+  DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT="$managed_fixture_download" \
+  DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$test_tmp/failure.commands" \
   DOTFILES_BOOTSTRAP_TEST_RUN_ID=forced-failure \
   DOTFILES_BOOTSTRAP_TEST_FAIL_AFTER_CHECKOUT=1 \
-  "$bootstrap" --apply --repo "$fixture_repo" --ref main
+  "$managed_fixture_root/bootstrap" --apply --repo "$fixture_repo" --ref main
+failure_apply_output=$(cat "$test_tmp/failure-apply.output")
 if [ "$run_status" -ne 0 ]; then
   pass 'a forced post-checkout failure exits unsuccessfully'
 else
@@ -1878,6 +3350,23 @@ if [ "$(cat "$failure_state/dotfiles-bootstrap/forced-failure/status" 2>/dev/nul
   pass 'automatic rollback is recorded in the transaction journal'
 else
   fail 'automatic rollback is recorded in the transaction journal'
+fi
+if printf '%s\n' "$failure_apply_output" \
+  | grep -Fq 'Packages are not uninstalled by rollback.' \
+  && retained_language_server_actions_are_present "$failure_apply_output"; then
+  pass 'automatic rollback reports every retained managed language-server action'
+else
+  fail 'automatic rollback reports every retained managed language-server action'
+fi
+failure_node_directory=$failure_home/.local/opt/node-24.19.0-x86_64
+failure_lua_directory=$failure_home/.local/opt/lua-language-server-3.19.1-x86_64
+failure_npm_directory=$failure_home/.local/opt/dotfiles-lsp-node-$actual_npm_lock_sha256
+if [ -d "$failure_node_directory" ] \
+  && [ -d "$failure_lua_directory" ] \
+  && [ -d "$failure_npm_directory" ]; then
+  pass 'configuration rollback retains managed language-tool directories'
+else
+  fail 'configuration rollback retains managed language-tool directories'
 fi
 
 signal_home=$test_tmp/signal-home
@@ -2137,7 +3626,8 @@ package_report=$(cat "$package_report_state/dotfiles-bootstrap/package-report/pa
 if printf '%s\n' "$package_report" | grep -Fq 'apt git' \
   && printf '%s\n' "$package_report" | grep -Fq 'apt i3-wm' \
   && printf '%s\n' "$package_report" | grep -Fq 'direct neovim' \
-  && printf '%s\n' "$package_report" | grep -Fq 'community ghostty'; then
+  && printf '%s\n' "$package_report" | grep -Fq 'community ghostty' \
+  && retained_language_server_actions_are_present "$package_report"; then
   pass 'transaction journals every package installation path'
 else
   fail 'transaction journals every package installation path'
@@ -2153,7 +3643,8 @@ package_rollback_output=$(cat "$test_tmp/package-report-rollback.output")
 if [ "$run_status" -eq 0 ] \
   && printf '%s\n' "$package_rollback_output" | grep -Fq 'apt git' \
   && printf '%s\n' "$package_rollback_output" | grep -Fq 'apt i3-wm' \
-  && printf '%s\n' "$package_rollback_output" | grep -Fq 'community ghostty'; then
+  && printf '%s\n' "$package_rollback_output" | grep -Fq 'community ghostty' \
+  && retained_language_server_actions_are_present "$package_rollback_output"; then
   pass 'rollback reports the retained package actions by name'
 else
   fail 'rollback reports the retained package actions by name'

@@ -595,6 +595,45 @@ tool_is_satisfied() {
   version_at_least "$installed_version" "$required_version"
 }
 
+stop_stdio_probe() {
+  stopping_probe_pid=$1
+  [ -n "$stopping_probe_pid" ] || return 0
+  kill "$stopping_probe_pid" >/dev/null 2>&1 || true
+  if kill -0 "$stopping_probe_pid" >/dev/null 2>&1; then
+    sleep 1
+  fi
+  if kill -0 "$stopping_probe_pid" >/dev/null 2>&1; then
+    kill -KILL "$stopping_probe_pid" >/dev/null 2>&1 || true
+  fi
+  if [ "$active_probe_pid" = "$stopping_probe_pid" ]; then
+    active_probe_pid=
+  fi
+  wait "$stopping_probe_pid" >/dev/null 2>&1 || true
+}
+
+replay_pending_transaction_signal() {
+  [ -n "$pending_transaction_signal_name" ] || return 0
+  replayed_signal_name=$pending_transaction_signal_name
+  replayed_signal_code=$pending_transaction_signal_code
+  trap '' HUP INT TERM
+  pending_transaction_signal_name=
+  pending_transaction_signal_code=
+  exit_for_transaction_signal "$replayed_signal_name" "$replayed_signal_code"
+}
+
+begin_cleanup_registration_critical() {
+  [ "$cleanup_registration_critical" = false ] \
+    || die 'cleanup registration critical section is already active'
+  cleanup_registration_critical=true
+}
+
+finish_cleanup_registration_critical() {
+  [ "$cleanup_registration_critical" = true ] \
+    || die 'cleanup registration critical section is not active'
+  cleanup_registration_critical=false
+  replay_pending_transaction_signal
+}
+
 stdio_server_is_satisfied() {
   stdio_command=$1
   shift
@@ -612,8 +651,13 @@ stdio_server_is_satisfied() {
   fi
 
   command -v "$stdio_command" >/dev/null 2>&1 || return 1
-  stdio_probe_tmp=$(temporary_directory) || return 1
+  begin_cleanup_registration_critical
+  stdio_probe_tmp=$(temporary_directory) || {
+    finish_cleanup_registration_critical
+    return 1
+  }
   active_probe_tmp=$stdio_probe_tmp
+  finish_cleanup_registration_critical
   stdio_probe_fifo=$stdio_probe_tmp/stdin
   mkfifo "$stdio_probe_fifo" || {
     remove_temporary_directory "$stdio_probe_tmp"
@@ -621,13 +665,14 @@ stdio_server_is_satisfied() {
     return 1
   }
 
+  begin_cleanup_registration_critical
   "$stdio_command" "$@" <"$stdio_probe_fifo" \
     >"$stdio_probe_tmp/stdout" 2>"$stdio_probe_tmp/stderr" &
-  stdio_probe_pid=$!
-  active_probe_pid=$stdio_probe_pid
+  active_probe_pid=$!
+  stdio_probe_pid=$active_probe_pid
+  finish_cleanup_registration_critical
   exec 3>"$stdio_probe_fifo" || {
-    kill "$stdio_probe_pid" >/dev/null 2>&1 || true
-    wait "$stdio_probe_pid" >/dev/null 2>&1 || true
+    stop_stdio_probe "$stdio_probe_pid"
     remove_temporary_directory "$stdio_probe_tmp"
     active_probe_pid=
     active_probe_tmp=
@@ -636,18 +681,11 @@ stdio_server_is_satisfied() {
   sleep 1
   if kill -0 "$stdio_probe_pid" >/dev/null 2>&1; then
     stdio_probe_result=0
-    kill "$stdio_probe_pid" >/dev/null 2>&1 || true
   else
     stdio_probe_result=1
   fi
   exec 3>&-
-  if kill -0 "$stdio_probe_pid" >/dev/null 2>&1; then
-    sleep 1
-  fi
-  if kill -0 "$stdio_probe_pid" >/dev/null 2>&1; then
-    kill -KILL "$stdio_probe_pid" >/dev/null 2>&1 || true
-  fi
-  wait "$stdio_probe_pid" >/dev/null 2>&1 || true
+  stop_stdio_probe "$stdio_probe_pid"
   active_probe_pid=
   remove_temporary_directory "$stdio_probe_tmp"
   active_probe_tmp=
@@ -1105,6 +1143,109 @@ managed_created_path_is_allowed() {
   return 1
 }
 
+begin_managed_publication_critical() {
+  [ "$managed_publication_critical" = false ] \
+    || die 'managed publication critical section is already active'
+  managed_publication_critical=true
+  managed_unjournaled_path=
+  managed_unjournaled_kind=
+}
+
+track_managed_unjournaled_path() {
+  [ "$managed_publication_critical" = true ] \
+    || die 'managed publication path was created outside its critical section'
+  [ -z "$managed_unjournaled_path" ] \
+    || die 'managed publication already has an unjournaled path'
+  managed_unjournaled_path=$1
+  managed_unjournaled_kind=$2
+  case "$managed_unjournaled_kind" in
+    parent|directory|file) ;;
+    *) die "unsupported managed publication path kind: $managed_unjournaled_kind" ;;
+  esac
+}
+
+clear_managed_unjournaled_path() {
+  managed_unjournaled_path=
+  managed_unjournaled_kind=
+}
+
+finish_managed_publication_critical() {
+  [ "$managed_publication_critical" = true ] \
+    || die 'managed publication critical section is not active'
+  managed_publication_critical=false
+  replay_pending_transaction_signal
+}
+
+complete_managed_publication_critical() {
+  [ -n "$managed_unjournaled_path" ] \
+    || die 'managed publication has no path to journal'
+  record_managed_created_path "$managed_unjournaled_path"
+  clear_managed_unjournaled_path
+  finish_managed_publication_critical
+}
+
+fail_managed_publication_critical() {
+  managed_publication_error=$1
+  finish_managed_publication_critical
+  die "$managed_publication_error"
+}
+
+remove_managed_unjournaled_path() {
+  [ -n "$managed_unjournaled_path" ] || return 0
+  cleanup_unjournaled_path=$managed_unjournaled_path
+  cleanup_unjournaled_kind=$managed_unjournaled_kind
+  if ! managed_created_path_is_allowed "$cleanup_unjournaled_path"; then
+    printf 'bootstrap: refusing unjournaled managed cleanup for unexpected path: %s\n' \
+      "$cleanup_unjournaled_path" >&2
+    return 1
+  fi
+
+  unjournaled_cleanup_status=0
+  case "$cleanup_unjournaled_kind" in
+    parent)
+      if path_exists "$cleanup_unjournaled_path"; then
+        rmdir "$cleanup_unjournaled_path" >/dev/null 2>&1 \
+          || unjournaled_cleanup_status=1
+      fi
+      ;;
+    directory)
+      if path_exists "$cleanup_unjournaled_path"; then
+        if [ -d "$cleanup_unjournaled_path" ] \
+          && [ ! -L "$cleanup_unjournaled_path" ]; then
+          rm -rf -- "$cleanup_unjournaled_path" \
+            || unjournaled_cleanup_status=1
+        else
+          printf 'bootstrap: refusing unjournaled managed directory cleanup for changed path: %s\n' \
+            "$cleanup_unjournaled_path" >&2
+          unjournaled_cleanup_status=1
+        fi
+      fi
+      ;;
+    file)
+      if path_exists "$cleanup_unjournaled_path"; then
+        if [ -d "$cleanup_unjournaled_path" ] \
+          && [ ! -L "$cleanup_unjournaled_path" ]; then
+          printf 'bootstrap: refusing unjournaled managed file cleanup for changed path: %s\n' \
+            "$cleanup_unjournaled_path" >&2
+          unjournaled_cleanup_status=1
+        else
+          rm -f -- "$cleanup_unjournaled_path" \
+            || unjournaled_cleanup_status=1
+        fi
+      fi
+      ;;
+    *)
+      printf 'bootstrap: refusing unjournaled managed cleanup for unsupported path kind: %s\n' \
+        "$cleanup_unjournaled_kind" >&2
+      unjournaled_cleanup_status=1
+      ;;
+  esac
+  if [ "$unjournaled_cleanup_status" -eq 0 ]; then
+    clear_managed_unjournaled_path
+  fi
+  return "$unjournaled_cleanup_status"
+}
+
 remove_managed_created_paths() {
   [ -n "$managed_created_paths_file" ] || return 0
   [ -r "$managed_created_paths_file" ] || return 0
@@ -1176,9 +1317,13 @@ create_managed_parent_directory() {
   parent_path=$1
   require_managed_parent_directory "$parent_path"
   if ! path_exists "$parent_path"; then
-    mkdir "$parent_path" \
-      || die "could not create managed language-tool parent: $parent_path"
-    record_managed_created_path "$parent_path"
+    begin_managed_publication_critical
+    if ! mkdir "$parent_path"; then
+      fail_managed_publication_critical \
+        "could not create managed language-tool parent: $parent_path"
+    fi
+    track_managed_unjournaled_path "$parent_path" parent
+    complete_managed_publication_critical
   fi
 }
 
@@ -1187,13 +1332,22 @@ publish_managed_directory() {
   publish_target=$2
   publication_token=$3
   require_managed_target_free "$publish_target"
-  mv --no-clobber --no-target-directory "$publish_source" "$publish_target" \
-    || die "could not publish managed language-tool directory: $publish_target"
-  [ ! -e "$publish_source" ] && [ ! -L "$publish_source" ] \
-    || die "managed language-tool directory was not published: $publish_target"
-  [ -d "$publish_target" ] && [ ! -L "$publish_target" ] \
-    || die "managed language-tool directory has an unexpected type: $publish_target"
-  record_managed_created_path "$publish_target"
+  begin_managed_publication_critical
+  if ! mv --no-clobber --no-target-directory \
+    "$publish_source" "$publish_target"; then
+    fail_managed_publication_critical \
+      "could not publish managed language-tool directory: $publish_target"
+  fi
+  track_managed_unjournaled_path "$publish_target" directory
+  if [ -e "$publish_source" ] || [ -L "$publish_source" ]; then
+    fail_managed_publication_critical \
+      "managed language-tool directory was not published: $publish_target"
+  fi
+  if [ ! -d "$publish_target" ] || [ -L "$publish_target" ]; then
+    fail_managed_publication_critical \
+      "managed language-tool directory has an unexpected type: $publish_target"
+  fi
+  complete_managed_publication_critical
   maybe_fail_managed_publication "$publication_token"
 }
 
@@ -1201,9 +1355,13 @@ publish_managed_link() {
   link_source=$1
   link_target=$2
   require_managed_target_free "$link_target"
-  ln -s "$link_source" "$link_target" \
-    || die "could not publish managed language-tool link: $link_target"
-  record_managed_created_path "$link_target"
+  begin_managed_publication_critical
+  if ! ln -s "$link_source" "$link_target"; then
+    fail_managed_publication_critical \
+      "could not publish managed language-tool link: $link_target"
+  fi
+  track_managed_unjournaled_path "$link_target" file
+  complete_managed_publication_critical
 }
 
 record_managed_language_server_actions() {
@@ -1258,16 +1416,26 @@ publish_debian_language_servers() {
   fi
   if [ "$managed_lua_required" = true ]; then
     require_managed_target_free "$HOME/.local/bin/lua-language-server"
-    mv --no-clobber --no-target-directory \
+    begin_managed_publication_critical
+    if ! mv --no-clobber --no-target-directory \
       "$publish_stage_root/lua-language-server.wrapper" \
-      "$HOME/.local/bin/lua-language-server" \
-      || die 'could not publish the managed LuaLS wrapper'
-    [ ! -e "$publish_stage_root/lua-language-server.wrapper" ] \
-      || die 'managed LuaLS wrapper was not published'
-    [ -x "$HOME/.local/bin/lua-language-server" ] \
-      && [ ! -L "$HOME/.local/bin/lua-language-server" ] \
-      || die 'managed LuaLS wrapper has an unexpected type'
-    record_managed_created_path "$HOME/.local/bin/lua-language-server"
+      "$HOME/.local/bin/lua-language-server"; then
+      fail_managed_publication_critical \
+        'could not publish the managed LuaLS wrapper'
+    fi
+    track_managed_unjournaled_path \
+      "$HOME/.local/bin/lua-language-server" file
+    if [ -e "$publish_stage_root/lua-language-server.wrapper" ] \
+      || [ -L "$publish_stage_root/lua-language-server.wrapper" ]; then
+      fail_managed_publication_critical \
+        'managed LuaLS wrapper was not published'
+    fi
+    if [ ! -x "$HOME/.local/bin/lua-language-server" ] \
+      || [ -L "$HOME/.local/bin/lua-language-server" ]; then
+      fail_managed_publication_critical \
+        'managed LuaLS wrapper has an unexpected type'
+    fi
+    complete_managed_publication_critical
   fi
   if [ "$managed_bash_required" = true ]; then
     publish_managed_link \
@@ -1318,9 +1486,13 @@ install_debian_language_servers() {
     return 0
   fi
 
-  managed_stage_root=$(temporary_directory) \
-    || die 'could not create managed language-server staging storage'
+  begin_cleanup_registration_critical
+  managed_stage_root=$(temporary_directory) || {
+    finish_cleanup_registration_critical
+    die 'could not create managed language-server staging storage'
+  }
   active_package_tmp=$managed_stage_root
+  finish_cleanup_registration_critical
   if [ "$managed_node_required" = true ]; then
     stage_node_runtime "$debian_manifest_root" "$managed_stage_root"
   else
@@ -1697,7 +1869,7 @@ prepare_debian_language_servers() {
 
   if [ "$managed_node_required" = true ] \
     || [ "$managed_lua_required" = true ]; then
-    managed_architecture=$(normalized_architecture)
+    managed_architecture=$(normalized_architecture) || exit $?
   fi
   if [ "$managed_node_required" = true ]; then
     managed_node_target=$HOME/.local/opt/node-24.19.0-$managed_architecture
@@ -2786,7 +2958,7 @@ run_manual_rollback() {
     || die "rollback failed for transaction: $requested_id"
 }
 
-handle_transaction_signal() {
+exit_for_transaction_signal() {
   signal_name=$1
   signal_code=$2
   if [ "$transaction_active" = true ]; then
@@ -2797,12 +2969,27 @@ handle_transaction_signal() {
   exit "$signal_code"
 }
 
+handle_transaction_signal() {
+  signal_name=$1
+  signal_code=$2
+  if [ "$managed_publication_critical" = true ] \
+    || [ "$cleanup_registration_critical" = true ] \
+    || [ -n "$pending_transaction_signal_name" ]; then
+    if [ -z "$pending_transaction_signal_name" ]; then
+      pending_transaction_signal_name=$signal_name
+      pending_transaction_signal_code=$signal_code
+    fi
+    return 0
+  fi
+  exit_for_transaction_signal "$signal_name" "$signal_code"
+}
+
 handle_process_exit() {
-  process_status=$?
-  trap - 0 HUP INT TERM
+  trap '' 0 HUP INT TERM
+  process_status=$1
   if [ -n "$active_probe_pid" ]; then
-    kill "$active_probe_pid" >/dev/null 2>&1 || true
-    wait "$active_probe_pid" >/dev/null 2>&1 || true
+    exec 3>&-
+    stop_stdio_probe "$active_probe_pid"
     active_probe_pid=
   fi
   if [ -n "$active_probe_tmp" ] && [ -d "$active_probe_tmp" ]; then
@@ -2810,7 +2997,14 @@ handle_process_exit() {
     active_probe_tmp=
   fi
   if [ "$process_status" -ne 0 ] && [ "$managed_publish_active" = true ]; then
+    managed_cleanup_incomplete=false
+    if ! remove_managed_unjournaled_path; then
+      managed_cleanup_incomplete=true
+    fi
     if ! remove_managed_created_paths; then
+      managed_cleanup_incomplete=true
+    fi
+    if [ "$managed_cleanup_incomplete" = true ]; then
       printf '%s\n' \
         'bootstrap: managed language-tool cleanup was incomplete; inspect the reported exact paths' >&2
     fi
@@ -2867,12 +3061,18 @@ managed_npm_target=
 managed_lock_sha256=
 managed_publish_active=false
 managed_created_paths_file=
+managed_publication_critical=false
+managed_unjournaled_path=
+managed_unjournaled_kind=
+cleanup_registration_critical=false
+pending_transaction_signal_name=
+pending_transaction_signal_code=
 selected_node=
 selected_npm=
 active_probe_tmp=
 active_probe_pid=
 
-trap handle_process_exit 0
+trap 'handle_process_exit "$?"' 0
 trap 'handle_transaction_signal HUP 129' HUP
 trap 'handle_transaction_signal INT 130' INT
 trap 'handle_transaction_signal TERM 143' TERM
