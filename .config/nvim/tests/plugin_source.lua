@@ -164,6 +164,7 @@ end
 
 local tags_allowed = {
   ["fzf-lua"] = true,
+  ["jupytext.nvim"] = true,
   ["lazy.nvim"] = true,
   ["mini.icons"] = true,
   ["mini.pairs"] = true,
@@ -171,6 +172,7 @@ local tags_allowed = {
   ["mini.surround"] = true,
   ["nvim-treesitter"] = true,
   ["oil.nvim"] = true,
+  ["otter.nvim"] = true,
   ["tokyonight.nvim"] = true,
 }
 

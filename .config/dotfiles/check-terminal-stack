@@ -2115,6 +2115,200 @@ nvim_log_has_error() {
   grep -Eq 'Error detected|Error in command line:|Failed to source|E[0-9][0-9][0-9]:' "$1"
 }
 
+run_nvim_notebook_focused_test() {
+  [ "$#" -eq 3 ] || return 2
+  nvim_focused_name=$1
+  nvim_focused_script=$2
+  nvim_focused_expected=$3
+  nvim_focused_root="$check_tmp/nvim-notebook-focused"
+  nvim_focused_output="$nvim_focused_root/$nvim_focused_name.out"
+  nvim_focused_log="$nvim_focused_root/$nvim_focused_name.log"
+
+  if [ ! -d "$nvim_focused_root" ] \
+    && ! (umask 077 && mkdir -p \
+      "$nvim_focused_root/home" \
+      "$nvim_focused_root/config" \
+      "$nvim_focused_root/data" \
+      "$nvim_focused_root/state" \
+      "$nvim_focused_root/cache" \
+      "$nvim_focused_root/runtime"); then
+    fail "could not create checker-owned notebook focused-test directories"
+    return 1
+  fi
+
+  : > "$nvim_focused_log"
+  if env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
+    HOME="$nvim_focused_root/home" \
+    TMPDIR="$check_tmp" \
+    XDG_CONFIG_HOME="$nvim_focused_root/config" \
+    XDG_DATA_HOME="$nvim_focused_root/data" \
+    XDG_STATE_HOME="$nvim_focused_root/state" \
+    XDG_CACHE_HOME="$nvim_focused_root/cache" \
+    XDG_RUNTIME_DIR="$nvim_focused_root/runtime" \
+    NVIM_LOG_FILE="$nvim_focused_log" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    DOTFILES_NVIM_ROOT="$nvim_root" \
+    nvim --clean --headless -u NONE -i NONE \
+    -c 'lua vim.opt.runtimepath:prepend(vim.env.DOTFILES_NVIM_ROOT)' \
+    -l "$nvim_focused_script" \
+    > "$nvim_focused_output" 2>&1 \
+    && ! nvim_log_has_error "$nvim_focused_output" \
+    && grep -Fqx "$nvim_focused_expected" "$nvim_focused_output" \
+    && [ ! -s "$nvim_focused_log" ]; then
+    pass "$nvim_focused_expected"
+    return 0
+  fi
+
+  [ ! -s "$nvim_focused_output" ] \
+    || sed 's/^/      /' "$nvim_focused_output" >&2
+  [ ! -s "$nvim_focused_log" ] \
+    || sed 's/^/      /' "$nvim_focused_log" >&2
+  fail "focused notebook test failed: $nvim_focused_expected"
+  return 1
+}
+
+nvim_notebook_output_is_exact() {
+  [ "$#" -eq 3 ] || return 2
+  nvim_notebook_inspect_path=$1
+  nvim_notebook_inspect_value=$2
+  nvim_notebook_inspect_mode=$3
+
+  PYTHONDONTWRITEBYTECODE=1 "$notebook_editor_python" -c \
+    'import nbformat,sys; notebook=nbformat.read(sys.argv[1],as_version=4); nbformat.validate(notebook); cells=[cell for cell in notebook.cells if cell.cell_type=="code"]; assert len(cells)==1; cell=cells[0]; expected=sys.argv[2]; assert cell.source==f"print({expected})\n"; assert len(cell.outputs)==1; output=cell.outputs[0]; mode=sys.argv[3]; assert output.output_type in ({"stream"} if mode=="stored" else {"stream","display_data"}); value=None; assert output.output_type!="stream" or output.get("name")=="stdout"; value=output.get("text") if output.output_type=="stream" else output.get("data",{}).get("text/plain"); parts=[value] if isinstance(value,str) else value; assert isinstance(parts,list) and all(isinstance(part,str) for part in parts); assert "".join(parts)==f"{expected}\n"' \
+    "$nvim_notebook_inspect_path" "$nvim_notebook_inspect_value" \
+    "$nvim_notebook_inspect_mode"
+}
+
+nvim_editor_python_versions_are_exact() {
+  [ "$#" -eq 2 ] || return 2
+  nvim_editor_probe_python=$1
+  nvim_editor_probe_pynvim=$2
+
+  PYTHONDONTWRITEBYTECODE=1 "$nvim_editor_probe_python" -c \
+    'import importlib.metadata as m,sys; expected={"pynvim":sys.argv[1],"jupyter_client":"8.9.1","nbformat":"5.11.0","jupytext":"1.19.5","ipykernel":"7.3.0"}; actual={name:m.version(name) for name in expected}; assert actual == expected, (actual, expected)' \
+    "$nvim_editor_probe_pynvim"
+}
+
+run_nvim_notebook_roundtrip() {
+  [ "$#" -eq 6 ] || return 2
+  nvim_roundtrip_name=$1
+  nvim_roundtrip_notebook=$2
+  nvim_roundtrip_invalid=$3
+  nvim_roundtrip_ordinary=$4
+  nvim_roundtrip_live=$5
+  nvim_roundtrip_label=$6
+  nvim_roundtrip_output="$check_tmp/nvim-roundtrip-$nvim_roundtrip_name.out"
+  nvim_roundtrip_log="$check_tmp/nvim-roundtrip-$nvim_roundtrip_name.log"
+  nvim_roundtrip_inspect="$check_tmp/nvim-roundtrip-$nvim_roundtrip_name.inspect"
+  nvim_roundtrip_status_file="$check_tmp/nvim-roundtrip-$nvim_roundtrip_name.status"
+  if ! nvim_roundtrip_invalid_before=$(cksum "$nvim_roundtrip_invalid" \
+    | awk '{ print $1 ":" $2 }'); then
+    fail "$nvim_roundtrip_label"
+    return 1
+  fi
+
+  # The pinned Kitty transport accepts a pipe-backed stdout but rejects a
+  # regular file descriptor. Capture through sed while recording Neovim's
+  # status separately so the real image.nvim backend remains under test.
+  : > "$nvim_roundtrip_log"
+  (
+    env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
+      HOME="$check_tmp/nvim-notebook-home" \
+      TMPDIR="$check_tmp" \
+      VIRTUAL_ENV="$nvim_data_root/notebook-python" \
+      XDG_CONFIG_HOME="$config_root" \
+      XDG_DATA_HOME="$data_home" \
+      XDG_STATE_HOME="$XDG_STATE_HOME" \
+      XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+      XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+      JUPYTER_RUNTIME_DIR="$check_tmp/jupyter-runtime" \
+      NVIM_LOG_FILE="$nvim_roundtrip_log" \
+      PYTHONDONTWRITEBYTECODE=1 \
+      TERM_PROGRAM=ghostty \
+      DOTFILES_NVIM_SKIP_PARSER_INSTALL=1 \
+      DOTFILES_NOTEBOOK_FIXTURE="$nvim_roundtrip_notebook" \
+      DOTFILES_NOTEBOOK_INVALID="$nvim_roundtrip_invalid" \
+      DOTFILES_NOTEBOOK_ORDINARY="$nvim_roundtrip_ordinary" \
+      DOTFILES_NOTEBOOK_TEST_SCRIPT="$nvim_root/tests/notebook_roundtrip.lua" \
+      DOTFILES_NOTEBOOK_LIVE_KERNEL="$nvim_roundtrip_live" \
+      nvim --headless -i NONE \
+      -c 'lua vim.defer_fn(function() vim.api.nvim_err_writeln("notebook round trip exceeded 45 seconds"); vim.cmd("cquit 124") end, 45000)' \
+      -c 'lua local plugins = require("lazy.core.config").plugins; local image = assert(plugins["image.nvim"], "image.nvim spec is unavailable"); assert(type(image.opts) == "table" and image.opts.backend == "kitty", "image.nvim must retain the Kitty backend"); assert(vim.g.molten_image_provider == "image.nvim", "Molten must retain the image.nvim provider"); assert(not image._.loaded, "image.nvim loaded before the notebook opened")' \
+      -c 'lua vim.cmd.edit(vim.fn.fnameescape(vim.env.DOTFILES_NOTEBOOK_ORDINARY))' \
+      -c 'lua dofile(vim.env.DOTFILES_NOTEBOOK_TEST_SCRIPT); io.stdout:write("\nnotebook round-trip assertions: ok\n"); io.stdout:flush()' \
+      -c qa
+    nvim_roundtrip_child_status=$?
+    printf '%s\n' "$nvim_roundtrip_child_status" \
+      > "$nvim_roundtrip_status_file"
+  ) 2>&1 | sed -n 'p' > "$nvim_roundtrip_output"
+  nvim_roundtrip_capture_status=$?
+  printf '\n' >> "$nvim_roundtrip_output"
+  nvim_roundtrip_nvim_status=""
+  if [ -r "$nvim_roundtrip_status_file" ]; then
+    IFS= read -r nvim_roundtrip_nvim_status \
+      < "$nvim_roundtrip_status_file" || nvim_roundtrip_nvim_status=""
+  fi
+  rm -f "$nvim_roundtrip_status_file"
+
+  if [ "$nvim_roundtrip_capture_status" -eq 0 ] \
+    && [ "$nvim_roundtrip_nvim_status" = 0 ] \
+    && ! nvim_log_has_error "$nvim_roundtrip_output" \
+    && grep -Fqx 'notebook round-trip assertions: ok' "$nvim_roundtrip_output" \
+    && [ ! -s "$nvim_roundtrip_log" ]; then
+    nvim_roundtrip_run_ok=true
+  else
+    nvim_roundtrip_run_ok=false
+  fi
+
+  if [ "$nvim_roundtrip_live" = 1 ]; then
+    nvim_roundtrip_expected=42
+    nvim_roundtrip_shape=live
+  else
+    nvim_roundtrip_expected=41
+    nvim_roundtrip_shape=stored
+  fi
+  if ! nvim_notebook_output_is_exact \
+    "$nvim_roundtrip_notebook" "$nvim_roundtrip_expected" \
+    "$nvim_roundtrip_shape" > "$nvim_roundtrip_inspect" 2>&1; then
+    nvim_roundtrip_run_ok=false
+  fi
+
+  nvim_roundtrip_invalid_after=$(cksum "$nvim_roundtrip_invalid" \
+    | awk '{ print $1 ":" $2 }') || nvim_roundtrip_run_ok=false
+  if [ "$nvim_roundtrip_invalid_after" != "$nvim_roundtrip_invalid_before" ]; then
+    nvim_roundtrip_run_ok=false
+  fi
+
+  nvim_roundtrip_directory=${nvim_roundtrip_notebook%/*}
+  nvim_roundtrip_basename=${nvim_roundtrip_notebook##*/}
+  nvim_roundtrip_sidecar=${nvim_roundtrip_notebook%.ipynb}.md
+  for nvim_roundtrip_artifact in \
+    "$nvim_roundtrip_sidecar" \
+    "$nvim_roundtrip_directory/.notebook-roundtrip-probe.ipynb" \
+    "$nvim_roundtrip_directory/.$nvim_roundtrip_basename.nvim-molten."*.ipynb
+  do
+    if [ -e "$nvim_roundtrip_artifact" ] || [ -L "$nvim_roundtrip_artifact" ]; then
+      printf '      unexpected notebook artifact: %s\n' \
+        "$nvim_roundtrip_artifact" >&2
+      nvim_roundtrip_run_ok=false
+    fi
+  done
+
+  if [ "$nvim_roundtrip_run_ok" = true ]; then
+    pass "$nvim_roundtrip_label"
+    return 0
+  fi
+
+  [ ! -s "$nvim_roundtrip_output" ] \
+    || sed 's/^/      /' "$nvim_roundtrip_output" >&2
+  [ ! -s "$nvim_roundtrip_log" ] \
+    || sed 's/^/      /' "$nvim_roundtrip_log" >&2
+  [ ! -s "$nvim_roundtrip_inspect" ] \
+    || sed 's/^/      /' "$nvim_roundtrip_inspect" >&2
+  fail "$nvim_roundtrip_label"
+  return 1
+}
+
 require_terminfo_capability() {
   terminfo_file=$1
   terminfo_name=$2
@@ -2146,7 +2340,7 @@ nvim_lock_is_exact() {
   [ "$#" -eq 1 ] || return 2
 
   jq -e '
-    keys == ["fzf-lua", "lazy.nvim", "mini.icons", "mini.pairs", "mini.starter", "mini.surround", "nvim-treesitter", "oil.nvim", "smart-splits.nvim", "tokyonight.nvim"]
+    keys == ["fzf-lua", "image.nvim", "jupytext.nvim", "lazy.nvim", "mini.icons", "mini.pairs", "mini.starter", "mini.surround", "molten-nvim", "nvim-treesitter", "oil.nvim", "otter.nvim", "quarto-nvim", "smart-splits.nvim", "tokyonight.nvim"]
     and all(.[];
       if type == "object" then
         ((.commit? | type) == "string")
@@ -2262,6 +2456,9 @@ nvim_plugin_generated_tags_are_exact() {
     fzf-lua)
       nvim_tags_sources='doc/fzf-lua-opts.txt doc/fzf-lua.txt'
       ;;
+    jupytext.nvim)
+      nvim_tags_sources='doc/jupytext.txt'
+      ;;
     mini.icons)
       nvim_tags_sources='doc/mini-icons.txt'
       ;;
@@ -2276,6 +2473,9 @@ nvim_plugin_generated_tags_are_exact() {
       ;;
     oil.nvim)
       nvim_tags_sources='doc/oil.txt'
+      ;;
+    otter.nvim)
+      nvim_tags_sources='doc/otter.nvim.txt'
       ;;
     nvim-treesitter)
       nvim_tags_sources='doc/nvim-treesitter.txt'
@@ -2430,7 +2630,7 @@ nvim_plugin_source_is_exact() {
   fi
 
   case "$nvim_source_name" in
-    lazy.nvim|fzf-lua|oil.nvim|nvim-treesitter|tokyonight.nvim)
+    lazy.nvim|fzf-lua|jupytext.nvim|oil.nvim|otter.nvim|nvim-treesitter|tokyonight.nvim)
       nvim_source_expected_status='!! doc/tags'
       ;;
     mini.icons|mini.pairs|mini.starter|mini.surround)
@@ -2524,13 +2724,18 @@ nvim_trust_write_lock_fixture() {
   printf '%s\n' \
     '{' \
     '  "fzf-lua": {"branch":"main","commit":"28440c741e927592877514fba3db21eb188caec8"},' \
+    '  "image.nvim": {"commit":"da2be65c153ba15a14a342b05591652a6df70d58"},' \
+    '  "jupytext.nvim": {"commit":"2e86acfa4345f611c86f57116db0c06ffecb721d"},' \
     '  "lazy.nvim": {"branch":"main","commit":"306a05526ada86a7b30af95c5cc81ffba93fef97"},' \
     "  \"mini.icons\": $nvim_lock_fixture_mini," \
     '  "mini.pairs": {"branch":"main","commit":"4a014143fcb4e9df26198ccb3ecff3b9e77a048c"},' \
     '  "mini.starter": {"branch":"main","commit":"2222222222222222222222222222222222222222"},' \
     '  "mini.surround": {"branch":"main","commit":"580e4cb98c5900d9fe743865fb5a5b2178b4ab18"},' \
+    '  "molten-nvim": {"commit":"a286aa914d9a154bc359131aab788b5a077a5a99"},' \
     '  "nvim-treesitter": {"branch":"main","commit":"3d3321b560a63ff92a8692401f303a5123336b86"},' \
     '  "oil.nvim": {"branch":"master","commit":"b73018b75affd13fa38e2fc94ef753b465f770d7"},' \
+    '  "otter.nvim": {"commit":"f4a033d4e2bd86d4f09386a73d3861538601253d"},' \
+    '  "quarto-nvim": {"commit":"17f1e5d664bc615478230dc0240666329efacf9b"},' \
     '  "smart-splits.nvim": {"branch":"master","commit":"ba2850ff3d3b09785a7105c69d06a12117d4b97d"},' \
     "  \"tokyonight.nvim\": $nvim_lock_fixture_tokyonight" \
     "$nvim_lock_fixture_extra" \
@@ -2676,7 +2881,7 @@ run_nvim_trust_self_test() {
     fi
   done
   nvim_trust_expect_accept \
-    "exact ten-object lock is accepted" \
+    "exact fifteen-object lock is accepted" \
     nvim_lock_is_exact "$check_tmp/nvim-lock-valid.json" || true
   nvim_trust_expect_reject \
     "extra lock key is rejected" \
@@ -5490,6 +5695,9 @@ check_tmp=$(mktemp -d "${TMPDIR:-/tmp}/terminal-stack-check.XXXXXX") || exit 1
 check_socket="$check_tmp/tmux.sock"
 tmux_move_socket="$check_tmp/tmux-move.sock"
 git_summary_tmp="$check_tmp/git-summary-tmp"
+NVIM_LOG_FILE="$check_tmp/nvim.log"
+PYTHONDONTWRITEBYTECODE=1
+export NVIM_LOG_FILE PYTHONDONTWRITEBYTECODE
 if ! mkdir -p "$git_summary_tmp"; then
   fail "could not create the checker-owned Git summary TMPDIR"
 fi
@@ -5532,7 +5740,7 @@ printf 'Data root: %s\n\n' "$data_home"
 static_shellcheck_ready=true
 static_stylua_ready=true
 git_security_commands_ready=true
-for required_command in uname awk sed grep cmp mktemp mkfifo wc ps infocmp git env ghostty herdr tmux nvim bash-language-server vscode-json-language-server yaml-language-server lua-language-server pyright-langserver fzf jq shellcheck stylua cksum stat date curl tar tree-sitter; do
+for required_command in uname awk sed grep cmp mktemp mkfifo wc ps infocmp git env ghostty herdr tmux nvim bash-language-server vscode-json-language-server yaml-language-server lua-language-server pyright-langserver fzf jq shellcheck stylua cksum stat date curl tar tree-sitter uv identify convert; do
   if ! require_command "$required_command"; then
     case "$required_command" in
       shellcheck) static_shellcheck_ready=false ;;
@@ -5541,6 +5749,27 @@ for required_command in uname awk sed grep cmp mktemp mkfifo wc ps infocmp git e
     esac
   fi
 done
+
+if command -v magick >/dev/null 2>&1 \
+  || { command -v identify >/dev/null 2>&1 && command -v convert >/dev/null 2>&1; }; then
+  pass "ImageMagick CLI is available"
+else
+  fail "ImageMagick CLI is required for notebook image output"
+fi
+
+uv_version=""
+uv_ready=false
+if command -v uv >/dev/null 2>&1; then
+  uv_version=$(uv --version 2>/dev/null \
+    | sed -n '1s/^uv \([0-9][0-9.]*\).*$/\1/p')
+  if [ -n "$uv_version" ] \
+    && version_at_least "$uv_version" "0.11.6"; then
+    pass "uv version $uv_version"
+    uv_ready=true
+  else
+    fail "uv 0.11.6 or newer required; found ${uv_version:-unknown}"
+  fi
+fi
 
 tree_sitter_version=""
 if command -v tree-sitter >/dev/null 2>&1; then
@@ -5614,14 +5843,22 @@ for static_lint_file in \
   "$nvim_root/lua/integrations/tmux_status.lua" \
   "$nvim_root/lua/navigation/pickers.lua" \
   "$nvim_root/lua/navigation/root.lua" \
+  "$nvim_root/lua/notebook/environment.lua" \
+  "$nvim_root/lua/notebook/health.lua" \
+  "$nvim_root/lua/notebook/python.lua" \
+  "$nvim_root/lua/notebook/save.lua" \
+  "$nvim_root/lua/notebook/workflow.lua" \
   "$nvim_root/lua/plugins/editing.lua" \
   "$nvim_root/lua/plugins/navigation.lua" \
+  "$nvim_root/lua/plugins/notebook.lua" \
   "$nvim_root/lua/plugins/smart-splits.lua" \
   "$nvim_root/lua/plugins/startup.lua" \
   "$nvim_root/lua/plugins/theme.lua" \
   "$nvim_root/lua/plugins/treesitter.lua" \
   "$nvim_root/lua/ui/startup.lua" \
   "$nvim_root/lua/ui/statusline.lua" \
+  "$nvim_root/python/pyproject.toml" \
+  "$nvim_root/python/uv.lock" \
   "$nvim_root/tests/bashls.lua" \
   "$nvim_root/tests/jsonls.lua" \
   "$nvim_root/tests/completion.lua" \
@@ -5629,6 +5866,14 @@ for static_lint_file in \
   "$nvim_root/tests/foundation.lua" \
   "$nvim_root/tests/lsp.lua" \
   "$nvim_root/tests/navigation.lua" \
+  "$nvim_root/tests/notebook_environment.lua" \
+  "$nvim_root/tests/notebook_health.lua" \
+  "$nvim_root/tests/notebook_plugins.lua" \
+  "$nvim_root/tests/notebook_python.lua" \
+  "$nvim_root/tests/notebook_roundtrip.lua" \
+  "$nvim_root/tests/notebook_save.lua" \
+  "$nvim_root/tests/notebook_workflow.lua" \
+  "$nvim_root/tests/fixtures/notebook/stored-output.ipynb" \
   "$nvim_root/tests/oil_trash.lua" \
   "$nvim_root/tests/plugin_source.lua" \
   "$nvim_root/tests/platform.lua" \
@@ -5657,6 +5902,72 @@ if [ "$static_lint_files_ready" = true ]; then
     sed 's/^/      /' "$check_tmp/shell-syntax.txt" >&2
     fail "POSIX shell syntax checks failed or emitted output"
   fi
+fi
+
+notebook_runtime_ready=$uv_ready
+notebook_editor_python="$nvim_data_root/notebook-python/bin/python"
+notebook_editor_jupyter="$nvim_data_root/notebook-python/bin/jupyter"
+notebook_editor_jupytext="$nvim_data_root/notebook-python/bin/jupytext"
+notebook_uv_lock_output="$check_tmp/notebook-uv-lock.txt"
+if command -v uv >/dev/null 2>&1 \
+  && UV_OFFLINE=1 UV_CACHE_DIR="$check_tmp/uv-cache" \
+    uv lock --check --project "$nvim_root/python" \
+    > "$notebook_uv_lock_output" 2>&1; then
+  pass "Neovim notebook Python lock is current"
+else
+  [ ! -s "$notebook_uv_lock_output" ] \
+    || sed 's/^/      /' "$notebook_uv_lock_output" >&2
+  fail "Neovim notebook Python lock is stale; refresh it and run :NotebookBootstrap"
+  notebook_runtime_ready=false
+fi
+
+notebook_editor_probe_output="$check_tmp/notebook-editor-python.txt"
+if [ -x "$notebook_editor_python" ] \
+  && [ -x "$notebook_editor_jupyter" ] \
+  && [ -x "$notebook_editor_jupytext" ] \
+  && nvim_editor_python_versions_are_exact \
+    "$notebook_editor_python" 0.6.0 \
+    > "$notebook_editor_probe_output" 2>&1; then
+  pass "Neovim notebook editor Python environment matches its exact dependency lock"
+else
+  [ ! -s "$notebook_editor_probe_output" ] \
+    || sed 's/^/      /' "$notebook_editor_probe_output" >&2
+  fail "Neovim notebook Python environment is missing or mismatched; run :NotebookBootstrap and restart Neovim"
+  notebook_runtime_ready=false
+fi
+
+notebook_editor_negative_probe="$check_tmp/notebook-editor-python-negative.txt"
+if [ -x "$notebook_editor_python" ]; then
+  if nvim_editor_python_versions_are_exact \
+    "$notebook_editor_python" 0.0.0 \
+    > "$notebook_editor_negative_probe" 2>&1; then
+    fail "Neovim notebook editor Python version probe accepted a mismatch"
+    notebook_runtime_ready=false
+  else
+    pass "Neovim notebook editor Python version probe rejects a mismatch"
+  fi
+fi
+
+if command -v nvim >/dev/null 2>&1 \
+  && [ "$static_lint_files_ready" = true ]; then
+  run_nvim_notebook_focused_test \
+    notebook-python "$nvim_root/tests/notebook_python.lua" \
+    'notebook Python assertions: ok' || true
+  run_nvim_notebook_focused_test \
+    notebook-plugins "$nvim_root/tests/notebook_plugins.lua" \
+    'notebook plugin assertions: ok' || true
+  run_nvim_notebook_focused_test \
+    notebook-environment "$nvim_root/tests/notebook_environment.lua" \
+    'notebook environment assertions: ok' || true
+  run_nvim_notebook_focused_test \
+    notebook-workflow "$nvim_root/tests/notebook_workflow.lua" \
+    'notebook workflow assertions: ok' || true
+  run_nvim_notebook_focused_test \
+    notebook-save "$nvim_root/tests/notebook_save.lua" \
+    'notebook save assertions: ok' || true
+  run_nvim_notebook_focused_test \
+    notebook-health "$nvim_root/tests/notebook_health.lua" \
+    'notebook health assertions: ok' || true
 fi
 
 if [ "$static_shellcheck_ready" = true ] \
@@ -9935,10 +10246,16 @@ for nvim_file in \
   "$nvim_root/lua/config/lsp.lua" \
   "$nvim_root/lua/config/treesitter.lua" \
   "$nvim_root/lua/editing/buffers.lua" \
+  "$nvim_root/lua/notebook/environment.lua" \
+  "$nvim_root/lua/notebook/health.lua" \
+  "$nvim_root/lua/notebook/python.lua" \
+  "$nvim_root/lua/notebook/save.lua" \
+  "$nvim_root/lua/notebook/workflow.lua" \
   "$nvim_root/lua/navigation/root.lua" \
   "$nvim_root/lua/navigation/pickers.lua" \
   "$nvim_root/lua/plugins/editing.lua" \
   "$nvim_root/lua/plugins/navigation.lua" \
+  "$nvim_root/lua/plugins/notebook.lua" \
   "$nvim_root/lua/plugins/smart-splits.lua" \
   "$nvim_root/lua/plugins/startup.lua" \
   "$nvim_root/lua/plugins/theme.lua" \
@@ -9946,6 +10263,8 @@ for nvim_file in \
   "$nvim_root/lua/ui/startup.lua" \
   "$nvim_root/lua/ui/statusline.lua" \
   "$nvim_root/lua/integrations/tmux_status.lua" \
+  "$nvim_root/python/pyproject.toml" \
+  "$nvim_root/python/uv.lock" \
   "$nvim_root/tests/platform.lua" \
   "$nvim_root/tests/bashls.lua" \
   "$nvim_root/tests/jsonls.lua" \
@@ -9954,6 +10273,14 @@ for nvim_file in \
   "$nvim_root/tests/foundation.lua" \
   "$nvim_root/tests/lsp.lua" \
   "$nvim_root/tests/navigation.lua" \
+  "$nvim_root/tests/notebook_environment.lua" \
+  "$nvim_root/tests/notebook_health.lua" \
+  "$nvim_root/tests/notebook_plugins.lua" \
+  "$nvim_root/tests/notebook_python.lua" \
+  "$nvim_root/tests/notebook_roundtrip.lua" \
+  "$nvim_root/tests/notebook_save.lua" \
+  "$nvim_root/tests/notebook_workflow.lua" \
+  "$nvim_root/tests/fixtures/notebook/stored-output.ipynb" \
   "$nvim_root/tests/oil_trash.lua" \
   "$nvim_root/tests/plugin_source.lua" \
   "$nvim_root/tests/pyright.lua" \
@@ -9968,7 +10295,7 @@ do
   fi
 done
 
-approved_nvim_plugins='fzf-lua lazy.nvim mini.icons mini.pairs mini.starter mini.surround nvim-treesitter oil.nvim smart-splits.nvim tokyonight.nvim'
+approved_nvim_plugins='fzf-lua image.nvim jupytext.nvim lazy.nvim mini.icons mini.pairs mini.starter mini.surround molten-nvim nvim-treesitter oil.nvim otter.nvim quarto-nvim smart-splits.nvim tokyonight.nvim'
 mini_icons_dir="$nvim_data_root/lazy/mini.icons"
 oil_dir="$nvim_data_root/lazy/oil.nvim"
 plugins_ready=true
@@ -9992,9 +10319,9 @@ if command -v jq >/dev/null 2>&1 \
   && [ -r "$nvim_root/lazy-lock.json" ] \
   && nvim_lock_is_exact "$nvim_root/lazy-lock.json"; then
   lock_valid=true
-  pass "Neovim lockfile contains exactly ten object-valued pinned plugins"
+  pass "Neovim lockfile contains exactly fifteen object-valued pinned plugins"
 else
-  fail "Neovim lockfile must contain the exact ten-plugin object boundary"
+  fail "Neovim lockfile must contain the exact fifteen-plugin object boundary"
 fi
 
 if [ "$lock_valid" = true ] && [ "$plugins_ready" = true ]; then
@@ -10034,7 +10361,7 @@ if [ "$nvim_config_ready" = true ] \
   && [ "$plugin_revisions_match" = true ] \
   && [ "$plugin_worktrees_clean" = true ]; then
   plugins_trusted=true
-  pass "Neovim ten-plugin revision and source trust gate satisfied"
+  pass "Neovim fifteen-plugin revision and source trust gate satisfied"
 else
   fail "Neovim plugin trust gate is closed; live plugin code will not run"
   printf '%s\n' \
@@ -10334,6 +10661,97 @@ if [ "$nvim_config_ready" = true ] && [ "$plugins_trusted" = true ] && command -
     sed 's/^/      /' "$check_tmp/nvim-provider.txt" >&2
     fail "Neovim clipboard provider health check failed"
   fi
+fi
+
+notebook_integration_root="$check_tmp/nvim-notebook-integration"
+notebook_fixture_source="$nvim_root/tests/fixtures/notebook/stored-output.ipynb"
+if [ "$nvim_config_ready" = true ] \
+  && [ "$plugins_trusted" = true ] \
+  && [ "$notebook_runtime_ready" = true ] \
+  && command -v nvim >/dev/null 2>&1; then
+  notebook_scope_output="$check_tmp/nvim-notebook-scope.out"
+  notebook_scope_log="$check_tmp/nvim-notebook-scope.log"
+  notebook_ordinary="$notebook_integration_root/ordinary.md"
+  notebook_nonlive="$notebook_integration_root/source-roundtrip.ipynb"
+  notebook_nonlive_invalid="$notebook_integration_root/source-invalid.ipynb"
+  notebook_live="$notebook_integration_root/live-roundtrip.ipynb"
+  notebook_live_invalid="$notebook_integration_root/live-invalid.ipynb"
+  notebook_fixture_before=""
+
+  if notebook_fixture_before=$(cksum "$notebook_fixture_source" \
+      | awk '{ print $1 ":" $2 }') \
+    && (umask 077 && mkdir -p \
+      "$notebook_integration_root" \
+      "$check_tmp/nvim-notebook-home" \
+      "$check_tmp/jupyter-runtime") \
+    && printf '%s\n' '# Ordinary Markdown' > "$notebook_ordinary" \
+    && cp "$notebook_fixture_source" "$notebook_nonlive" \
+    && cp "$notebook_fixture_source" "$notebook_live" \
+    && printf '%s\n' '{"cells": [' > "$notebook_nonlive_invalid" \
+    && printf '%s\n' '{"cells": [' > "$notebook_live_invalid"; then
+    : > "$notebook_scope_log"
+    if env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
+      HOME="$check_tmp/nvim-notebook-home" \
+      TMPDIR="$check_tmp" \
+      XDG_CONFIG_HOME="$config_root" \
+      XDG_DATA_HOME="$data_home" \
+      XDG_STATE_HOME="$XDG_STATE_HOME" \
+      XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+      XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+      JUPYTER_RUNTIME_DIR="$check_tmp/jupyter-runtime" \
+      NVIM_LOG_FILE="$notebook_scope_log" \
+      PYTHONDONTWRITEBYTECODE=1 \
+      TERM_PROGRAM=ghostty \
+      DOTFILES_NVIM_SKIP_PARSER_INSTALL=1 \
+      DOTFILES_NOTEBOOK_ORDINARY="$notebook_ordinary" \
+      nvim --headless -i NONE \
+      -c 'lua vim.cmd.edit(vim.fn.fnameescape(vim.env.DOTFILES_NOTEBOOK_ORDINARY))' \
+      -c 'lua assert(vim.bo.filetype == "markdown", "ordinary fixture did not use Markdown"); assert(not vim.b.dotfiles_notebook, "ordinary Markdown was marked as a notebook"); assert(#vim.fn.MoltenRunningKernels(true) == 0, "configured startup started a Molten kernel"); for _, lhs in ipairs({ "<leader>jc", "<leader>jv", "<leader>ja", "<leader>jn", "<leader>jp", "<leader>jo", "<leader>jx", "<leader>jR", "<leader>js" }) do assert(vim.fn.maparg(lhs, "n", false, true).buffer ~= 1, "ordinary Markdown received " .. lhs) end; assert(vim.fn.maparg("<leader>jv", "x", false, true).buffer ~= 1, "ordinary Markdown received visual <leader>jv"); local plugins = require("lazy.core.config").plugins; assert(plugins["jupytext.nvim"] and plugins["jupytext.nvim"]._.loaded, "Jupytext did not load eagerly"); assert(type(plugins["image.nvim"].opts) == "table" and plugins["image.nvim"].opts.backend == "kitty", "image.nvim must retain the Kitty backend"); assert(vim.g.molten_image_provider == "image.nvim", "Molten must retain the image.nvim provider"); for _, name in ipairs({ "image.nvim", "molten-nvim", "otter.nvim", "quarto-nvim" }) do assert(plugins[name] and not plugins[name]._.loaded, name .. " activated for ordinary Markdown") end; for _, command in ipairs({ "NotebookBootstrap", "NotebookHealth", "MoltenInit", "MoltenImportOutput", "MoltenExportOutput" }) do assert(vim.fn.exists(":" .. command) == 2, command .. " is unavailable") end' \
+      -c qa > "$notebook_scope_output" 2>&1 \
+      && ! nvim_log_has_error "$notebook_scope_output" \
+      && [ ! -s "$notebook_scope_log" ]; then
+      pass "Neovim configured Jupytext, Molten, image.nvim, Quarto, Otter, and ordinary Markdown notebook-scope assertions pass"
+    else
+      [ ! -s "$notebook_scope_output" ] \
+        || sed 's/^/      /' "$notebook_scope_output" >&2
+      [ ! -s "$notebook_scope_log" ] \
+        || sed 's/^/      /' "$notebook_scope_log" >&2
+      fail "Neovim configured notebook scope assertions failed"
+    fi
+
+    run_nvim_notebook_roundtrip \
+      source "$notebook_nonlive" "$notebook_nonlive_invalid" \
+      "$notebook_ordinary" 0 \
+      "Neovim notebook source round trip preserves stored output without startup kernel" \
+      || true
+    run_nvim_notebook_roundtrip \
+      live "$notebook_live" "$notebook_live_invalid" \
+      "$notebook_ordinary" 1 \
+      "Neovim notebook live execution persists output only after manual export" \
+      || true
+
+    notebook_fixture_after=$(cksum "$notebook_fixture_source" \
+      | awk '{ print $1 ":" $2 }')
+    if [ "$notebook_fixture_after" = "$notebook_fixture_before" ]; then
+      pass "committed notebook round-trip fixture remains byte-identical"
+    else
+      fail "notebook round trips changed the committed fixture"
+    fi
+
+    for plugin_name in image.nvim jupytext.nvim molten-nvim otter.nvim quarto-nvim; do
+      plugin_dir="$nvim_data_root/lazy/$plugin_name"
+      plugin_lock=$(jq -r --arg name "$plugin_name" \
+        '.[$name].commit // empty' "$nvim_root/lazy-lock.json")
+      require_clean_git_worktree \
+        "$plugin_dir" "$plugin_name" "$plugin_lock" \
+        "$check_tmp/plugin-post-notebook-$plugin_name" || true
+    done
+  else
+    fail "could not create checker-owned notebook round-trip fixtures"
+  fi
+else
+  printf '%s\n' \
+    'SKIP  configured notebook scope and trusted notebook round-trip assertions'
 fi
 
 task9_ready=false
