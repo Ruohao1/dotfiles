@@ -174,6 +174,7 @@ local tags_allowed = {
   ["oil.nvim"] = true,
   ["otter.nvim"] = true,
   ["tokyonight.nvim"] = true,
+  ["which-key.nvim"] = true,
 }
 
 local function lstat(path, label)
