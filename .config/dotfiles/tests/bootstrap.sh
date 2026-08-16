@@ -192,6 +192,10 @@ require_excludes "$macos_output" '.config/tmux/conf/platform/linux.conf' 'macOS 
 require_contains "$macos_output" \
   'backup and set Spotlight shortcut Command+Shift+semicolon' \
   'macOS dry-run reports the transactional Spotlight shortcut change'
+require_excludes "$macos_output" 'NSWindowShouldDragOnGesture' \
+  'macOS none dry-run excludes the AeroSpace window-drag preference'
+require_excludes "$macos_output" 'required macOS setup' \
+  'macOS none dry-run excludes the Karabiner permission step'
 workspace_launch_agent=$workspace_root/Library/LaunchAgents/dev.ruohao.tmux-workspace.plist
 if grep -Fq '<key>RunAtLoad</key>' "$workspace_launch_agent" \
   && grep -Fq '<key>KeepAlive</key>' "$workspace_launch_agent" \
@@ -593,8 +597,15 @@ fi
 aerospace_home=$test_tmp/aerospace-home
 aerospace_state=$test_tmp/aerospace-state
 aerospace_spotlight_state=$test_tmp/aerospace-spotlight-state
-mkdir -p "$aerospace_home/.config/aerospace"
-mkdir -p "$aerospace_spotlight_state"
+aerospace_window_drag_state=$test_tmp/aerospace-window-drag-state
+mkdir -p \
+  "$aerospace_home/.config/aerospace" \
+  "$aerospace_home/.config/karabiner" \
+  "$aerospace_spotlight_state" \
+  "$aerospace_window_drag_state"
+printf '%s\n' false >"$aerospace_window_drag_state/value"
+printf '%s\n' 'legacy Karabiner configuration' \
+  >"$aerospace_home/.config/karabiner/karabiner.json"
 printf '%s\n' 'original Aerospace Spotlight shortcut' \
   >"$aerospace_spotlight_state/entry"
 printf '%s\n' 'legacy aerospace config' >"$aerospace_home/.aerospace.toml"
@@ -608,6 +619,7 @@ run_capture "$test_tmp/aerospace-apply.output" env \
   DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
   DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
   DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STATE="$aerospace_spotlight_state" \
+  DOTFILES_BOOTSTRAP_TEST_WINDOW_DRAG_STATE="$aerospace_window_drag_state" \
   DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
   DOTFILES_BOOTSTRAP_TEST_RUN_ID=window-manager-aerospace \
   "$bootstrap" --apply --window-manager aerospace \
@@ -629,12 +641,31 @@ if [ "$(cat "$aerospace_spotlight_state/entry" 2>/dev/null || true)" = \
 else
   fail 'macOS apply journals and sets the native Spotlight shortcut'
 fi
+if [ "$(cat "$aerospace_window_drag_state/value" 2>/dev/null || true)" = true ] \
+  && [ "$(cat "$aerospace_run/preferences/window-drag-gesture/before.value" 2>/dev/null || true)" = false ] \
+  && [ -f "$aerospace_run/preferences/window-drag-gesture/before.present" ] \
+  && [ "$(cat "$aerospace_run/preferences/window-drag-gesture/after.value" 2>/dev/null || true)" = true ] \
+  && [ "$(cat "$aerospace_run/preferences/window-drag-gesture/status" 2>/dev/null || true)" = applied ]; then
+  pass 'AeroSpace apply journals and enables the native window-drag preference'
+else
+  fail 'AeroSpace apply journals and enables the native window-drag preference'
+fi
 if cmp -s "$fixture_work/.config/aerospace/aerospace.toml" \
   "$aerospace_home/.config/aerospace/aerospace.toml" \
   && cmp -s "$fixture_work/.config/aerospace/dwindle" \
     "$aerospace_home/.config/aerospace/dwindle" \
+  && cmp -s "$fixture_work/.config/karabiner/karabiner.json" \
+    "$aerospace_home/.config/karabiner/karabiner.json" \
   && cmp -s "$fixture_work/.config/macos/spotlight-shortcut" \
     "$aerospace_home/.config/macos/spotlight-shortcut" \
+  && cmp -s "$fixture_work/.config/macos/window-drag-gesture" \
+    "$aerospace_home/.config/macos/window-drag-gesture" \
+  && [ -x "$aerospace_run/preference-tools/spotlight-shortcut" ] \
+  && cmp -s "$fixture_work/.config/macos/spotlight-shortcut" \
+    "$aerospace_run/preference-tools/spotlight-shortcut" \
+  && [ -x "$aerospace_run/preference-tools/window-drag-gesture" ] \
+  && cmp -s "$fixture_work/.config/macos/window-drag-gesture" \
+    "$aerospace_run/preference-tools/window-drag-gesture" \
   && [ ! -e "$aerospace_home/.config/launcher/application-launcher" ] \
   && [ -x "$aerospace_home/.config/aerospace/dwindle" ] \
   && [ ! -e "$aerospace_home/.config/hypr/hyprland.lua" ] \
@@ -651,12 +682,125 @@ if [ ! -e "$aerospace_home/.aerospace.toml" ] \
 else
   fail 'Aerospace apply automatically backs up the legacy config location'
 fi
+if [ "$(cat "$aerospace_run/backup/.config/karabiner/karabiner.json" 2>/dev/null || true)" = \
+    'legacy Karabiner configuration' ]; then
+  pass 'AeroSpace apply backs up a conflicting Karabiner configuration'
+else
+  fail 'AeroSpace apply backs up a conflicting Karabiner configuration'
+fi
 if grep -Fq 'echo local aerospace' \
   "$aerospace_home/.config/aerospace/local.sh"; then
   pass 'Aerospace apply preserves a preexisting machine-local hook'
 else
   fail 'Aerospace apply preserves a preexisting machine-local hook'
 fi
+require_contains "$(cat "$test_tmp/aerospace-apply.output")" \
+  'open Karabiner-Elements and complete its required macOS setup' \
+  'AeroSpace apply reports the manual permission step without claiming completion'
+
+aerospace_drag_journal=$aerospace_run/preferences/window-drag-gesture
+aerospace_drag_journal_saved=$aerospace_run/preferences/window-drag-gesture.saved
+mv "$aerospace_drag_journal" "$aerospace_drag_journal_saved"
+printf '%s\n' 'invalid window-drag journal' >"$aerospace_drag_journal"
+run_capture "$test_tmp/aerospace-rollback-invalid-file.output" env \
+  HOME="$aerospace_home" \
+  XDG_STATE_HOME="$aerospace_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STATE="$aerospace_spotlight_state" \
+  DOTFILES_BOOTSTRAP_TEST_WINDOW_DRAG_STATE="$aerospace_window_drag_state" \
+  "$bootstrap" --rollback window-manager-aerospace
+if [ "$run_status" -ne 0 ]; then
+  pass 'rollback rejects a regular-file window-drag preference journal'
+else
+  fail 'rollback rejects a regular-file window-drag preference journal'
+fi
+require_contains "$(cat "$test_tmp/aerospace-rollback-invalid-file.output")" \
+  'bootstrap: transaction has invalid window-drag-gesture preference journal' \
+  'regular-file preference preflight reports the invalid window-drag journal'
+if [ "$(cat "$aerospace_run/status" 2>/dev/null || true)" = complete ] \
+  && [ -d "$aerospace_home/.cfg" ] \
+  && cmp -s "$fixture_work/.config/karabiner/karabiner.json" \
+    "$aerospace_home/.config/karabiner/karabiner.json" \
+  && [ "$(cat "$aerospace_spotlight_state/entry" 2>/dev/null || true)" = \
+    '{"enabled":true,"value":{"parameters":[59,41,1179648],"type":"standard"}}' ] \
+  && [ "$(cat "$aerospace_window_drag_state/value" 2>/dev/null || true)" = true ]; then
+  pass 'regular-file preference preflight leaves the transaction untouched'
+else
+  fail 'regular-file preference preflight leaves the transaction untouched'
+fi
+rm "$aerospace_drag_journal"
+ln -s "$aerospace_drag_journal_saved" "$aerospace_drag_journal"
+run_capture "$test_tmp/aerospace-rollback-invalid-symlink.output" env \
+  HOME="$aerospace_home" \
+  XDG_STATE_HOME="$aerospace_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STATE="$aerospace_spotlight_state" \
+  DOTFILES_BOOTSTRAP_TEST_WINDOW_DRAG_STATE="$aerospace_window_drag_state" \
+  "$bootstrap" --rollback window-manager-aerospace
+if [ "$run_status" -ne 0 ]; then
+  pass 'rollback rejects a symlinked window-drag preference journal'
+else
+  fail 'rollback rejects a symlinked window-drag preference journal'
+fi
+require_contains "$(cat "$test_tmp/aerospace-rollback-invalid-symlink.output")" \
+  'bootstrap: transaction has invalid window-drag-gesture preference journal' \
+  'symlink preference preflight reports the invalid window-drag journal'
+if [ "$(cat "$aerospace_run/status" 2>/dev/null || true)" = complete ] \
+  && [ -d "$aerospace_home/.cfg" ] \
+  && cmp -s "$fixture_work/.config/karabiner/karabiner.json" \
+    "$aerospace_home/.config/karabiner/karabiner.json" \
+  && [ "$(cat "$aerospace_spotlight_state/entry" 2>/dev/null || true)" = \
+    '{"enabled":true,"value":{"parameters":[59,41,1179648],"type":"standard"}}' ] \
+  && [ "$(cat "$aerospace_window_drag_state/value" 2>/dev/null || true)" = true ]; then
+  pass 'symlink preference preflight leaves the transaction untouched'
+else
+  fail 'symlink preference preflight leaves the transaction untouched'
+fi
+rm "$aerospace_drag_journal"
+mv "$aerospace_drag_journal_saved" "$aerospace_drag_journal"
+
+rm \
+  "$aerospace_home/.config/macos/spotlight-shortcut" \
+  "$aerospace_home/.config/macos/window-drag-gesture"
+if [ ! -e "$aerospace_home/.config/macos/spotlight-shortcut" ] \
+  && [ ! -e "$aerospace_home/.config/macos/window-drag-gesture" ] \
+  && [ -x "$aerospace_run/preference-tools/spotlight-shortcut" ] \
+  && [ -x "$aerospace_run/preference-tools/window-drag-gesture" ]; then
+  pass 'AeroSpace rollback remains independent of deployed preference helpers'
+else
+  fail 'AeroSpace rollback remains independent of deployed preference helpers'
+fi
+run_capture "$test_tmp/aerospace-rollback-interrupted-drag.output" env \
+  HOME="$aerospace_home" \
+  XDG_STATE_HOME="$aerospace_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STATE="$aerospace_spotlight_state" \
+  DOTFILES_BOOTSTRAP_TEST_WINDOW_DRAG_STATE="$aerospace_window_drag_state" \
+  DOTFILES_BOOTSTRAP_TEST_WINDOW_DRAG_STOP_AFTER_RESTORE_WRITE=1 \
+  "$bootstrap" --rollback window-manager-aerospace
+if [ "$run_status" -ne 0 ]; then
+  pass 'AeroSpace rollback exposes an interrupted window-drag restore'
+else
+  fail 'AeroSpace rollback exposes an interrupted window-drag restore'
+fi
+if [ "$(cat "$aerospace_run/status" 2>/dev/null || true)" = rolling-back ] \
+  && [ "$(cat "$aerospace_run/preferences/window-drag-gesture/status" 2>/dev/null || true)" = preparing ] \
+  && [ "$(cat "$aerospace_window_drag_state/value" 2>/dev/null || true)" = false ] \
+  && [ "$(cat "$aerospace_run/preferences/spotlight-shortcut/status" 2>/dev/null || true)" = applied ] \
+  && [ "$(cat "$aerospace_spotlight_state/entry" 2>/dev/null || true)" = \
+    '{"enabled":true,"value":{"parameters":[59,41,1179648],"type":"standard"}}' ] \
+  && [ -d "$aerospace_home/.cfg" ]; then
+  pass 'AeroSpace rollback restores window drag before Spotlight and configuration'
+else
+  fail 'AeroSpace rollback restores window drag before Spotlight and configuration'
+fi
+
 run_capture "$test_tmp/aerospace-rollback.output" env \
   HOME="$aerospace_home" \
   XDG_STATE_HOME="$aerospace_state" \
@@ -664,6 +808,7 @@ run_capture "$test_tmp/aerospace-rollback.output" env \
   DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
   DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
   DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STATE="$aerospace_spotlight_state" \
+  DOTFILES_BOOTSTRAP_TEST_WINDOW_DRAG_STATE="$aerospace_window_drag_state" \
   "$bootstrap" --rollback window-manager-aerospace
 if [ "$run_status" -eq 0 ]; then
   pass 'Aerospace profile rollback succeeds in the macOS simulation'
@@ -674,7 +819,11 @@ if [ "$(cat "$aerospace_home/.aerospace.toml" 2>/dev/null || true)" = \
     'legacy aerospace config' ] \
   && [ ! -e "$aerospace_home/.config/aerospace/aerospace.toml" ] \
   && [ ! -e "$aerospace_home/.config/aerospace/dwindle" ] \
+  && [ "$(cat "$aerospace_home/.config/karabiner/karabiner.json" 2>/dev/null || true)" = \
+    'legacy Karabiner configuration' ] \
   && [ ! -e "$aerospace_home/.config/macos/spotlight-shortcut" ] \
+  && [ ! -e "$aerospace_home/.config/macos/window-drag-gesture" ] \
+  && [ "$(cat "$aerospace_window_drag_state/value" 2>/dev/null || true)" = false ] \
   && [ "$(cat "$aerospace_spotlight_state/entry" 2>/dev/null || true)" = \
     'original Aerospace Spotlight shortcut' ] \
   && grep -Fq 'echo local aerospace' \
@@ -682,6 +831,79 @@ if [ "$(cat "$aerospace_home/.aerospace.toml" 2>/dev/null || true)" = \
   pass 'Aerospace rollback restores legacy config and preserves its local hook'
 else
   fail 'Aerospace rollback restores legacy config and preserves its local hook'
+fi
+
+aerospace_absent_home=$test_tmp/aerospace-absent-home
+aerospace_absent_state=$test_tmp/aerospace-absent-state
+aerospace_absent_spotlight_state=$test_tmp/aerospace-absent-spotlight-state
+aerospace_absent_drag_state=$test_tmp/aerospace-absent-drag-state
+mkdir -p "$aerospace_absent_spotlight_state" "$aerospace_absent_drag_state"
+run_capture "$test_tmp/aerospace-absent-apply.output" env \
+  HOME="$aerospace_absent_home" \
+  XDG_STATE_HOME="$aerospace_absent_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STATE="$aerospace_absent_spotlight_state" \
+  DOTFILES_BOOTSTRAP_TEST_WINDOW_DRAG_STATE="$aerospace_absent_drag_state" \
+  DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_RUN_ID=window-drag-absent \
+  "$bootstrap" --apply --window-manager aerospace \
+  --repo "$fixture_repo" --ref main
+if [ "$run_status" -eq 0 ] \
+  && [ "$(cat "$aerospace_absent_drag_state/value" 2>/dev/null || true)" = true ] \
+  && [ ! -e "$aerospace_absent_state/dotfiles-bootstrap/window-drag-absent/preferences/window-drag-gesture/before.present" ]; then
+  pass 'AeroSpace apply journals and enables an initially absent drag preference'
+else
+  fail 'AeroSpace apply journals and enables an initially absent drag preference'
+fi
+run_capture "$test_tmp/aerospace-absent-rollback.output" env \
+  HOME="$aerospace_absent_home" \
+  XDG_STATE_HOME="$aerospace_absent_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STATE="$aerospace_absent_spotlight_state" \
+  DOTFILES_BOOTSTRAP_TEST_WINDOW_DRAG_STATE="$aerospace_absent_drag_state" \
+  "$bootstrap" --rollback window-drag-absent
+if [ "$run_status" -eq 0 ] && [ ! -e "$aerospace_absent_drag_state/value" ]; then
+  pass 'AeroSpace rollback removes an originally absent drag preference'
+else
+  fail 'AeroSpace rollback removes an originally absent drag preference'
+fi
+
+preference_order_home=$test_tmp/preference-order-home
+preference_order_state=$test_tmp/preference-order-state
+preference_order_spotlight_state=$test_tmp/preference-order-spotlight-state
+preference_order_drag_state=$test_tmp/preference-order-drag-state
+mkdir -p "$preference_order_spotlight_state" "$preference_order_drag_state"
+printf '%s\n' 'original preference-order Spotlight shortcut' \
+  >"$preference_order_spotlight_state/entry"
+printf '%s\n' false >"$preference_order_drag_state/value"
+run_capture "$test_tmp/preference-apply-order.output" env \
+  HOME="$preference_order_home" \
+  XDG_STATE_HOME="$preference_order_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STATE="$preference_order_spotlight_state" \
+  DOTFILES_BOOTSTRAP_TEST_WINDOW_DRAG_STATE="$preference_order_drag_state" \
+  DOTFILES_BOOTSTRAP_TEST_WINDOW_DRAG_FAIL_WRITE=1 \
+  DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_RUN_ID=preference-apply-order \
+  "$bootstrap" --apply --window-manager aerospace \
+  --repo "$fixture_repo" --ref main
+preference_order_run=$preference_order_state/dotfiles-bootstrap/preference-apply-order
+if [ "$run_status" -ne 0 ] \
+  && [ "$(cat "$preference_order_run/preferences/spotlight-shortcut/status" 2>/dev/null || true)" = restored ] \
+  && [ "$(cat "$preference_order_spotlight_state/entry" 2>/dev/null || true)" = \
+    'original preference-order Spotlight shortcut' ] \
+  && [ "$(cat "$preference_order_run/preferences/window-drag-gesture/status" 2>/dev/null || true)" = failed ] \
+  && [ "$(cat "$preference_order_drag_state/value" 2>/dev/null || true)" = false ] \
+  && [ "$(cat "$preference_order_run/status" 2>/dev/null || true)" = rolled-back ]; then
+  pass 'AeroSpace applies Spotlight before attempting the window-drag preference'
+else
+  fail 'AeroSpace applies Spotlight before attempting the window-drag preference'
 fi
 
 mac_failure_home=$test_tmp/mac-failure-home
@@ -714,6 +936,39 @@ if [ "$(cat "$mac_failure_spotlight_state/entry" 2>/dev/null || true)" = \
   pass 'automatic rollback restores macOS preferences and deployed files'
 else
   fail 'automatic rollback restores macOS preferences and deployed files'
+fi
+
+drag_failure_home=$test_tmp/drag-failure-home
+drag_failure_state=$test_tmp/drag-failure-state
+drag_failure_spotlight_state=$test_tmp/drag-failure-spotlight-state
+drag_failure_preference_state=$test_tmp/drag-failure-preference-state
+mkdir -p "$drag_failure_spotlight_state" "$drag_failure_preference_state"
+printf '%s\n' false >"$drag_failure_preference_state/value"
+run_capture "$test_tmp/drag-failure.output" env \
+  HOME="$drag_failure_home" \
+  XDG_STATE_HOME="$drag_failure_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STATE="$drag_failure_spotlight_state" \
+  DOTFILES_BOOTSTRAP_TEST_WINDOW_DRAG_STATE="$drag_failure_preference_state" \
+  DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_RUN_ID=window-drag-forced-failure \
+  DOTFILES_BOOTSTRAP_TEST_FAIL_AFTER_CHECKOUT=1 \
+  "$bootstrap" --apply --window-manager aerospace \
+  --repo "$fixture_repo" --ref main
+if [ "$run_status" -ne 0 ]; then
+  pass 'forced AeroSpace failure exits after applying the drag preference'
+else
+  fail 'forced AeroSpace failure exits after applying the drag preference'
+fi
+if [ "$(cat "$drag_failure_preference_state/value" 2>/dev/null || true)" = false ] \
+  && [ "$(cat "$drag_failure_state/dotfiles-bootstrap/window-drag-forced-failure/status" 2>/dev/null || true)" = rolled-back ] \
+  && [ ! -e "$drag_failure_home/.cfg" ] \
+  && [ ! -e "$drag_failure_home/.config/karabiner/karabiner.json" ]; then
+  pass 'automatic rollback restores the drag preference and Karabiner configuration'
+else
+  fail 'automatic rollback restores the drag preference and Karabiner configuration'
 fi
 
 mac_conflict_home=$test_tmp/mac-conflict-home
@@ -759,6 +1014,50 @@ if [ "$(cat "$mac_conflict_state/dotfiles-bootstrap/mac-preference-conflict/stat
   pass 'preference conflict stops rollback before deployed files are changed'
 else
   fail 'preference conflict stops rollback before deployed files are changed'
+fi
+
+drag_conflict_home=$test_tmp/drag-conflict-home
+drag_conflict_state=$test_tmp/drag-conflict-state
+drag_conflict_spotlight_state=$test_tmp/drag-conflict-spotlight-state
+drag_conflict_preference_state=$test_tmp/drag-conflict-preference-state
+mkdir -p "$drag_conflict_spotlight_state" "$drag_conflict_preference_state"
+run_capture "$test_tmp/drag-conflict-apply.output" env \
+  HOME="$drag_conflict_home" \
+  XDG_STATE_HOME="$drag_conflict_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STATE="$drag_conflict_spotlight_state" \
+  DOTFILES_BOOTSTRAP_TEST_WINDOW_DRAG_STATE="$drag_conflict_preference_state" \
+  DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_RUN_ID=window-drag-conflict \
+  "$bootstrap" --apply --window-manager aerospace \
+  --repo "$fixture_repo" --ref main
+printf '%s\n' false >"$drag_conflict_preference_state/value"
+run_capture "$test_tmp/drag-conflict-rollback.output" env \
+  HOME="$drag_conflict_home" \
+  XDG_STATE_HOME="$drag_conflict_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STATE="$drag_conflict_spotlight_state" \
+  DOTFILES_BOOTSTRAP_TEST_WINDOW_DRAG_STATE="$drag_conflict_preference_state" \
+  "$bootstrap" --rollback window-drag-conflict
+if [ "$run_status" -ne 0 ]; then
+  pass 'manual rollback reports a later window-drag preference conflict'
+else
+  fail 'manual rollback reports a later window-drag preference conflict'
+fi
+if [ "$(cat "$drag_conflict_preference_state/value" 2>/dev/null || true)" = false ]; then
+  pass 'conflicted rollback preserves the later window-drag preference'
+else
+  fail 'conflicted rollback preserves the later window-drag preference'
+fi
+if [ "$(cat "$drag_conflict_state/dotfiles-bootstrap/window-drag-conflict/status" 2>/dev/null || true)" = complete ] \
+  && [ -d "$drag_conflict_home/.cfg" ]; then
+  pass 'drag-preference conflict stops rollback before deployed files change'
+else
+  fail 'drag-preference conflict stops rollback before deployed files change'
 fi
 
 transaction_home=$test_tmp/transaction-home
@@ -1314,6 +1613,54 @@ if [ "$run_status" -eq 0 ] \
   pass 'rollback reports the retained package actions by name'
 else
   fail 'rollback reports the retained package actions by name'
+fi
+
+karabiner_report_home=$test_tmp/karabiner-report-home
+karabiner_report_state=$test_tmp/karabiner-report-state
+karabiner_report_spotlight_state=$test_tmp/karabiner-report-spotlight-state
+karabiner_report_drag_state=$test_tmp/karabiner-report-drag-state
+karabiner_report_log=$test_tmp/karabiner-report.commands
+mkdir -p "$karabiner_report_spotlight_state" "$karabiner_report_drag_state"
+run_capture "$test_tmp/karabiner-report-apply.output" env \
+  HOME="$karabiner_report_home" \
+  XDG_STATE_HOME="$karabiner_report_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+  DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$karabiner_report_log" \
+  DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STATE="$karabiner_report_spotlight_state" \
+  DOTFILES_BOOTSTRAP_TEST_WINDOW_DRAG_STATE="$karabiner_report_drag_state" \
+  DOTFILES_BOOTSTRAP_TEST_RUN_ID=karabiner-package-report \
+  "$bootstrap" --apply --window-manager aerospace \
+  --repo "$fixture_repo" --ref main
+karabiner_report=$(
+  cat "$karabiner_report_state/dotfiles-bootstrap/karabiner-package-report/packages-retained.txt" \
+    2>/dev/null || true
+)
+if [ "$run_status" -eq 0 ] \
+  && printf '%s\n' "$karabiner_report" \
+    | grep -Fq 'homebrew-cask karabiner-elements'; then
+  pass 'AeroSpace transaction journals Karabiner Elements as retained'
+else
+  fail 'AeroSpace transaction journals Karabiner Elements as retained'
+fi
+run_capture "$test_tmp/karabiner-report-rollback.output" env \
+  HOME="$karabiner_report_home" \
+  XDG_STATE_HOME="$karabiner_report_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+  DOTFILES_BOOTSTRAP_TEST_SPOTLIGHT_STATE="$karabiner_report_spotlight_state" \
+  DOTFILES_BOOTSTRAP_TEST_WINDOW_DRAG_STATE="$karabiner_report_drag_state" \
+  "$bootstrap" --rollback karabiner-package-report
+karabiner_rollback_output=$(cat "$test_tmp/karabiner-report-rollback.output")
+if [ "$run_status" -eq 0 ] \
+  && printf '%s\n' "$karabiner_rollback_output" \
+    | grep -Fq 'homebrew-cask karabiner-elements'; then
+  pass 'AeroSpace rollback reports retained Karabiner Elements by name'
+else
+  fail 'AeroSpace rollback reports retained Karabiner Elements by name'
 fi
 
 if [ "$failures" -ne 0 ]; then

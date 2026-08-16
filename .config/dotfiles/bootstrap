@@ -247,14 +247,32 @@ emit_selected_paths() {
 
 emit_platform_preference_plan() {
   selected_platform=$1
+  selected_window_manager=$2
   printf '%s\n' 'System preferences:'
   case "$selected_platform" in
     macos)
       printf '%s\n' \
         '  backup and set Spotlight shortcut Command+Shift+semicolon'
+      if [ "$selected_window_manager" = aerospace ]; then
+        printf '%s\n' \
+          '  backup and enable NSWindowShouldDragOnGesture for Control+Command drag'
+      fi
       ;;
     linux) printf '%s\n' '  none' ;;
     *) die "unsupported preference platform: $selected_platform" ;;
+  esac
+}
+
+emit_post_apply_manual_steps() {
+  selected_platform=$1
+  selected_window_manager=$2
+  printf '%s\n' 'Post-apply manual steps:'
+  case "$selected_platform:$selected_window_manager" in
+    macos:aerospace)
+      printf '%s\n' \
+        '  open Karabiner-Elements and complete its required macOS setup'
+      ;;
+    *) printf '%s\n' '  none' ;;
   esac
 }
 
@@ -1625,28 +1643,40 @@ activate_login_service() {
   esac
 }
 
+install_transaction_preference() {
+  preference_name=$1
+  preference_label=$2
+  preference_helper=$HOME/.config/macos/$preference_name
+  [ -x "$preference_helper" ] \
+    || die "deployed $preference_label helper is not executable"
+  preference_tools=$transaction_run/preference-tools
+  mkdir -p "$transaction_run/preferences" "$preference_tools" \
+    || die 'could not create transaction preference storage'
+  transaction_preference_helper=$preference_tools/$preference_name
+  cp -p "$preference_helper" "$transaction_preference_helper" \
+    || die "could not journal the $preference_label helper"
+  chmod 0700 "$transaction_preference_helper" \
+    || die "could not protect the journaled $preference_label helper"
+  "$transaction_preference_helper" apply \
+    "$transaction_run/preferences/$preference_name" \
+    || die "could not configure the $preference_label"
+}
+
 install_platform_preferences() {
   selected_platform=$1
+  selected_window_manager=$2
   case "$selected_platform" in
     linux) return 0 ;;
     macos) ;;
     *) die "unsupported preference platform: $selected_platform" ;;
   esac
 
-  preference_helper=$HOME/.config/macos/spotlight-shortcut
-  [ -x "$preference_helper" ] \
-    || die 'deployed macOS Spotlight shortcut helper is not executable'
-  preference_tools=$transaction_run/preference-tools
-  mkdir -p "$transaction_run/preferences" "$preference_tools" \
-    || die 'could not create transaction preference storage'
-  transaction_preference_helper=$preference_tools/spotlight-shortcut
-  cp -p "$preference_helper" "$transaction_preference_helper" \
-    || die 'could not journal the Spotlight shortcut helper'
-  chmod 0700 "$transaction_preference_helper" \
-    || die 'could not protect the journaled Spotlight shortcut helper'
-  "$transaction_preference_helper" apply \
-    "$transaction_run/preferences/spotlight-shortcut" \
-    || die 'could not configure the macOS Spotlight shortcut'
+  install_transaction_preference \
+    spotlight-shortcut 'macOS Spotlight shortcut'
+  if [ "$selected_window_manager" = aerospace ]; then
+    install_transaction_preference \
+      window-drag-gesture 'macOS window-drag gesture'
+  fi
 }
 
 migrate_window_manager_entrypoint() {
@@ -1735,7 +1765,7 @@ deploy_configuration() {
   done <"$prepared_selected_paths"
   create_window_manager_local_override "$selected_window_manager"
   install_command_links
-  install_platform_preferences "$selected_platform"
+  install_platform_preferences "$selected_platform" "$selected_window_manager"
   activate_login_service "$selected_platform"
 
   if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
@@ -1747,6 +1777,9 @@ deploy_configuration() {
     kill -TERM "$$"
   fi
   complete_transaction
+  if [ "$selected_platform:$selected_window_manager" = macos:aerospace ]; then
+    emit_post_apply_manual_steps "$selected_platform" "$selected_window_manager"
+  fi
   case "$selected_window_manager" in
     none) ;;
     *)
@@ -1806,7 +1839,28 @@ report_retained_packages() {
 }
 
 transaction_preference_helper_path() {
-  printf '%s\n' "$transaction_run/preference-tools/spotlight-shortcut"
+  preference_name=$1
+  printf '%s\n' "$transaction_run/preference-tools/$preference_name"
+}
+
+preflight_one_transaction_preference() {
+  preference_name=$1
+  preference_journal=$transaction_run/preferences/$preference_name
+  if ! path_exists "$preference_journal"; then
+    return 0
+  fi
+  if [ ! -d "$preference_journal" ] || [ -L "$preference_journal" ]; then
+    printf 'bootstrap: transaction has invalid %s preference journal\n' \
+      "$preference_name" >&2
+    return 1
+  fi
+  preference_helper=$(transaction_preference_helper_path "$preference_name")
+  if [ ! -x "$preference_helper" ]; then
+    printf 'bootstrap: transaction is missing its %s rollback helper\n' \
+      "$preference_name" >&2
+    return 1
+  fi
+  "$preference_helper" can-restore "$preference_journal"
 }
 
 preflight_transaction_preferences() {
@@ -1821,24 +1875,32 @@ preflight_transaction_preferences() {
       ;;
   esac
 
-  preference_journal=$transaction_run/preferences/spotlight-shortcut
-  [ -d "$preference_journal" ] || return 0
-  preference_helper=$(transaction_preference_helper_path)
-  if [ ! -x "$preference_helper" ]; then
-    printf '%s\n' \
-      'bootstrap: transaction is missing its Spotlight rollback helper' >&2
+  for preference_name in spotlight-shortcut window-drag-gesture; do
+    preflight_one_transaction_preference "$preference_name" || return $?
+  done
+}
+
+restore_one_transaction_preference() {
+  preference_name=$1
+  preference_journal=$transaction_run/preferences/$preference_name
+  if ! path_exists "$preference_journal"; then
+    return 0
+  fi
+  if [ ! -d "$preference_journal" ] || [ -L "$preference_journal" ]; then
+    printf 'bootstrap: transaction has invalid %s preference journal\n' \
+      "$preference_name" >&2
     return 1
   fi
-  "$preference_helper" can-restore "$preference_journal"
+  preference_helper=$(transaction_preference_helper_path "$preference_name")
+  "$preference_helper" restore "$preference_journal"
 }
 
 restore_transaction_preferences() {
   preference_platform=$(cat "$transaction_run/platform" 2>/dev/null || true)
   [ "$preference_platform" = macos ] || return 0
-  preference_journal=$transaction_run/preferences/spotlight-shortcut
-  [ -d "$preference_journal" ] || return 0
-  preference_helper=$(transaction_preference_helper_path)
-  "$preference_helper" restore "$preference_journal"
+  for preference_name in window-drag-gesture spotlight-shortcut; do
+    restore_one_transaction_preference "$preference_name" || return $?
+  done
 }
 
 transaction_has_service_metadata() {
@@ -2094,8 +2156,9 @@ emit_selected_paths "$platform" "$window_manager" "$script_dir/manifests" \
   | sed 's/^/  install /'
 printf '%s\n' 'Packages:'
 emit_package_plan "$manager" "$window_manager" "$script_dir/manifests"
-emit_platform_preference_plan "$platform"
+emit_platform_preference_plan "$platform" "$window_manager"
 emit_service_plan "$platform"
+emit_post_apply_manual_steps "$platform" "$window_manager"
 
 if [ "$mode" = dry-run ]; then
   prepare_dry_run=true

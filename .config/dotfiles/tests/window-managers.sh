@@ -802,6 +802,12 @@ require_contains "$aerospace_output" '.config/macos/window-drag-gesture' \
 require_contains "$aerospace_output" \
   'install homebrew-cask karabiner-elements' \
   'AeroSpace profile selects Karabiner Elements'
+require_contains "$aerospace_output" \
+  'backup and enable NSWindowShouldDragOnGesture for Control+Command drag' \
+  'AeroSpace dry-run reports the transactional window-drag preference'
+require_contains "$aerospace_output" \
+  'open Karabiner-Elements and complete its required macOS setup' \
+  'AeroSpace dry-run reports the one-time permission step'
 require_excludes "$aerospace_output" '.config/hypr/hyprland.lua' \
   'Aerospace profile excludes Hyprland config'
 require_excludes "$aerospace_output" '.config/i3/config' \
@@ -845,6 +851,10 @@ require_excludes "$mac_none_output" '.config/macos/window-drag-gesture' \
   'macOS none profile excludes the window-drag helper'
 require_excludes "$mac_none_output" 'karabiner-elements' \
   'macOS none profile excludes Karabiner Elements'
+require_excludes "$mac_none_output" 'NSWindowShouldDragOnGesture' \
+  'macOS none profile excludes the window-drag preference'
+require_excludes "$mac_none_output" 'required macOS setup' \
+  'macOS none profile excludes the Karabiner permission step'
 
 run_capture "$test_tmp/apt-hypr.output" env \
   HOME="$test_tmp/apt-hypr-home" \
