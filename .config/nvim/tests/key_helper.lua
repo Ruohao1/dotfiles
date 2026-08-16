@@ -93,6 +93,12 @@ local required_triggers = {
   { '"', { "n", "x" } },
 }
 
+local expected_trigger_counts = {}
+for _, required in ipairs(required_triggers) do
+  local identity = required[1] .. "\0" .. table.concat(required[2], "\0")
+  expected_trigger_counts[identity] = 1
+end
+
 local trigger_counts = {}
 for index, trigger in ipairs(plugin.opts.triggers) do
   exact_keys(trigger, { "1", "mode" }, "WhichKey trigger " .. index .. " keys")
@@ -107,11 +113,7 @@ for index, trigger in ipairs(plugin.opts.triggers) do
   local identity = trigger[1] .. "\0" .. table.concat(modes, "\0")
   trigger_counts[identity] = (trigger_counts[identity] or 0) + 1
 end
-
-for _, required in ipairs(required_triggers) do
-  local identity = required[1] .. "\0" .. table.concat(required[2], "\0")
-  eq(trigger_counts[identity], 1, "required WhichKey trigger " .. required[1])
-end
+eq(trigger_counts, expected_trigger_counts, "complete WhichKey trigger contract")
 
 eq(plugin.opts.plugins, {
   marks = true,
@@ -327,57 +329,138 @@ View.timer = original_timer
 State.state = original_state
 assert(timer_ok, timer_error)
 
-local leader_trigger = vim.fn.maparg("<leader>", "n", false, true)
-assert(type(leader_trigger.callback) == "function", "leader trigger callback missing")
-
 local action_count = 0
-vim.keymap.set("n", "<leader>qa", function()
-  action_count = action_count + 1
-end, { desc = "Key helper test action" })
+local action_enabled = true
+local mapping_created = false
+local input_timers = {}
+local original_raw_delay = rawget(Config, "delay")
 
-vim.defer_fn(function()
-  vim.api.nvim_input("qa")
-end, 0)
-local completion_ok, completion_error = pcall(leader_trigger.callback)
-assert(completion_ok, "fast mapping completion failed: " .. tostring(completion_error))
-eq(action_count, 1, "fast mapping execution count")
-assert(not View.valid(), "fast mapping opened WhichKey")
-
-local original_delay = Config.delay
-Config.delay = 0
-local before_buffer = vim.api.nvim_get_current_buf()
-local before_lines = vim.api.nvim_buf_get_lines(before_buffer, 0, -1, false)
-local popup_seen = false
-vim.defer_fn(function()
-  popup_seen = vim.wait(1000, function()
-    return View.valid()
-  end, 5)
-  vim.api.nvim_input("<Esc>")
-end, 0)
-local popup_ok, popup_error = pcall(leader_trigger.callback)
-Config.delay = original_delay
-assert(popup_ok, "WhichKey popup smoke failed: " .. tostring(popup_error))
-assert(popup_seen, "WhichKey popup did not open before the upper deadline")
-assert(
-  vim.wait(1000, function()
-    return not View.valid()
-  end, 5),
-  "WhichKey popup did not close after Escape"
-)
-eq(vim.api.nvim_get_current_buf(), before_buffer, "WhichKey popup current buffer")
-eq(
-  vim.api.nvim_buf_get_lines(before_buffer, 0, -1, false),
-  before_lines,
-  "WhichKey popup buffer text"
-)
-eq(action_count, 1, "WhichKey popup cancellation action count")
-
-for _, notification in ipairs(require("which-key.mappings").notifs) do
-  assert(
-    notification.level < vim.log.levels.ERROR,
-    "WhichKey mapping diagnostic: " .. notification.msg
-  )
+local function flush_typeahead()
+  vim.api.nvim_feedkeys("", "x", false)
 end
 
-vim.keymap.del("n", "<leader>qa")
+local function cleanup_dynamic_test()
+  local errors = {}
+  local function cleanup_step(label, callback)
+    local ok, cleanup_error = pcall(callback)
+    if not ok then
+      table.insert(errors, label .. ": " .. tostring(cleanup_error))
+    end
+  end
+
+  action_enabled = false
+  cleanup_step("restore raw Config.delay", function()
+    rawset(Config, "delay", original_raw_delay)
+  end)
+  for index, timer in ipairs(input_timers) do
+    cleanup_step("stop pending input timer " .. index, function()
+      if timer and not timer:is_closing() then
+        timer:stop()
+        timer:close()
+      end
+    end)
+  end
+  cleanup_step("stop View timer", function()
+    if View.timer then
+      View.timer:stop()
+    end
+  end)
+  cleanup_step("stop WhichKey State", function()
+    State.stop()
+  end)
+  cleanup_step("hide WhichKey View", function()
+    View.hide()
+  end)
+
+  if mapping_created then
+    cleanup_step("drain pending test input first pass", function()
+      flush_typeahead()
+    end)
+    cleanup_step("drain pending test input second pass", function()
+      flush_typeahead()
+    end)
+    cleanup_step("delete test mapping", function()
+      vim.keymap.del("n", "<leader>qa")
+      mapping_created = false
+    end)
+  end
+
+  if #errors > 0 then
+    return table.concat(errors, "\n")
+  end
+end
+
+local dynamic_ok, dynamic_error = xpcall(function()
+  local leader_trigger = vim.fn.maparg("<leader>", "n", false, true)
+  assert(type(leader_trigger.callback) == "function", "leader trigger callback missing")
+  assert(vim.tbl_isempty(vim.fn.maparg("<leader>qa", "n", false, true)), "test mapping exists")
+
+  vim.keymap.set("n", "<leader>qa", function()
+    if action_enabled then
+      action_count = action_count + 1
+    end
+  end, { desc = "Key helper test action" })
+  mapping_created = true
+
+  table.insert(
+    input_timers,
+    vim.defer_fn(function()
+      vim.api.nvim_input("qa")
+    end, 0)
+  )
+  leader_trigger.callback()
+  flush_typeahead()
+  eq(action_count, 1, "fast mapping execution count")
+  flush_typeahead()
+  eq(action_count, 1, "fast mapping second-flush execution count")
+  assert(not View.valid(), "fast mapping opened WhichKey")
+
+  rawset(Config, "delay", 0)
+  local before_buffer = vim.api.nvim_get_current_buf()
+  local before_lines = vim.api.nvim_buf_get_lines(before_buffer, 0, -1, false)
+  local popup_seen = false
+  table.insert(
+    input_timers,
+    vim.defer_fn(function()
+      popup_seen = vim.wait(1000, function()
+        return View.valid()
+      end, 5)
+      vim.api.nvim_input("<Esc>")
+    end, 0)
+  )
+  leader_trigger.callback()
+  assert(popup_seen, "WhichKey popup did not open before the upper deadline")
+  assert(
+    vim.wait(1000, function()
+      return not View.valid()
+    end, 5),
+    "WhichKey popup did not close after Escape"
+  )
+  eq(vim.api.nvim_get_current_buf(), before_buffer, "WhichKey popup current buffer")
+  eq(
+    vim.api.nvim_buf_get_lines(before_buffer, 0, -1, false),
+    before_lines,
+    "WhichKey popup buffer text"
+  )
+  eq(action_count, 1, "WhichKey popup cancellation action count")
+
+  for _, notification in ipairs(require("which-key.mappings").notifs) do
+    assert(
+      notification.level < vim.log.levels.ERROR,
+      "WhichKey mapping diagnostic: " .. notification.msg
+    )
+  end
+end, debug.traceback)
+
+local cleanup_error = cleanup_dynamic_test()
+if not dynamic_ok then
+  if cleanup_error then
+    dynamic_error = dynamic_error .. "\ncleanup failed:\n" .. cleanup_error
+  end
+  error(dynamic_error, 0)
+end
+assert(not cleanup_error, cleanup_error)
+eq(rawget(Config, "delay"), original_raw_delay, "raw Config.delay restoration")
+eq(action_count, 1, "cleaned-up action count")
+assert(vim.tbl_isempty(vim.fn.maparg("<leader>qa", "n", false, true)), "test mapping leaked")
 print("Neovim key helper live assertions: ok")
