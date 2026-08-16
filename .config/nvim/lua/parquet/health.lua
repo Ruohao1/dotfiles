@@ -59,7 +59,11 @@ local function new(deps)
 
     emit(initial)
     local errors = rawget(state, "errors")
-    if errors ~= nil and type(errors) ~= "table" then
+    if errors == nil then
+      if initial == nil then
+        emit("dependency probe returned malformed diagnostics")
+      end
+    elseif type(errors) ~= "table" then
       emit("dependency probe returned malformed diagnostics")
     elseif type(errors) == "table" then
       local malformed = false

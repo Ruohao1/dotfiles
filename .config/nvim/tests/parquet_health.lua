@@ -207,7 +207,21 @@ do
   expect(calls == 1, "exceptional probe refreshed more than once")
   expect(has(reports, "error", "probe exploded"), "probe exception detail was hidden")
   expect(has(reports, "error", "dotfiles bootstrap"), "probe exception lacked remediation")
+  expect(not has(reports, "error", "malformed diagnostics"), "probe exception was misclassified")
   expect(not has(reports, "ok", "ready"), "exceptional probe was reported ready")
+end
+
+do
+  local health, reports = fixture({
+    probe = function()
+      return "not a report"
+    end,
+  })
+  local ok, detail = pcall(health.check)
+  expect(ok, "non-table probe result raised: " .. tostring(detail))
+  expect(has(reports, "error", "invalid report"), "non-table probe result was hidden")
+  expect(not has(reports, "error", "malformed diagnostics"), "non-table probe was misclassified")
+  expect(not has(reports, "ok", "ready"), "non-table probe result was reported ready")
 end
 
 do
@@ -251,6 +265,26 @@ do
   health.check()
   expect(has(reports, "error", "diagnostics"), "empty dependency diagnostic was accepted")
   expect(not has(reports, "ok", "ready"), "empty dependency diagnostic was reported ready")
+end
+
+do
+  local health, reports = fixture({
+    probe = function()
+      return {
+        ok = true,
+        pyarrow = {
+          ok = true,
+          path = "/tools/visidata/lib/python3.13/site-packages/pyarrow/__init__.py",
+          version = "25.0.0",
+        },
+        uv = { ok = true, path = "/usr/bin/uv", version = "0.11.6" },
+        viewer = { ok = true, path = "/tools/visidata/bin/vd", version = "3.4" },
+      }
+    end,
+  })
+  health.check()
+  expect(has(reports, "error", "diagnostics"), "missing dependency diagnostics were accepted")
+  expect(not has(reports, "ok", "ready"), "missing dependency diagnostics were reported ready")
 end
 
 do
