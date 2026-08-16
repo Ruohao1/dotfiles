@@ -251,30 +251,6 @@ eq(automatic_trigger_modes, allowed_modes, "automatic WhichKey trigger modes")
 local Buf = require("which-key.buf")
 local Triggers = require("which-key.triggers")
 local bufnr = vim.api.nvim_get_current_buf()
-for _, mode in ipairs({ "n", "x", "o", "v", "i", "s", "c", "t" }) do
-  Buf.get({ buf = bufnr, mode = mode })
-end
-assert(
-  vim.wait(1000, function()
-    local seen = {}
-    for _, trigger in pairs(Triggers._triggers) do
-      seen[trigger.mode] = true
-    end
-    return seen.n and seen.x and seen.o
-  end, 10),
-  "WhichKey trigger registry did not populate"
-)
-
-local installed_trigger_modes = {}
-for id, trigger in pairs(Triggers._triggers) do
-  assert(
-    allowed_modes[trigger.mode],
-    string.format("forbidden trigger mode %s at %s", tostring(trigger.mode), tostring(id))
-  )
-  installed_trigger_modes[trigger.mode] = true
-end
-eq(installed_trigger_modes, allowed_modes, "installed WhichKey trigger modes")
-
 local function which_key_trigger(lhs, mode)
   local mapping = vim.fn.maparg(lhs, mode, false, true)
   return type(mapping) == "table"
@@ -282,20 +258,135 @@ local function which_key_trigger(lhs, mode)
     and mapping.desc:find("which-key-trigger", 1, true) ~= nil
 end
 
-assert(
-  vim.wait(1000, function()
-    return which_key_trigger("<leader>", "n") and which_key_trigger("g", "n")
-  end),
-  "approved WhichKey triggers did not install"
-)
+local leader_fixtures = {
+  { lhs = "<leader>bx", mode = "n", label = "Buffers" },
+  { lhs = "<leader>cx", mode = "n", label = "Code" },
+  { lhs = "<leader>fx", mode = "n", label = "Find" },
+  { lhs = "<leader>hx", mode = "n", label = "Line pins" },
+  { lhs = "<leader>jx", mode = "n", label = "Notebook" },
+  { lhs = "<leader>tx", mode = "n", label = "Toggle" },
+  { lhs = "<leader>cx", mode = "x", label = "Code" },
+  { lhs = "<leader>jx", mode = "x", label = "Notebook" },
+}
+local created_leader_fixtures = {}
 
-for _, required in ipairs(required_triggers) do
-  if required[1] ~= "<auto>" then
-    for _, mode in ipairs(required[2]) do
-      assert(which_key_trigger(required[1], mode), mode .. " trigger missing for " .. required[1])
+local fixture_ok, fixture_error = xpcall(function()
+  for _, fixture in ipairs(leader_fixtures) do
+    assert(
+      vim.tbl_isempty(vim.fn.maparg(fixture.lhs, fixture.mode, false, true)),
+      fixture.mode .. " fixture mapping already exists for " .. fixture.lhs
+    )
+    vim.keymap.set(fixture.mode, fixture.lhs, "<Nop>", {
+      buffer = bufnr,
+      desc = "Key helper test fixture: " .. fixture.label,
+    })
+    table.insert(created_leader_fixtures, fixture)
+  end
+
+  local mode_states = {}
+  for _, mode in ipairs({ "n", "x", "o", "v", "i", "s", "c", "t" }) do
+    mode_states[mode] = Buf.get({ buf = bufnr, mode = mode })
+  end
+
+  local live_groups = {}
+  for _, group in ipairs({
+    { lhs = "<leader>b", label = "Buffers" },
+    { lhs = "<leader>c", label = "Code" },
+    { lhs = "<leader>f", label = "Find" },
+    { lhs = "<leader>h", label = "Line pins" },
+    { lhs = "<leader>j", label = "Notebook" },
+    { lhs = "<leader>t", label = "Toggle" },
+  }) do
+    local modes = {}
+    for _, mode in ipairs({ "n", "x", "o", "v", "i", "s", "c", "t" }) do
+      local node = mode_states[mode].tree:find(group.lhs)
+      if node and node.group == true then
+        assert(mode == "n" or mode == "x", "live group has prohibited mode " .. mode)
+        eq(node.desc, group.label, mode .. " live group label for " .. group.lhs)
+        table.insert(modes, mode)
+      end
+    end
+    assert(#modes > 0, "live group is missing for " .. group.lhs)
+    live_groups[group.lhs .. "\0" .. table.concat(modes, "\0")] = group.label
+  end
+  eq(live_groups, expected_groups, "live WhichKey leader groups")
+
+  assert(
+    vim.wait(1000, function()
+      local seen = {}
+      for _, trigger in pairs(Triggers._triggers) do
+        seen[trigger.mode] = true
+      end
+      return seen.n and seen.x and seen.o
+    end, 10),
+    "WhichKey trigger registry did not populate"
+  )
+
+  local installed_trigger_modes = {}
+  for id, trigger in pairs(Triggers._triggers) do
+    assert(
+      allowed_modes[trigger.mode],
+      string.format("forbidden trigger mode %s at %s", tostring(trigger.mode), tostring(id))
+    )
+    installed_trigger_modes[trigger.mode] = true
+  end
+  eq(installed_trigger_modes, allowed_modes, "installed WhichKey trigger modes")
+
+  assert(
+    vim.wait(1000, function()
+      for _, required in ipairs(required_triggers) do
+        if required[1] ~= "<auto>" then
+          for _, mode in ipairs(required[2]) do
+            if not which_key_trigger(required[1], mode) then
+              return false
+            end
+          end
+        end
+      end
+      return true
+    end, 10),
+    "approved WhichKey triggers did not install"
+  )
+
+  for _, required in ipairs(required_triggers) do
+    if required[1] ~= "<auto>" then
+      for _, mode in ipairs(required[2]) do
+        assert(which_key_trigger(required[1], mode), mode .. " trigger missing for " .. required[1])
+      end
     end
   end
+end, debug.traceback)
+
+local fixture_cleanup_errors = {}
+for index = #created_leader_fixtures, 1, -1 do
+  local fixture = created_leader_fixtures[index]
+  local deleted, delete_error = pcall(vim.keymap.del, fixture.mode, fixture.lhs, { buffer = bufnr })
+  if not deleted then
+    table.insert(
+      fixture_cleanup_errors,
+      string.format("delete %s %s: %s", fixture.mode, fixture.lhs, tostring(delete_error))
+    )
+  end
 end
+for _, fixture in ipairs(leader_fixtures) do
+  if not vim.tbl_isempty(vim.fn.maparg(fixture.lhs, fixture.mode, false, true)) then
+    table.insert(
+      fixture_cleanup_errors,
+      fixture.mode .. " fixture mapping leaked for " .. fixture.lhs
+    )
+  end
+end
+
+local fixture_cleanup_error = #fixture_cleanup_errors > 0
+    and table.concat(fixture_cleanup_errors, "\n")
+  or nil
+if not fixture_ok then
+  if fixture_cleanup_error then
+    fixture_error = fixture_error .. "\nfixture cleanup failed:\n" .. fixture_cleanup_error
+  end
+  error(fixture_error, 0)
+end
+assert(not fixture_cleanup_error, fixture_cleanup_error)
 
 local State = require("which-key.state")
 eq(State.delay({ mode = "n", keys = "<leader>" }), 300, "normal leader delay")
