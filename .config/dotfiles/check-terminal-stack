@@ -2203,6 +2203,65 @@ parquet_file_fingerprint() {
     "$1"
 }
 
+nvim_parquet_with_path_entry() {
+  [ "$#" -ge 2 ] || return 2
+  nvim_parquet_path_entry=$1
+  shift
+  case "$nvim_parquet_path_entry" in
+    ""|*:*) return 2 ;;
+    /*) ;;
+    *) return 2 ;;
+  esac
+  [ -d "$nvim_parquet_path_entry" ] || return 1
+  PATH="$nvim_parquet_path_entry${PATH:+:$PATH}" "$@"
+}
+
+run_nvim_parquet_path_entry_test() {
+  parquet_path_test_root="$check_tmp/nvim-parquet-path-entry"
+  parquet_path_test_split="$parquet_path_test_root/split"
+  parquet_path_test_colon="$parquet_path_test_split:relative"
+  parquet_path_test_safe="$parquet_path_test_root/safe"
+  parquet_path_test_marker="$parquet_path_test_root/split-executed"
+  parquet_path_test_output="$parquet_path_test_root/output.txt"
+  parquet_path_test_empty_output="$parquet_path_test_root/empty-path.txt"
+  if ! (umask 077 && mkdir -p \
+    "$parquet_path_test_split" \
+    "$parquet_path_test_colon" \
+    "$parquet_path_test_safe"); then
+    return 1
+  fi
+
+  # shellcheck disable=SC2016  # Preserve parameters for the generated fixtures.
+  printf '%s\n' '#!/bin/sh' ': > "$1"' > "$parquet_path_test_split/uv"
+  # shellcheck disable=SC2016  # Preserve parameters for the generated fixtures.
+  printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$PATH" > "$1"' \
+    > "$parquet_path_test_safe/path-probe"
+  chmod 700 \
+    "$parquet_path_test_split/uv" \
+    "$parquet_path_test_safe/path-probe"
+
+  if nvim_parquet_with_path_entry \
+    "$parquet_path_test_colon" uv "$parquet_path_test_marker" \
+    > "$parquet_path_test_output" 2>&1; then
+    return 1
+  else
+    parquet_path_test_status=$?
+  fi
+  [ "$parquet_path_test_status" -eq 2 ] \
+    && [ ! -e "$parquet_path_test_marker" ] \
+    && [ ! -s "$parquet_path_test_output" ] \
+    || return 1
+
+  (
+    unset PATH
+    nvim_parquet_with_path_entry \
+      "$parquet_path_test_safe" \
+      "$parquet_path_test_safe/path-probe" \
+      "$parquet_path_test_empty_output"
+  ) || return 1
+  grep -Fqx "$parquet_path_test_safe" "$parquet_path_test_empty_output"
+}
+
 run_nvim_parquet_resolver_selection_test() {
   parquet_selection_root="$check_tmp/nvim-parquet-resolver-selection"
   parquet_selection_path_bin="$parquet_selection_root/path-bin"
@@ -2279,7 +2338,7 @@ run_nvim_parquet_resolver_selection_test() {
     "$parquet_selection_viewer"
   : > "$parquet_selection_log"
 
-  if PATH="$parquet_selection_path_bin:$PATH" \
+  if nvim_parquet_with_path_entry "$parquet_selection_path_bin" env \
     HOME="$parquet_selection_home" \
     XDG_CONFIG_HOME="$parquet_selection_root/config" \
     XDG_DATA_HOME="$parquet_selection_root/data" \
@@ -2442,9 +2501,9 @@ run_nvim_parquet_integration_test() {
   [ -d "$parquet_tool_uv_directory" ] || return 1
   : > "$parquet_integration_log"
 
-  env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
+  nvim_parquet_with_path_entry "$parquet_tool_uv_directory" \
+    env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
     HOME="$check_tmp/nvim-parquet-home" \
-    PATH="$parquet_tool_uv_directory:$PATH" \
     TMPDIR="$check_tmp" \
     XDG_CONFIG_HOME="$config_root" \
     XDG_DATA_HOME="$data_home" \
@@ -6004,8 +6063,10 @@ case "${DOTFILES_CHECK_MODE:-}" in
   nvim-parquet-resolver-self-test)
     parquet_probe_output="$check_tmp/parquet-tool.txt"
     : > "$parquet_probe_output"
-    if run_nvim_parquet_resolver_selection_test \
+    if run_nvim_parquet_path_entry_test \
+      && run_nvim_parquet_resolver_selection_test \
       && resolve_nvim_parquet_tool; then
+      printf '%s\n' 'parquet PATH entry assertions: ok'
       printf '%s\n' 'parquet resolver selection assertions: ok'
       printf '%s\n' 'parquet authoritative resolver assertions: ok'
       exit 0
@@ -6074,6 +6135,12 @@ parquet_tool_python=""
 parquet_tool_viewer=""
 parquet_tool_pyarrow=""
 parquet_probe_output="$check_tmp/parquet-tool.txt"
+
+if run_nvim_parquet_path_entry_test; then
+  pass "Neovim Parquet PATH transport rejects split entries and empty inherited PATH"
+else
+  fail "Neovim Parquet PATH transport regression failed"
+fi
 
 if run_nvim_parquet_resolver_selection_test; then
   pass "Neovim Parquet resolver rejects malformed PATH uv and selects managed fallback"
