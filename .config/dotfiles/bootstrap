@@ -393,7 +393,13 @@ emit_package_plan() {
         '  install upstream stylua' \
         '  install upstream tree-sitter-cli >=0.26.1' \
         '  install upstream herdr' \
-        '  install upstream font-space-mono-nerd'
+        '  install upstream font-space-mono-nerd' \
+        '  ensure upstream node >=22.0.0 with npm >=10.0.0 (fallback node 24.19.0)' \
+        '  ensure upstream lua-language-server >=3.19.1' \
+        '  ensure npm bash-language-server@5.6.0' \
+        '  ensure npm vscode-langservers-extracted@4.10.0' \
+        '  ensure npm pyright@1.1.411' \
+        '  ensure npm yaml-language-server@1.24.0'
       if apt_offers_ghostty; then
         printf '%s\n' '  install apt ghostty'
       elif [ "$allow_community_packages" = true ]; then

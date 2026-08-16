@@ -14,3 +14,8 @@ base-devel
 wl-clipboard
 ttf-space-mono-nerd
 fontconfig
+bash-language-server
+vscode-json-languageserver
+lua-language-server
+pyright
+yaml-language-server

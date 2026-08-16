@@ -8,3 +8,8 @@ shellcheck
 stylua
 tree-sitter
 herdr
+bash-language-server
+vscode-langservers-extracted
+lua-language-server
+pyright
+yaml-language-server

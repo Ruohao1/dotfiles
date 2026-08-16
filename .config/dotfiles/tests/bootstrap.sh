@@ -128,6 +128,16 @@ require_contains "$linux_output" 'install pacman ghostty' 'pacman plan includes 
 require_contains "$linux_output" 'install pacman ttf-space-mono-nerd' 'pacman plan includes the configured font'
 require_contains "$linux_output" 'manual sudo pacman -Syu --needed' 'pacman plan requires an explicit full upgrade'
 require_contains "$linux_output" 'install upstream herdr' 'pacman plan uses the official Herdr installer'
+for provider in \
+  bash-language-server \
+  vscode-json-languageserver \
+  lua-language-server \
+  pyright \
+  yaml-language-server
+do
+  require_contains "$linux_output" "install pacman $provider" \
+    "pacman plan includes $provider"
+done
 
 apt_output=$(
   HOME="$test_tmp/apt-home" \
@@ -142,6 +152,18 @@ require_contains "$apt_output" 'install apt git' 'apt plan includes Git'
 require_contains "$apt_output" 'install upstream neovim >=0.12.0' 'apt plan preserves the Neovim version floor'
 require_contains "$apt_output" 'install upstream herdr' 'apt plan uses the official Herdr installer'
 require_contains "$apt_output" 'blocked community ghostty' 'apt plan blocks community Ghostty without consent'
+apt_lsp_plan=$(printf '%s\n' "$apt_output" | sed -n '/ensure upstream node >=22.0.0/,/ensure npm yaml-language-server@1.24.0/p')
+expected_apt_lsp_plan='  ensure upstream node >=22.0.0 with npm >=10.0.0 (fallback node 24.19.0)
+  ensure upstream lua-language-server >=3.19.1
+  ensure npm bash-language-server@5.6.0
+  ensure npm vscode-langservers-extracted@4.10.0
+  ensure npm pyright@1.1.411
+  ensure npm yaml-language-server@1.24.0'
+if [ "$apt_lsp_plan" = "$expected_apt_lsp_plan" ]; then
+  pass 'apt plan preserves the exact ordered language-server fallback contract'
+else
+  fail 'apt plan preserves the exact ordered language-server fallback contract'
+fi
 
 apt_community_output=$(
   HOME="$test_tmp/apt-community-home" \
@@ -188,6 +210,16 @@ require_contains "$macos_output" \
   'macOS dry-run reports LaunchAgent kickstart'
 require_contains "$macos_output" 'install homebrew-formula neovim' 'Homebrew plan includes Neovim formula'
 require_contains "$macos_output" 'install homebrew-cask ghostty' 'Homebrew plan includes Ghostty cask'
+for provider in \
+  bash-language-server \
+  vscode-langservers-extracted \
+  lua-language-server \
+  pyright \
+  yaml-language-server
+do
+  require_contains "$macos_output" "install homebrew-formula $provider" \
+    "Homebrew plan includes $provider"
+done
 require_excludes "$macos_output" '.config/tmux/conf/platform/linux.conf' 'macOS plan excludes Linux tmux adapter'
 require_contains "$macos_output" \
   'backup and set Spotlight shortcut Command+Shift+semicolon' \
@@ -303,6 +335,15 @@ brew_apply_commands=$(cat "$brew_apply_log" 2>/dev/null || true)
 require_contains "$brew_apply_commands" 'pinned-installer homebrew a34ae4ee9151cbce4c3b33bca7043a972b7ae9a5' 'Homebrew bootstrap uses the pinned installer revision'
 require_contains "$brew_apply_commands" 'brew install neovim' 'Homebrew package phase installs missing formulae'
 require_contains "$brew_apply_commands" 'brew install --cask ghostty' 'Homebrew package phase installs missing casks'
+if printf '%s\n' "$brew_apply_commands" | grep -Fqx 'brew install bash-language-server' \
+  && printf '%s\n' "$brew_apply_commands" | grep -Fqx 'brew install vscode-langservers-extracted' \
+  && printf '%s\n' "$brew_apply_commands" | grep -Fqx 'brew install lua-language-server' \
+  && printf '%s\n' "$brew_apply_commands" | grep -Fqx 'brew install pyright' \
+  && printf '%s\n' "$brew_apply_commands" | grep -Fqx 'brew install yaml-language-server'; then
+  pass 'Homebrew apply installs all five exact language-server formulae'
+else
+  fail 'Homebrew apply installs all five exact language-server formulae'
+fi
 
 i3_apt_apply_log=$test_tmp/i3-apt-apply.commands
 run_capture "$test_tmp/i3-apt-apply.output" env \
