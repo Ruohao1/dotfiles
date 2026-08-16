@@ -46,7 +46,6 @@ mode=dry-run
 allow_community_packages=false
 repo_url=https://github.com/Ruohao1/dotfiles.git
 repo_ref=main
-# shellcheck disable=SC2034 # Used by the Debian managed-install path added next.
 npm_language_servers_lock_sha256=f01618d246ff8f53ad57e8d6a1cfe4d278f06a68d80eddbb254d910218aba4b8
 rollback_id=
 window_manager=
@@ -445,6 +444,9 @@ start_package_tracking() {
   package_actions_file=$package_actions_tmp/actions
   : >"$package_actions_file" \
     || die 'could not initialize temporary package action journal'
+  managed_created_paths_file=$package_actions_tmp/managed-created.paths
+  : >"$managed_created_paths_file" \
+    || die 'could not initialize managed-created path journal'
 }
 
 record_package_action() {
@@ -452,7 +454,7 @@ record_package_action() {
   package_action_name=$2
   [ -n "$package_actions_file" ] || return 0
   case "$package_action_kind" in
-    apt|direct|homebrew-cask|homebrew-formula|installer|community) ;;
+    apt|direct|homebrew-cask|homebrew-formula|installer|community|npm) ;;
     *) die "unsupported package action kind: $package_action_kind" ;;
   esac
   validate_package_name "$package_action_name" \
@@ -566,6 +568,14 @@ tool_is_satisfied() {
   required_version=$2
 
   if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS+x}" = x ]; then
+    case ",${DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS}," in
+      *,"$tool_name",*) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
     && [ "${DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING:-0}" = 1 ]; then
     return 1
   fi
@@ -583,6 +593,101 @@ tool_is_satisfied() {
   installed_version=$(command_version "$tool_name")
   [ -n "$installed_version" ] || return 1
   version_at_least "$installed_version" "$required_version"
+}
+
+stdio_server_is_satisfied() {
+  stdio_command=$1
+  shift
+
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS+x}" = x ]; then
+    case ",${DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS}," in
+      *,"$stdio_command",*) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING:-0}" = 1 ]; then
+    return 1
+  fi
+
+  command -v "$stdio_command" >/dev/null 2>&1 || return 1
+  stdio_probe_tmp=$(temporary_directory) || return 1
+  active_probe_tmp=$stdio_probe_tmp
+  stdio_probe_fifo=$stdio_probe_tmp/stdin
+  mkfifo "$stdio_probe_fifo" || {
+    remove_temporary_directory "$stdio_probe_tmp"
+    active_probe_tmp=
+    return 1
+  }
+
+  "$stdio_command" "$@" <"$stdio_probe_fifo" \
+    >"$stdio_probe_tmp/stdout" 2>"$stdio_probe_tmp/stderr" &
+  stdio_probe_pid=$!
+  active_probe_pid=$stdio_probe_pid
+  exec 3>"$stdio_probe_fifo" || {
+    kill "$stdio_probe_pid" >/dev/null 2>&1 || true
+    wait "$stdio_probe_pid" >/dev/null 2>&1 || true
+    remove_temporary_directory "$stdio_probe_tmp"
+    active_probe_pid=
+    active_probe_tmp=
+    return 1
+  }
+  sleep 1
+  if kill -0 "$stdio_probe_pid" >/dev/null 2>&1; then
+    stdio_probe_result=0
+    kill "$stdio_probe_pid" >/dev/null 2>&1 || true
+  else
+    stdio_probe_result=1
+  fi
+  exec 3>&-
+  if kill -0 "$stdio_probe_pid" >/dev/null 2>&1; then
+    sleep 1
+  fi
+  if kill -0 "$stdio_probe_pid" >/dev/null 2>&1; then
+    kill -KILL "$stdio_probe_pid" >/dev/null 2>&1 || true
+  fi
+  wait "$stdio_probe_pid" >/dev/null 2>&1 || true
+  active_probe_pid=
+  remove_temporary_directory "$stdio_probe_tmp"
+  active_probe_tmp=
+  return "$stdio_probe_result"
+}
+
+language_server_is_satisfied() {
+  language_server_command=$1
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS+x}" = x ]; then
+    case ",${DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS}," in
+      *,"$language_server_command",*) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+  case "$language_server_command" in
+    bash-language-server)
+      tool_is_satisfied bash-language-server 5.6.0
+      ;;
+    vscode-json-language-server)
+      stdio_server_is_satisfied vscode-json-language-server --stdio
+      ;;
+    lua-language-server)
+      tool_is_satisfied lua-language-server 3.19.1
+      ;;
+    pyright-langserver)
+      stdio_server_is_satisfied pyright-langserver --stdio || return 1
+      if command -v pyright >/dev/null 2>&1; then
+        pyright_version=$(command_version pyright)
+        if [ -n "$pyright_version" ] \
+          && ! version_at_least "$pyright_version" 1.1.411; then
+          return 1
+        fi
+      fi
+      ;;
+    yaml-language-server)
+      tool_is_satisfied yaml-language-server 1.24.0
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 normalized_architecture() {
@@ -642,11 +747,81 @@ download_verified() {
   esac
   [ "${#expected_sha256}" -eq 64 ] || die "invalid SHA-256 length for $download_url"
 
-  curl --fail --location --show-error --silent --output "$destination" -- "$download_url" \
-    || die "download failed: $download_url"
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ -n "${DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT:-}" ]; then
+    case "$DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT" in
+      /*) ;;
+      *) die 'DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT must be absolute' ;;
+    esac
+    download_name=${download_url##*/}
+    case "$download_name" in
+      ''|.|..|*/*) die "unsafe test download basename: $download_name" ;;
+    esac
+    test_download_source=$DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT/$download_name
+    [ -f "$test_download_source" ] \
+      || die "missing test download source: $test_download_source"
+    cp "$test_download_source" "$destination" \
+      || die "could not copy test download source: $download_name"
+    record_test_command download "$download_url"
+  else
+    curl --fail --location --show-error --silent --output "$destination" -- "$download_url" \
+      || die "download failed: $download_url"
+  fi
   actual_sha256=$(file_sha256 "$destination")
   [ "$actual_sha256" = "$expected_sha256" ] \
     || die "checksum mismatch for $download_url"
+}
+
+archive_member_list_is_safe() {
+  member_list=$1
+  allowed_root=$2
+  awk -v root="$allowed_root" '
+    function reject() { invalid = 1 }
+    /^\// { reject(); next }
+    {
+      path = $0
+      sub(/\/$/, "", path)
+      count = split(path, component, "/")
+      for (part_index = 1; part_index <= count; part_index++) {
+        if (component[part_index] == "..") reject()
+      }
+      if (root != "" && path != root && index(path, root "/") != 1) reject()
+    }
+    END { exit invalid }
+  ' "$member_list"
+}
+
+lua_archive_roots_are_exact() {
+  member_list=$1
+  awk '
+    {
+      path = $0
+      sub(/\/$/, "", path)
+      split(path, component, "/")
+      top = component[1]
+      if (top == "LICENSE" || top == "bin" || top == "changelog.md" \
+        || top == "debugger.lua" || top == "locale" || top == "main.lua" \
+        || top == "meta" || top == "script") {
+        seen[top] = 1
+      } else {
+        invalid = 1
+      }
+    }
+    END {
+      required[1] = "LICENSE"
+      required[2] = "bin"
+      required[3] = "changelog.md"
+      required[4] = "debugger.lua"
+      required[5] = "locale"
+      required[6] = "main.lua"
+      required[7] = "meta"
+      required[8] = "script"
+      for (root_index = 1; root_index <= 8; root_index++) {
+        if (!seen[required[root_index]]) invalid = 1
+      }
+      exit invalid
+    }
+  ' "$member_list"
 }
 
 installer_record() {
@@ -721,6 +896,452 @@ direct_asset_record() {
     }
     END { if (!found) exit 1 }
   ' "$manifest_file" || die "missing direct asset for $tool_name/$selected_platform/$selected_arch"
+}
+
+stage_node_runtime() {
+  node_manifest_root=$1
+  node_stage_root=$2
+  node_asset_data=$(direct_asset_record \
+    node linux "$managed_architecture" "$node_manifest_root/packages-direct.tsv")
+  old_ifs=$IFS
+  tab_character=$(printf '\t')
+  IFS=$tab_character
+  set -f
+  # shellcheck disable=SC2086 # Intentional split on the verified manifest tab delimiter.
+  set -- $node_asset_data
+  set +f
+  IFS=$old_ifs
+  [ "$#" -eq 4 ] || die 'malformed direct asset entry: node'
+  node_asset_version=$1
+  node_asset_format=$2
+  node_asset_url=$3
+  node_asset_sha256=$4
+  [ "$node_asset_version" = 24.19.0 ] \
+    || die 'unexpected managed Node version'
+  [ "$node_asset_format" = tar.xz ] \
+    || die 'unexpected managed Node archive format'
+  case "$node_asset_url" in
+    https://*) ;;
+    *) die 'direct asset URL must use HTTPS: node' ;;
+  esac
+  case "$managed_architecture" in
+    x86_64) node_archive_root=node-v24.19.0-linux-x64 ;;
+    arm64) node_archive_root=node-v24.19.0-linux-arm64 ;;
+    *) die "unsupported managed Node architecture: $managed_architecture" ;;
+  esac
+
+  node_asset_path=$node_stage_root/node.asset
+  node_member_list=$node_stage_root/node.members
+  download_verified "$node_asset_url" "$node_asset_sha256" "$node_asset_path"
+  tar -tJf "$node_asset_path" >"$node_member_list" \
+    || die 'could not list the verified Node archive'
+  archive_member_list_is_safe "$node_member_list" "$node_archive_root" \
+    || die 'verified Node archive contains an unsafe member'
+  mkdir "$node_stage_root/node.extract" \
+    || die 'could not create managed Node extraction directory'
+  tar -xJf "$node_asset_path" -C "$node_stage_root/node.extract" \
+    || die 'could not extract the verified Node archive'
+  node_extracted_root=$node_stage_root/node.extract/$node_archive_root
+  [ -x "$node_extracted_root/bin/node" ] \
+    || die 'verified Node archive is missing executable bin/node'
+  [ -x "$node_extracted_root/bin/npm" ] \
+    || die 'verified Node archive is missing executable bin/npm'
+  [ -f "$node_extracted_root/lib/node_modules/npm/bin/npm-cli.js" ] \
+    || die 'verified Node archive is missing npm-cli.js'
+  mv "$node_extracted_root" "$node_stage_root/node.ready" \
+    || die 'could not stage the verified Node runtime'
+  selected_node=$node_stage_root/node.ready/bin/node
+  selected_npm=$node_stage_root/node.ready/bin/npm
+  selected_node_version=$(command_version "$selected_node")
+  [ "$selected_node_version" = 24.19.0 ] \
+    || die 'staged Node version does not match 24.19.0'
+  selected_npm_version=$(
+    PATH="$node_stage_root/node.ready/bin:$PATH" \
+      "$selected_npm" --version 2>/dev/null \
+      | sed -n '1s/[^0-9]*\([0-9][0-9.]*\).*/\1/p'
+  )
+  [ "$selected_npm_version" = 11.17.0 ] \
+    || die 'staged npm version does not match 11.17.0'
+}
+
+stage_lua_language_server() {
+  lua_manifest_root=$1
+  lua_stage_root=$2
+  lua_asset_data=$(direct_asset_record \
+    lua-language-server linux "$managed_architecture" \
+    "$lua_manifest_root/packages-direct.tsv")
+  old_ifs=$IFS
+  tab_character=$(printf '\t')
+  IFS=$tab_character
+  set -f
+  # shellcheck disable=SC2086 # Intentional split on the verified manifest tab delimiter.
+  set -- $lua_asset_data
+  set +f
+  IFS=$old_ifs
+  [ "$#" -eq 4 ] || die 'malformed direct asset entry: lua-language-server'
+  lua_asset_version=$1
+  lua_asset_format=$2
+  lua_asset_url=$3
+  lua_asset_sha256=$4
+  [ "$lua_asset_version" = 3.19.1 ] \
+    || die 'unexpected managed LuaLS version'
+  [ "$lua_asset_format" = tar.gz ] \
+    || die 'unexpected managed LuaLS archive format'
+  case "$lua_asset_url" in
+    https://*) ;;
+    *) die 'direct asset URL must use HTTPS: lua-language-server' ;;
+  esac
+
+  lua_asset_path=$lua_stage_root/lua.asset
+  lua_member_list=$lua_stage_root/lua.members
+  download_verified "$lua_asset_url" "$lua_asset_sha256" "$lua_asset_path"
+  tar -tzf "$lua_asset_path" >"$lua_member_list" \
+    || die 'could not list the verified LuaLS archive'
+  archive_member_list_is_safe "$lua_member_list" '' \
+    || die 'verified LuaLS archive contains an unsafe member'
+  lua_archive_roots_are_exact "$lua_member_list" \
+    || die 'verified LuaLS archive has unexpected top-level content'
+  mkdir "$lua_stage_root/lua.ready" \
+    || die 'could not create managed LuaLS extraction directory'
+  tar -xzf "$lua_asset_path" -C "$lua_stage_root/lua.ready" \
+    || die 'could not extract the verified LuaLS archive'
+  [ -x "$lua_stage_root/lua.ready/bin/lua-language-server" ] \
+    || die 'verified LuaLS archive is missing executable bin/lua-language-server'
+  [ -f "$lua_stage_root/lua.ready/bin/main.lua" ] \
+    || die 'verified LuaLS archive is missing bin/main.lua'
+  [ -f "$lua_stage_root/lua.ready/main.lua" ] \
+    || die 'verified LuaLS archive is missing main.lua'
+  [ -f "$lua_stage_root/lua.ready/debugger.lua" ] \
+    || die 'verified LuaLS archive is missing debugger.lua'
+  for lua_required_directory in locale meta script; do
+    [ -d "$lua_stage_root/lua.ready/$lua_required_directory" ] \
+      || die "verified LuaLS archive is missing $lua_required_directory"
+  done
+}
+
+stage_npm_language_servers() {
+  npm_manifest_root=$1
+  npm_stage_root=$2
+  npm_ready=$npm_stage_root/npm.ready
+  mkdir "$npm_ready" || die 'could not create managed npm staging directory'
+  cp "$npm_manifest_root/packages-npm-language-servers.json" \
+    "$npm_ready/package.json" \
+    || die 'could not stage the npm language-server manifest'
+  cp "$npm_manifest_root/packages-npm-language-servers-lock.json" \
+    "$npm_ready/package-lock.json" \
+    || die 'could not stage the npm language-server lockfile'
+
+  "$selected_node" -e '
+const fs = require("fs");
+const root = process.argv[1];
+const manifest = JSON.parse(fs.readFileSync(root + "/package.json", "utf8"));
+const lock = JSON.parse(fs.readFileSync(root + "/package-lock.json", "utf8"));
+const expected = {"bash-language-server":"5.6.0","pyright":"1.1.411","vscode-langservers-extracted":"4.10.0","yaml-language-server":"1.24.0"};
+if (manifest.private !== true || JSON.stringify(manifest.dependencies) !== JSON.stringify(expected)) process.exit(1);
+if (lock.lockfileVersion !== 3 || lock.requires !== true) process.exit(1);
+if (!lock.packages || JSON.stringify(lock.packages[""].dependencies) !== JSON.stringify(expected)) process.exit(1);
+for (const [path, record] of Object.entries(lock.packages)) {
+  if (path === "") continue;
+  if (!path.startsWith("node_modules/")) process.exit(1);
+  if (typeof record.resolved !== "string" || !record.resolved.startsWith("https://registry.npmjs.org/")) process.exit(1);
+  if (typeof record.integrity !== "string" || !/^sha512-[A-Za-z0-9+/]+={0,2}$/.test(record.integrity)) process.exit(1);
+}
+' "$npm_ready" || die 'npm language-server manifests failed validation'
+
+  (
+    cd "$npm_ready" || exit 1
+    npm_config_cache="$npm_stage_root/npm-cache" \
+      PATH="$(dirname "$selected_node"):$PATH" \
+      "$selected_npm" ci --ignore-scripts --omit=dev --no-audit --no-fund
+  ) || die 'npm language-server installation failed'
+
+  for npm_command in \
+    bash-language-server \
+    vscode-json-language-server \
+    pyright-langserver \
+    yaml-language-server
+  do
+    [ -x "$npm_ready/node_modules/.bin/$npm_command" ] \
+      || die "npm language-server bundle is missing executable: $npm_command"
+  done
+}
+
+record_managed_created_path() {
+  created_path=$1
+  [ -n "$managed_created_paths_file" ] \
+    || die 'managed-created path journal is unavailable'
+  case "$created_path" in
+    ''|*"
+"*|*""*|*"	"*) die 'managed-created path contains control characters' ;;
+    /*) ;;
+    *) die "managed-created path must be absolute: $created_path" ;;
+  esac
+  printf '%s\n' "$created_path" >>"$managed_created_paths_file" \
+    || die 'could not record a managed-created path'
+}
+
+managed_created_path_is_allowed() {
+  candidate_managed_path=$1
+  case "$candidate_managed_path" in
+    "$HOME/.local"|"$HOME/.local/bin"|"$HOME/.local/opt"|\
+    "$HOME/.local/bin/node"|"$HOME/.local/bin/npm"|\
+    "$HOME/.local/bin/lua-language-server"|\
+    "$HOME/.local/bin/bash-language-server"|\
+    "$HOME/.local/bin/vscode-json-language-server"|\
+    "$HOME/.local/bin/pyright-langserver"|\
+    "$HOME/.local/bin/yaml-language-server")
+      return 0
+      ;;
+  esac
+  [ -n "$managed_node_target" ] \
+    && [ "$candidate_managed_path" = "$managed_node_target" ] \
+    && return 0
+  [ -n "$managed_lua_target" ] \
+    && [ "$candidate_managed_path" = "$managed_lua_target" ] \
+    && return 0
+  [ -n "$managed_npm_target" ] \
+    && [ "$candidate_managed_path" = "$managed_npm_target" ] \
+    && return 0
+  return 1
+}
+
+remove_managed_created_paths() {
+  [ -n "$managed_created_paths_file" ] || return 0
+  [ -r "$managed_created_paths_file" ] || return 0
+  managed_reverse_file=$managed_created_paths_file.reverse
+  awk '{ path[NR] = $0 } END { for (path_index = NR; path_index >= 1; path_index--) print path[path_index] }' \
+    "$managed_created_paths_file" >"$managed_reverse_file" \
+    || return 1
+  managed_cleanup_status=0
+  while IFS= read -r cleanup_managed_path || [ -n "$cleanup_managed_path" ]; do
+    case "$cleanup_managed_path" in
+      ''|*"
+"*|*""*|*"	"*)
+        printf '%s\n' 'bootstrap: refusing managed cleanup for a control-character path' >&2
+        managed_cleanup_status=1
+        continue
+        ;;
+    esac
+    if ! managed_created_path_is_allowed "$cleanup_managed_path"; then
+      printf 'bootstrap: refusing managed cleanup for unexpected path: %s\n' \
+        "$cleanup_managed_path" >&2
+      managed_cleanup_status=1
+      continue
+    fi
+    case "$cleanup_managed_path" in
+      "$HOME/.local"|"$HOME/.local/bin"|"$HOME/.local/opt")
+        if path_exists "$cleanup_managed_path"; then
+          rmdir "$cleanup_managed_path" >/dev/null 2>&1 \
+            || managed_cleanup_status=1
+        fi
+        ;;
+      "$managed_node_target"|"$managed_lua_target"|"$managed_npm_target")
+        if path_exists "$cleanup_managed_path"; then
+          if [ -d "$cleanup_managed_path" ] && [ ! -L "$cleanup_managed_path" ]; then
+            rm -rf -- "$cleanup_managed_path" \
+              || managed_cleanup_status=1
+          else
+            printf 'bootstrap: refusing managed directory cleanup for changed path: %s\n' \
+              "$cleanup_managed_path" >&2
+            managed_cleanup_status=1
+          fi
+        fi
+        ;;
+      *)
+        if path_exists "$cleanup_managed_path"; then
+          if [ -d "$cleanup_managed_path" ] && [ ! -L "$cleanup_managed_path" ]; then
+            printf 'bootstrap: refusing managed file cleanup for changed path: %s\n' \
+              "$cleanup_managed_path" >&2
+            managed_cleanup_status=1
+          else
+            rm -f -- "$cleanup_managed_path" \
+              || managed_cleanup_status=1
+          fi
+        fi
+        ;;
+    esac
+  done <"$managed_reverse_file"
+  return "$managed_cleanup_status"
+}
+
+maybe_fail_managed_publication() {
+  publication_token=$1
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_PUBLISH_FAIL_AFTER:-}" = "$publication_token" ]; then
+    die "forced managed publication failure after $publication_token"
+  fi
+}
+
+create_managed_parent_directory() {
+  parent_path=$1
+  require_managed_parent_directory "$parent_path"
+  if ! path_exists "$parent_path"; then
+    mkdir "$parent_path" \
+      || die "could not create managed language-tool parent: $parent_path"
+    record_managed_created_path "$parent_path"
+  fi
+}
+
+publish_managed_directory() {
+  publish_source=$1
+  publish_target=$2
+  publication_token=$3
+  require_managed_target_free "$publish_target"
+  mv --no-clobber --no-target-directory "$publish_source" "$publish_target" \
+    || die "could not publish managed language-tool directory: $publish_target"
+  [ ! -e "$publish_source" ] && [ ! -L "$publish_source" ] \
+    || die "managed language-tool directory was not published: $publish_target"
+  [ -d "$publish_target" ] && [ ! -L "$publish_target" ] \
+    || die "managed language-tool directory has an unexpected type: $publish_target"
+  record_managed_created_path "$publish_target"
+  maybe_fail_managed_publication "$publication_token"
+}
+
+publish_managed_link() {
+  link_source=$1
+  link_target=$2
+  require_managed_target_free "$link_target"
+  ln -s "$link_source" "$link_target" \
+    || die "could not publish managed language-tool link: $link_target"
+  record_managed_created_path "$link_target"
+}
+
+record_managed_language_server_actions() {
+  if [ "$managed_node_required" = true ]; then
+    record_package_action direct node
+  fi
+  if [ "$managed_lua_required" = true ]; then
+    record_package_action direct lua-language-server
+  fi
+  if [ "$managed_npm_required" = true ]; then
+    record_package_action npm bash-language-server@5.6.0
+    record_package_action npm vscode-langservers-extracted@4.10.0
+    record_package_action npm pyright@1.1.411
+    record_package_action npm yaml-language-server@1.24.0
+  fi
+}
+
+publish_debian_language_servers() {
+  publish_stage_root=$1
+  managed_publish_active=true
+
+  create_managed_parent_directory "$HOME/.local"
+  create_managed_parent_directory "$HOME/.local/bin"
+  create_managed_parent_directory "$HOME/.local/opt"
+
+  if [ "$managed_node_required" = true ]; then
+    publish_managed_directory \
+      "$publish_stage_root/node.ready" "$managed_node_target" node-directory
+  fi
+  if [ "$managed_lua_required" = true ]; then
+    lua_relative_target=../opt/lua-language-server-3.19.1-$managed_architecture/bin/lua-language-server
+    # shellcheck disable=SC2016 # The generated wrapper expands these values at runtime.
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'wrapper_dir=$(CDPATH= cd -P "$(dirname "$0")" && pwd) || exit 1' \
+      "exec \"\$wrapper_dir/$lua_relative_target\" \"\$@\"" \
+      >"$publish_stage_root/lua-language-server.wrapper" \
+      || die 'could not stage the LuaLS wrapper'
+    chmod 0755 "$publish_stage_root/lua-language-server.wrapper" \
+      || die 'could not make the LuaLS wrapper executable'
+    publish_managed_directory \
+      "$publish_stage_root/lua.ready" "$managed_lua_target" lua-directory
+  fi
+  if [ "$managed_npm_required" = true ]; then
+    publish_managed_directory \
+      "$publish_stage_root/npm.ready" "$managed_npm_target" npm-directory
+  fi
+
+  if [ "$managed_node_required" = true ]; then
+    publish_managed_link "$managed_node_target/bin/node" "$HOME/.local/bin/node"
+    publish_managed_link "$managed_node_target/bin/npm" "$HOME/.local/bin/npm"
+  fi
+  if [ "$managed_lua_required" = true ]; then
+    require_managed_target_free "$HOME/.local/bin/lua-language-server"
+    mv --no-clobber --no-target-directory \
+      "$publish_stage_root/lua-language-server.wrapper" \
+      "$HOME/.local/bin/lua-language-server" \
+      || die 'could not publish the managed LuaLS wrapper'
+    [ ! -e "$publish_stage_root/lua-language-server.wrapper" ] \
+      || die 'managed LuaLS wrapper was not published'
+    [ -x "$HOME/.local/bin/lua-language-server" ] \
+      && [ ! -L "$HOME/.local/bin/lua-language-server" ] \
+      || die 'managed LuaLS wrapper has an unexpected type'
+    record_managed_created_path "$HOME/.local/bin/lua-language-server"
+  fi
+  if [ "$managed_bash_required" = true ]; then
+    publish_managed_link \
+      "$managed_npm_target/node_modules/.bin/bash-language-server" \
+      "$HOME/.local/bin/bash-language-server"
+  fi
+  if [ "$managed_json_required" = true ]; then
+    publish_managed_link \
+      "$managed_npm_target/node_modules/.bin/vscode-json-language-server" \
+      "$HOME/.local/bin/vscode-json-language-server"
+  fi
+  if [ "$managed_pyright_required" = true ]; then
+    publish_managed_link \
+      "$managed_npm_target/node_modules/.bin/pyright-langserver" \
+      "$HOME/.local/bin/pyright-langserver"
+  fi
+  if [ "$managed_yaml_required" = true ]; then
+    publish_managed_link \
+      "$managed_npm_target/node_modules/.bin/yaml-language-server" \
+      "$HOME/.local/bin/yaml-language-server"
+  fi
+  maybe_fail_managed_publication command-links
+
+  record_managed_language_server_actions
+  managed_publish_active=false
+}
+
+install_debian_language_servers() {
+  debian_manifest_root=$1
+  if [ "$managed_node_required" != true ] \
+    && [ "$managed_lua_required" != true ] \
+    && [ "$managed_npm_required" != true ]; then
+    return 0
+  fi
+
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_REAL_MANAGED_INSTALL:-0}" != 1 ]; then
+    if [ "$managed_node_required" = true ]; then
+      record_test_command direct-install node
+    fi
+    if [ "$managed_lua_required" = true ]; then
+      record_test_command direct-install lua-language-server
+    fi
+    if [ "$managed_npm_required" = true ]; then
+      record_test_command npm-ci --ignore-scripts --omit=dev --no-audit --no-fund
+    fi
+    record_managed_language_server_actions
+    return 0
+  fi
+
+  managed_stage_root=$(temporary_directory) \
+    || die 'could not create managed language-server staging storage'
+  active_package_tmp=$managed_stage_root
+  if [ "$managed_node_required" = true ]; then
+    stage_node_runtime "$debian_manifest_root" "$managed_stage_root"
+  else
+    selected_node=$(command -v node) \
+      || die 'satisfactory Node command disappeared before npm staging'
+    selected_npm=$(command -v npm) \
+      || die 'satisfactory npm command disappeared before npm staging'
+    tool_is_satisfied node 22.0.0 \
+      || die 'selected Node command no longer satisfies version 22.0.0'
+    tool_is_satisfied npm 10.0.0 \
+      || die 'selected npm command no longer satisfies version 10.0.0'
+  fi
+  if [ "$managed_lua_required" = true ]; then
+    stage_lua_language_server "$debian_manifest_root" "$managed_stage_root"
+  fi
+  if [ "$managed_npm_required" = true ]; then
+    stage_npm_language_servers "$debian_manifest_root" "$managed_stage_root"
+  fi
+  publish_debian_language_servers "$managed_stage_root"
+  remove_temporary_directory "$managed_stage_root"
+  active_package_tmp=
 }
 
 install_direct_tool() {
@@ -910,6 +1531,7 @@ install_homebrew_packages() {
 install_apt_packages() {
   manifest_root=$1
   selected_window_manager=$2
+  prepare_debian_language_servers "$manifest_root"
   window_manager_packages=$(window_manager_package_manifest \
     apt "$selected_window_manager" "$manifest_root")
   ghostty_installed=false
@@ -946,6 +1568,8 @@ install_apt_packages() {
       record_package_action apt "$installed_apt_package"
     done
   fi
+
+  install_debian_language_servers "$manifest_root"
 
   install_direct_tool neovim 0.12.0 "$manifest_root"
   install_direct_tool stylua 2.5.0 "$manifest_root"
@@ -1019,6 +1643,114 @@ validate_home_directory() {
     /*) ;;
     *) die 'HOME must be an absolute path' ;;
   esac
+}
+
+require_managed_target_free() {
+  managed_target=$1
+  if path_exists "$managed_target"; then
+    die "refusing to replace existing managed language-tool target: $managed_target"
+  fi
+}
+
+require_managed_parent_directory() {
+  managed_parent=$1
+  if path_exists "$managed_parent" \
+    && { [ ! -d "$managed_parent" ] || [ -L "$managed_parent" ]; }; then
+    die "managed language-tool parent must be a real directory: $managed_parent"
+  fi
+}
+
+prepare_debian_language_servers() {
+  managed_manifest_root=$1
+  managed_node_required=false
+  managed_lua_required=false
+  managed_bash_required=false
+  managed_json_required=false
+  managed_pyright_required=false
+  managed_yaml_required=false
+  managed_npm_required=false
+  managed_architecture=
+  managed_node_target=
+  managed_lua_target=
+  validate_home_directory
+
+  tool_is_satisfied node 22.0.0 \
+    && tool_is_satisfied npm 10.0.0 \
+    || managed_node_required=true
+  language_server_is_satisfied bash-language-server \
+    || managed_bash_required=true
+  language_server_is_satisfied vscode-json-language-server \
+    || managed_json_required=true
+  language_server_is_satisfied lua-language-server \
+    || managed_lua_required=true
+  language_server_is_satisfied pyright-langserver \
+    || managed_pyright_required=true
+  language_server_is_satisfied yaml-language-server \
+    || managed_yaml_required=true
+
+  if [ "$managed_bash_required" = true ] \
+    || [ "$managed_json_required" = true ] \
+    || [ "$managed_pyright_required" = true ] \
+    || [ "$managed_yaml_required" = true ]; then
+    managed_npm_required=true
+  fi
+
+  if [ "$managed_node_required" = true ] \
+    || [ "$managed_lua_required" = true ]; then
+    managed_architecture=$(normalized_architecture)
+  fi
+  if [ "$managed_node_required" = true ]; then
+    managed_node_target=$HOME/.local/opt/node-24.19.0-$managed_architecture
+  fi
+  if [ "$managed_lua_required" = true ]; then
+    managed_lua_target=$HOME/.local/opt/lua-language-server-3.19.1-$managed_architecture
+  fi
+  managed_lock_sha256=$npm_language_servers_lock_sha256
+  case "$managed_lock_sha256" in
+    ''|*[!0-9a-f]*) die 'invalid embedded npm language-server lock SHA-256' ;;
+  esac
+  [ "${#managed_lock_sha256}" -eq 64 ] \
+    || die 'invalid embedded npm language-server lock SHA-256 length'
+  if [ -n "$managed_manifest_root" ]; then
+    actual_lock_sha256=$(file_sha256 \
+      "$managed_manifest_root/packages-npm-language-servers-lock.json")
+    [ "$actual_lock_sha256" = "$managed_lock_sha256" ] \
+      || die 'npm language-server lockfile does not match the embedded SHA-256'
+  fi
+  managed_npm_target=$HOME/.local/opt/dotfiles-lsp-node-$managed_lock_sha256
+
+  if [ "$managed_node_required" = true ] \
+    || [ "$managed_lua_required" = true ] \
+    || [ "$managed_npm_required" = true ]; then
+    require_managed_parent_directory "$HOME/.local"
+    require_managed_parent_directory "$HOME/.local/bin"
+    require_managed_parent_directory "$HOME/.local/opt"
+  fi
+
+  if [ "$managed_node_required" = true ]; then
+    require_managed_target_free "$managed_node_target"
+    require_managed_target_free "$HOME/.local/bin/node"
+    require_managed_target_free "$HOME/.local/bin/npm"
+  fi
+  if [ "$managed_lua_required" = true ]; then
+    require_managed_target_free "$managed_lua_target"
+    require_managed_target_free "$HOME/.local/bin/lua-language-server"
+  fi
+  if [ "$managed_npm_required" = true ]; then
+    require_managed_target_free "$managed_npm_target"
+  fi
+  if [ "$managed_bash_required" = true ]; then
+    require_managed_target_free "$HOME/.local/bin/bash-language-server"
+  fi
+  if [ "$managed_json_required" = true ]; then
+    require_managed_target_free "$HOME/.local/bin/vscode-json-language-server"
+  fi
+  if [ "$managed_pyright_required" = true ]; then
+    require_managed_target_free "$HOME/.local/bin/pyright-langserver"
+  fi
+  if [ "$managed_yaml_required" = true ]; then
+    require_managed_target_free "$HOME/.local/bin/yaml-language-server"
+  fi
 }
 
 state_root_path() {
@@ -2068,6 +2800,22 @@ handle_transaction_signal() {
 handle_process_exit() {
   process_status=$?
   trap - 0 HUP INT TERM
+  if [ -n "$active_probe_pid" ]; then
+    kill "$active_probe_pid" >/dev/null 2>&1 || true
+    wait "$active_probe_pid" >/dev/null 2>&1 || true
+    active_probe_pid=
+  fi
+  if [ -n "$active_probe_tmp" ] && [ -d "$active_probe_tmp" ]; then
+    remove_temporary_directory "$active_probe_tmp"
+    active_probe_tmp=
+  fi
+  if [ "$process_status" -ne 0 ] && [ "$managed_publish_active" = true ]; then
+    if ! remove_managed_created_paths; then
+      printf '%s\n' \
+        'bootstrap: managed language-tool cleanup was incomplete; inspect the reported exact paths' >&2
+    fi
+    managed_publish_active=false
+  fi
   if [ "$transaction_active" = true ]; then
     printf '%s\n' 'bootstrap: configuration failed; restoring the transaction backup' >&2
     if ! rollback_transaction "$transaction_run"; then
@@ -2105,6 +2853,24 @@ manifest_gitdir=
 manifest_commit=
 package_actions_tmp=
 package_actions_file=
+managed_architecture=
+managed_node_required=false
+managed_lua_required=false
+managed_bash_required=false
+managed_json_required=false
+managed_pyright_required=false
+managed_yaml_required=false
+managed_npm_required=false
+managed_node_target=
+managed_lua_target=
+managed_npm_target=
+managed_lock_sha256=
+managed_publish_active=false
+managed_created_paths_file=
+selected_node=
+selected_npm=
+active_probe_tmp=
+active_probe_pid=
 
 trap handle_process_exit 0
 trap 'handle_transaction_signal HUP 129' HUP
@@ -2146,6 +2912,9 @@ if [ -z "$script_dir" ]; then
         'Git is not installed, so the standalone dry-run cannot fetch its manifests.' \
         'Run with --apply to bootstrap Git, or install Git and rerun the dry-run.'
       exit 0
+    fi
+    if [ "$manager" = apt ]; then
+      prepare_debian_language_servers ''
     fi
     install_standalone_git "$manager"
   fi

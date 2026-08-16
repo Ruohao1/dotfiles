@@ -63,6 +63,222 @@ run_capture() {
   set -e
 }
 
+make_version_command() {
+  command_path=$1
+  version_text=$2
+  mkdir -p "$(dirname "$command_path")"
+  printf '%s\n' \
+    '#!/bin/sh' \
+    "printf '%s\\n' '$version_text'" \
+    >"$command_path"
+  chmod 0755 "$command_path"
+}
+
+make_stdio_command() {
+  command_path=$1
+  command_behavior=$2
+  mkdir -p "$(dirname "$command_path")"
+  case "$command_behavior" in
+    wait)
+      printf '%s\n' '#!/bin/sh' 'exec sleep 30' >"$command_path"
+      ;;
+    fail)
+      printf '%s\n' '#!/bin/sh' 'exit 1' >"$command_path"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  chmod 0755 "$command_path"
+}
+
+prepare_satisfaction_commands() {
+  satisfaction_bin=$1
+  satisfaction_node_version=$2
+  satisfaction_npm_version=$3
+  satisfaction_bash_version=$4
+  satisfaction_json_behavior=$5
+  satisfaction_lua_version=$6
+  satisfaction_pyright_behavior=$7
+  satisfaction_pyright_version=$8
+  satisfaction_yaml_version=$9
+
+  mkdir -p "$satisfaction_bin"
+  make_version_command "$satisfaction_bin/node" "$satisfaction_node_version"
+  make_version_command "$satisfaction_bin/npm" "$satisfaction_npm_version"
+  make_version_command "$satisfaction_bin/bash-language-server" "$satisfaction_bash_version"
+  make_stdio_command "$satisfaction_bin/vscode-json-language-server" \
+    "$satisfaction_json_behavior"
+  make_version_command "$satisfaction_bin/lua-language-server" "$satisfaction_lua_version"
+  make_stdio_command "$satisfaction_bin/pyright-langserver" \
+    "$satisfaction_pyright_behavior"
+  make_version_command "$satisfaction_bin/pyright" "$satisfaction_pyright_version"
+  make_version_command "$satisfaction_bin/yaml-language-server" "$satisfaction_yaml_version"
+  make_version_command "$satisfaction_bin/nvim" '0.12.4'
+  make_version_command "$satisfaction_bin/stylua" '2.5.2'
+  make_version_command "$satisfaction_bin/tree-sitter" '0.26.9'
+  make_version_command "$satisfaction_bin/herdr" '0.8.0'
+  printf '%s\n' '#!/bin/sh' "printf '%s\\n' 'install ok installed'" \
+    >"$satisfaction_bin/dpkg-query"
+  printf '%s\n' '#!/bin/sh' 'exit 0' >"$satisfaction_bin/apt-cache"
+  printf '%s\n' '#!/bin/sh' "printf '%s\\n' 'SpaceMono Nerd Font Mono'" \
+    >"$satisfaction_bin/fc-list"
+  chmod 0755 \
+    "$satisfaction_bin/dpkg-query" \
+    "$satisfaction_bin/apt-cache" \
+    "$satisfaction_bin/fc-list"
+}
+
+run_satisfaction_case() {
+  satisfaction_name=$1
+  shift
+  satisfaction_root=$test_tmp/satisfaction-$satisfaction_name
+  satisfaction_bin=$satisfaction_root/bin
+  satisfaction_log=$satisfaction_root/commands
+  mkdir -p "$satisfaction_root"
+  prepare_satisfaction_commands "$satisfaction_bin" "$@"
+  run_capture "$satisfaction_root/output" env \
+    PATH="$satisfaction_bin:/usr/bin:/bin" \
+    HOME="$satisfaction_root/home" \
+    XDG_STATE_HOME="$satisfaction_root/state" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+    DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+    DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+    DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$satisfaction_log" \
+    "$bootstrap" --apply
+  satisfaction_case_status=$run_status
+  satisfaction_case_commands=$(cat "$satisfaction_log" 2>/dev/null || true)
+}
+
+create_fake_node_archive() {
+  fake_download_root=$1
+  fake_source_root=$2
+  fake_architecture=$3
+  case "$fake_architecture" in
+    x86_64)
+      fake_node_archive_root=node-v24.19.0-linux-x64
+      fake_node_asset=node-v24.19.0-linux-x64.tar.xz
+      ;;
+    arm64)
+      fake_node_archive_root=node-v24.19.0-linux-arm64
+      fake_node_asset=node-v24.19.0-linux-arm64.tar.xz
+      ;;
+    *) return 1 ;;
+  esac
+  fake_node_root=$fake_source_root/$fake_node_archive_root
+  mkdir -p "$fake_node_root/bin" "$fake_node_root/lib/node_modules/npm/bin"
+  system_node=$(command -v node)
+  # shellcheck disable=SC2016 # Generated fixtures expand these values when invoked.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'if [ "${1:-}" = --version ]; then' \
+    "  printf '%s\\n' 'v24.19.0'" \
+    '  exit 0' \
+    'fi' \
+    "exec '$system_node' \"\$@\"" \
+    >"$fake_node_root/bin/node"
+  # shellcheck disable=SC2016 # Generated fixtures expand these values when invoked.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'if [ "${1:-}" = --version ]; then' \
+    "  printf '%s\\n' '11.17.0'" \
+    '  exit 0' \
+    'fi' \
+    '[ "${1:-}" = ci ] || exit 1' \
+    'shift' \
+    'if [ -n "${DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG:-}" ]; then' \
+    "  printf '%s' 'npm-ci' >>\"\$DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG\"" \
+    '  for npm_argument do' \
+    "    printf ' %s' \"\$npm_argument\" >>\"\$DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG\"" \
+    '  done' \
+    "  printf '\\n' >>\"\$DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG\"" \
+    'fi' \
+    'mkdir -p node_modules/.bin' \
+    'for package_name in bash-language-server pyright vscode-langservers-extracted yaml-language-server; do' \
+    '  mkdir -p "node_modules/$package_name"' \
+    "  printf '%s\\n' '{}' >\"node_modules/\$package_name/package.json\"" \
+    'done' \
+    'for command_name in bash-language-server vscode-json-language-server pyright-langserver yaml-language-server vscode-css-language-server vscode-html-language-server vscode-eslint-language-server pyright npx corepack; do' \
+    "  printf '%s\\n' '#!/bin/sh' 'exit 0' >\"node_modules/.bin/\$command_name\"" \
+    '  chmod 0755 "node_modules/.bin/$command_name"' \
+    'done' \
+    >"$fake_node_root/bin/npm"
+  chmod 0755 "$fake_node_root/bin/node" "$fake_node_root/bin/npm"
+  : >"$fake_node_root/lib/node_modules/npm/bin/npm-cli.js"
+  tar -cJf "$fake_download_root/$fake_node_asset" \
+    -C "$fake_source_root" "$fake_node_archive_root"
+  fake_node_sha=$(file_sha256_for_test "$fake_download_root/$fake_node_asset")
+}
+
+create_fake_lua_archive() {
+  fake_download_root=$1
+  fake_source_root=$2
+  fake_architecture=$3
+  case "$fake_architecture" in
+    x86_64) fake_lua_asset=lua-language-server-3.19.1-linux-x64.tar.gz ;;
+    arm64) fake_lua_asset=lua-language-server-3.19.1-linux-arm64.tar.gz ;;
+    *) return 1 ;;
+  esac
+  fake_lua_root=$fake_source_root/lua-$fake_architecture
+  mkdir -p \
+    "$fake_lua_root/bin" \
+    "$fake_lua_root/locale" \
+    "$fake_lua_root/meta" \
+    "$fake_lua_root/script"
+  printf '%s\n' '#!/bin/sh' 'exit 0' >"$fake_lua_root/bin/lua-language-server"
+  chmod 0755 "$fake_lua_root/bin/lua-language-server"
+  : >"$fake_lua_root/LICENSE"
+  : >"$fake_lua_root/changelog.md"
+  : >"$fake_lua_root/debugger.lua"
+  : >"$fake_lua_root/main.lua"
+  : >"$fake_lua_root/bin/main.lua"
+  : >"$fake_lua_root/locale/.keep"
+  : >"$fake_lua_root/meta/.keep"
+  : >"$fake_lua_root/script/.keep"
+  (
+    cd "$fake_lua_root"
+    tar -czf "$fake_download_root/$fake_lua_asset" \
+      LICENSE bin changelog.md debugger.lua locale main.lua meta script
+  )
+  fake_lua_sha=$(file_sha256_for_test "$fake_download_root/$fake_lua_asset")
+}
+
+file_sha256_for_test() {
+  test_checksum_path=$1
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$test_checksum_path" | awk '{ print $1 }'
+  else
+    shasum -a 256 "$test_checksum_path" | awk '{ print $1 }'
+  fi
+}
+
+run_managed_architecture_case() {
+  managed_case_architecture=$1
+  managed_case_home=$test_tmp/managed-$managed_case_architecture-home
+  managed_case_state=$test_tmp/managed-$managed_case_architecture-state
+  managed_case_log=$test_tmp/managed-$managed_case_architecture.commands
+  mkdir -p "$managed_case_home"
+  run_capture "$test_tmp/managed-$managed_case_architecture.output" env \
+    HOME="$managed_case_home" \
+    XDG_STATE_HOME="$managed_case_state" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+    DOTFILES_BOOTSTRAP_TEST_ARCH="$managed_case_architecture" \
+    DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+    DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS= \
+    DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+    DOTFILES_BOOTSTRAP_TEST_REAL_MANAGED_INSTALL=1 \
+    DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT="$managed_fixture_download" \
+    DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+    DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$managed_case_log" \
+    "$managed_fixture_root/bootstrap" --apply
+  managed_case_status=$run_status
+  managed_case_commands=$(cat "$managed_case_log" 2>/dev/null || true)
+}
+
 test_tmp=$(mktemp -d "${TMPDIR:-/tmp}/dotfiles-bootstrap-test.XXXXXX")
 cleanup() {
   case "$test_tmp" in
@@ -339,6 +555,245 @@ require_contains "$apt_apply_commands" 'sudo apt-get update' 'apt package phase 
 require_contains "$apt_apply_commands" 'sudo apt-get install -y --no-install-recommends --no-remove' 'apt package install refuses removals'
 require_contains "$apt_apply_commands" 'direct-install neovim' 'apt package phase installs supported Neovim upstream'
 require_contains "$apt_apply_commands" 'community-installer ghostty' 'apt package phase records the consented Ghostty installer'
+apt_update_line=$(printf '%s\n' "$apt_apply_commands" | grep -nF 'sudo apt-get update' | head -n 1 | cut -d: -f1)
+apt_install_line=$(printf '%s\n' "$apt_apply_commands" | grep -nF 'sudo apt-get install ' | head -n 1 | cut -d: -f1)
+managed_node_line=$(printf '%s\n' "$apt_apply_commands" | grep -nF 'direct-install node' | head -n 1 | cut -d: -f1)
+managed_lua_line=$(printf '%s\n' "$apt_apply_commands" | grep -nF 'direct-install lua-language-server' | head -n 1 | cut -d: -f1)
+managed_npm_line=$(printf '%s\n' "$apt_apply_commands" | grep -nF 'npm-ci --ignore-scripts --omit=dev --no-audit --no-fund' | head -n 1 | cut -d: -f1)
+if [ -n "$apt_update_line" ] \
+  && [ "$apt_update_line" -lt "$apt_install_line" ] \
+  && [ "$apt_install_line" -lt "$managed_node_line" ] \
+  && [ "$managed_node_line" -lt "$managed_lua_line" ] \
+  && [ "$managed_lua_line" -lt "$managed_npm_line" ]; then
+  pass 'Debian apply preserves apt Node LuaLS and npm installation order'
+else
+  fail 'Debian apply preserves apt Node LuaLS and npm installation order'
+fi
+
+run_satisfaction_case exact \
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0
+if [ "$satisfaction_case_status" -eq 0 ] \
+  && ! printf '%s\n' "$satisfaction_case_commands" \
+    | grep -Eq '^(direct-install (node|lua-language-server)|npm-ci )'; then
+  pass 'exact Node npm and language-server floors are preserved'
+else
+  fail 'exact Node npm and language-server floors are preserved'
+fi
+
+satisfaction_lower_versions_pass=true
+run_satisfaction_case node-low \
+  21.99.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0
+printf '%s\n' "$satisfaction_case_commands" | grep -Fqx 'direct-install node' \
+  || satisfaction_lower_versions_pass=false
+run_satisfaction_case npm-low \
+  22.0.0 9.99.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0
+printf '%s\n' "$satisfaction_case_commands" | grep -Fqx 'direct-install node' \
+  || satisfaction_lower_versions_pass=false
+run_satisfaction_case bash-low \
+  22.0.0 10.0.0 5.5.9 wait 3.19.1 wait 1.1.411 1.24.0
+printf '%s\n' "$satisfaction_case_commands" \
+  | grep -Fqx 'npm-ci --ignore-scripts --omit=dev --no-audit --no-fund' \
+  || satisfaction_lower_versions_pass=false
+run_satisfaction_case lua-low \
+  22.0.0 10.0.0 5.6.0 wait 3.19.0 wait 1.1.411 1.24.0
+printf '%s\n' "$satisfaction_case_commands" | grep -Fqx 'direct-install lua-language-server' \
+  || satisfaction_lower_versions_pass=false
+run_satisfaction_case yaml-low \
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.23.9
+printf '%s\n' "$satisfaction_case_commands" \
+  | grep -Fqx 'npm-ci --ignore-scripts --omit=dev --no-audit --no-fund' \
+  || satisfaction_lower_versions_pass=false
+if [ "$satisfaction_lower_versions_pass" = true ]; then
+  pass 'each immediately lower version selects its exact managed fallback'
+else
+  fail 'each immediately lower version selects its exact managed fallback'
+fi
+
+satisfaction_stdio_pass=true
+run_satisfaction_case json-fail \
+  22.0.0 10.0.0 5.6.0 fail 3.19.1 wait 1.1.411 1.24.0
+printf '%s\n' "$satisfaction_case_commands" \
+  | grep -Fqx 'npm-ci --ignore-scripts --omit=dev --no-audit --no-fund' \
+  || satisfaction_stdio_pass=false
+run_satisfaction_case pyright-fail \
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 fail 1.1.411 1.24.0
+printf '%s\n' "$satisfaction_case_commands" \
+  | grep -Fqx 'npm-ci --ignore-scripts --omit=dev --no-audit --no-fund' \
+  || satisfaction_stdio_pass=false
+run_satisfaction_case pyright-companion-low \
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.410 1.24.0
+printf '%s\n' "$satisfaction_case_commands" \
+  | grep -Fqx 'npm-ci --ignore-scripts --omit=dev --no-audit --no-fund' \
+  || satisfaction_stdio_pass=false
+if [ "$satisfaction_stdio_pass" = true ]; then
+  pass 'stdio startup and the Pyright companion floor select managed fallbacks'
+else
+  fail 'stdio startup and the Pyright companion floor select managed fallbacks'
+fi
+
+collision_home=$test_tmp/lsp-collision-home
+collision_log=$test_tmp/lsp-collision.commands
+mkdir -p "$collision_home/.local/bin"
+printf '%s\n' 'pre-existing command' >"$collision_home/.local/bin/bash-language-server"
+run_capture "$test_tmp/lsp-collision.output" env \
+  HOME="$collision_home" \
+  XDG_STATE_HOME="$test_tmp/lsp-collision-state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+  DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+  DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS= \
+  DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+  DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+  DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$collision_log" \
+  "$bootstrap" --apply
+collision_output=$(cat "$test_tmp/lsp-collision.output")
+if [ "$run_status" -ne 0 ] \
+  && printf '%s\n' "$collision_output" \
+    | grep -Fq "$collision_home/.local/bin/bash-language-server"; then
+  pass 'managed target collision reports the exact occupied path'
+else
+  fail 'managed target collision reports the exact occupied path'
+fi
+if [ ! -e "$collision_log" ]; then
+  pass 'managed target collision precedes apt downloads direct installs and npm'
+else
+  fail 'managed target collision precedes apt downloads direct installs and npm'
+fi
+
+managed_fixture_root=$test_tmp/managed-harness
+managed_fixture_download=$test_tmp/managed-downloads
+managed_fixture_source=$test_tmp/managed-archive-sources
+mkdir -p \
+  "$managed_fixture_root" \
+  "$managed_fixture_download" \
+  "$managed_fixture_source/x86_64" \
+  "$managed_fixture_source/arm64"
+cp "$bootstrap" "$managed_fixture_root/bootstrap"
+cp -R "$dotfiles_dir/manifests" "$managed_fixture_root/manifests"
+
+create_fake_node_archive \
+  "$managed_fixture_download" "$managed_fixture_source/x86_64" x86_64
+fake_node_x86_sha=$fake_node_sha
+create_fake_lua_archive \
+  "$managed_fixture_download" "$managed_fixture_source/x86_64" x86_64
+fake_lua_x86_sha=$fake_lua_sha
+create_fake_node_archive \
+  "$managed_fixture_download" "$managed_fixture_source/arm64" arm64
+fake_node_arm_sha=$fake_node_sha
+create_fake_lua_archive \
+  "$managed_fixture_download" "$managed_fixture_source/arm64" arm64
+fake_lua_arm_sha=$fake_lua_sha
+
+awk -F '\t' -v OFS='\t' \
+  -v node_x86_sha="$fake_node_x86_sha" \
+  -v node_arm_sha="$fake_node_arm_sha" \
+  -v lua_x86_sha="$fake_lua_x86_sha" \
+  -v lua_arm_sha="$fake_lua_arm_sha" '
+  $1 == "node" && $3 == "x86_64" {
+    $6 = "https://fixtures.invalid/node-v24.19.0-linux-x64.tar.xz"
+    $7 = node_x86_sha
+  }
+  $1 == "node" && $3 == "arm64" {
+    $6 = "https://fixtures.invalid/node-v24.19.0-linux-arm64.tar.xz"
+    $7 = node_arm_sha
+  }
+  $1 == "lua-language-server" && $3 == "x86_64" {
+    $6 = "https://fixtures.invalid/lua-language-server-3.19.1-linux-x64.tar.gz"
+    $7 = lua_x86_sha
+  }
+  $1 == "lua-language-server" && $3 == "arm64" {
+    $6 = "https://fixtures.invalid/lua-language-server-3.19.1-linux-arm64.tar.gz"
+    $7 = lua_arm_sha
+  }
+  { print }
+' "$managed_fixture_root/manifests/packages-direct.tsv" \
+  >"$managed_fixture_root/manifests/packages-direct.tsv.new"
+mv "$managed_fixture_root/manifests/packages-direct.tsv.new" \
+  "$managed_fixture_root/manifests/packages-direct.tsv"
+
+for managed_test_architecture in x86_64 arm64; do
+  run_managed_architecture_case "$managed_test_architecture"
+  managed_case_pass=true
+  managed_node_directory=$managed_case_home/.local/opt/node-24.19.0-$managed_test_architecture
+  managed_lua_directory=$managed_case_home/.local/opt/lua-language-server-3.19.1-$managed_test_architecture
+  managed_npm_directory=$managed_case_home/.local/opt/dotfiles-lsp-node-$actual_npm_lock_sha256
+  case "$managed_test_architecture" in
+    x86_64)
+      expected_node_asset=node-v24.19.0-linux-x64.tar.xz
+      expected_lua_asset=lua-language-server-3.19.1-linux-x64.tar.gz
+      ;;
+    arm64)
+      expected_node_asset=node-v24.19.0-linux-arm64.tar.xz
+      expected_lua_asset=lua-language-server-3.19.1-linux-arm64.tar.gz
+      ;;
+  esac
+
+  [ "$managed_case_status" -eq 0 ] || managed_case_pass=false
+  [ -d "$managed_node_directory" ] || managed_case_pass=false
+  [ -d "$managed_lua_directory" ] || managed_case_pass=false
+  [ -d "$managed_npm_directory" ] || managed_case_pass=false
+  [ "$(readlink "$managed_case_home/.local/bin/node" 2>/dev/null || true)" \
+    = "$managed_node_directory/bin/node" ] || managed_case_pass=false
+  [ "$(readlink "$managed_case_home/.local/bin/npm" 2>/dev/null || true)" \
+    = "$managed_node_directory/bin/npm" ] || managed_case_pass=false
+  [ -x "$managed_case_home/.local/bin/lua-language-server" ] \
+    && [ ! -L "$managed_case_home/.local/bin/lua-language-server" ] \
+    || managed_case_pass=false
+  grep -Fq \
+    "../opt/lua-language-server-3.19.1-$managed_test_architecture/bin/lua-language-server" \
+    "$managed_case_home/.local/bin/lua-language-server" \
+    || managed_case_pass=false
+  for managed_command in \
+    bash-language-server \
+    vscode-json-language-server \
+    pyright-langserver \
+    yaml-language-server
+  do
+    [ -L "$managed_case_home/.local/bin/$managed_command" ] \
+      || managed_case_pass=false
+  done
+  for managed_package in \
+    bash-language-server \
+    vscode-langservers-extracted \
+    pyright \
+    yaml-language-server
+  do
+    [ -d "$managed_npm_directory/node_modules/$managed_package" ] \
+      || managed_case_pass=false
+  done
+  for unpublished_command in \
+    vscode-css-language-server \
+    vscode-html-language-server \
+    vscode-eslint-language-server \
+    pyright \
+    npx \
+    corepack
+  do
+    [ ! -e "$managed_case_home/.local/bin/$unpublished_command" ] \
+      && [ ! -L "$managed_case_home/.local/bin/$unpublished_command" ] \
+      || managed_case_pass=false
+  done
+  [ "$(find "$managed_case_home/.local/bin" -mindepth 1 -maxdepth 1 | wc -l)" -eq 7 ] \
+    || managed_case_pass=false
+  printf '%s\n' "$managed_case_commands" \
+    | grep -Fqx "download https://fixtures.invalid/$expected_node_asset" \
+    || managed_case_pass=false
+  printf '%s\n' "$managed_case_commands" \
+    | grep -Fqx "download https://fixtures.invalid/$expected_lua_asset" \
+    || managed_case_pass=false
+  printf '%s\n' "$managed_case_commands" \
+    | grep -Fqx 'npm-ci --ignore-scripts --omit=dev --no-audit --no-fund' \
+    || managed_case_pass=false
+
+  if [ "$managed_case_pass" = true ]; then
+    pass "$managed_test_architecture stages and publishes the exact managed language-server set"
+  else
+    fail "$managed_test_architecture stages and publishes the exact managed language-server set"
+    sed "s/^/  $managed_test_architecture output: /" \
+      "$test_tmp/managed-$managed_test_architecture.output" >&2
+  fi
+done
 
 pacman_apply_log=$test_tmp/pacman-apply.commands
 run_capture "$test_tmp/pacman-apply.output" env \
