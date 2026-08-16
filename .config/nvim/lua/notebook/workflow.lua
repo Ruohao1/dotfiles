@@ -581,16 +581,34 @@ local function new(deps)
       return false
     end
     if #kernels == 0 then
-      local write_ok, write_error = pcall(deps.write_buffer, bufnr)
+      local write_ok, write_error = pcall(deps.buf_call, bufnr, function()
+        deps.nvim_cmd({ cmd = "write" }, {})
+      end)
       if not write_ok then
         notify("Could not save notebook source: " .. tostring(write_error), vim.log.levels.ERROR)
+        return false
+      end
+      local modified_ok, still_modified = pcall(deps.buf_modified, bufnr)
+      if not modified_ok then
+        notify(
+          "Could not save notebook source: could not verify buffer state: "
+            .. tostring(still_modified),
+          vim.log.levels.ERROR
+        )
+        return false
+      end
+      if still_modified then
+        notify(
+          "Could not save notebook source: Jupytext left the notebook buffer modified",
+          vim.log.levels.ERROR
+        )
         return false
       end
       notify("Notebook source saved; no active kernel outputs to export", vim.log.levels.INFO)
       return true
     end
 
-    local export_ok, export_error = pcall(deps.save_export, bufnr)
+    local export_ok, export_error = pcall(deps.save.export, bufnr)
     if not export_ok then
       notify("Could not export notebook outputs: " .. tostring(export_error), vim.log.levels.ERROR)
       return false
@@ -619,6 +637,9 @@ end
 local default_dependencies = {
   buf_call = vim.api.nvim_buf_call,
   buf_is_valid = vim.api.nvim_buf_is_valid,
+  buf_modified = function(bufnr)
+    return vim.api.nvim_get_option_value("modified", { buf = bufnr })
+  end,
   buf_name = vim.api.nvim_buf_get_name,
   cell_ranges = cell_ranges,
   command = function(name, arguments, modifiers)
@@ -643,6 +664,7 @@ local default_dependencies = {
   get_current_win = vim.api.nvim_get_current_win,
   get_cursor = vim.api.nvim_win_get_cursor,
   notify = vim.notify,
+  nvim_cmd = vim.api.nvim_cmd,
   quarto_activate = function()
     require("quarto").activate()
   end,
@@ -662,9 +684,11 @@ local default_dependencies = {
     end
     return vim.fn.MoltenRunningKernels(local_only)
   end,
-  save_export = function(bufnr)
-    return require("notebook.save").export(bufnr)
-  end,
+  save = {
+    export = function(bufnr)
+      return require("notebook.save").export(bufnr)
+    end,
+  },
   select = vim.ui.select,
   set_buf_mark = function(bufnr, name, mark)
     vim.api.nvim_buf_set_mark(bufnr, name, mark[1], mark[2], {})
@@ -682,11 +706,6 @@ local default_dependencies = {
   end,
   win_get_buf = vim.api.nvim_win_get_buf,
   win_is_valid = vim.api.nvim_win_is_valid,
-  write_buffer = function(bufnr)
-    vim.api.nvim_buf_call(bufnr, function()
-      vim.cmd.write()
-    end)
-  end,
 }
 
 local workflow = new(default_dependencies)

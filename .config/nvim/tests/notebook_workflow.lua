@@ -130,6 +130,7 @@ local function new_fixture()
       [notebook_buffer] = {
         filetype = "markdown",
         maps = {},
+        modified = true,
         name = "/work/analysis.ipynb",
         valid = true,
         vars = {
@@ -150,6 +151,7 @@ local function new_fixture()
       run_cell = 0,
       run_range = 0,
       save_export = 0,
+      save_buffers = {},
       select = 0,
       writes = 0,
     },
@@ -218,6 +220,9 @@ local function new_fixture()
     end,
     buf_name = function(bufnr)
       return fixture.buffers[bufnr] and fixture.buffers[bufnr].name or ""
+    end,
+    buf_modified = function(bufnr)
+      return fixture.buffers[bufnr].modified
     end,
     cell_ranges = function()
       if fixture.cell_error then
@@ -316,6 +321,18 @@ local function new_fixture()
         message = tostring(message),
       }
     end,
+    nvim_cmd = function(command)
+      expect(command.cmd == "write", "unexpected raw notebook command")
+      expect(not command.bang, "source-only save unexpectedly forced the write")
+      expect(call_buffer == notebook_buffer, "source write ran outside the notebook buffer")
+      fixture.calls.writes = fixture.calls.writes + 1
+      if fixture.write_error then
+        error(fixture.write_error)
+      end
+      if not fixture.write_noop then
+        fixture.buffers[notebook_buffer].modified = false
+      end
+    end,
     quarto_activate = function()
       expect(fixture.buffers[call_buffer] ~= nil, "Quarto activated outside a known buffer")
       fixture.calls.quarto = fixture.calls.quarto + 1
@@ -342,13 +359,16 @@ local function new_fixture()
       end
       return vim.deepcopy(fixture.running)
     end,
-    save_export = function(bufnr)
-      fixture.calls.save_export = fixture.calls.save_export + 1
-      expect(bufnr == notebook_buffer, "export targeted the wrong buffer")
-      if fixture.save_error then
-        error(fixture.save_error)
-      end
-    end,
+    save = {
+      export = function(bufnr)
+        fixture.calls.save_export = fixture.calls.save_export + 1
+        fixture.calls.save_buffers[#fixture.calls.save_buffers + 1] = bufnr
+        expect(bufnr == notebook_buffer, "export targeted the wrong buffer")
+        if fixture.save_error then
+          error(fixture.save_error)
+        end
+      end,
+    },
     select = function(choices, options, callback)
       fixture.calls.select = fixture.calls.select + 1
       fixture.last_select = { choices = choices, options = options }
@@ -404,13 +424,6 @@ local function new_fixture()
     win_is_valid = function(winid)
       return fixture.windows[winid] ~= nil and fixture.windows[winid].valid
     end,
-    write_buffer = function(bufnr)
-      fixture.calls.writes = fixture.calls.writes + 1
-      expect(bufnr == notebook_buffer, "source write targeted the wrong buffer")
-      if fixture.write_error then
-        error(fixture.write_error)
-      end
-    end,
   }
 
   fixture.workflow = workflow_module._test.new(dependencies)
@@ -456,6 +469,32 @@ do
   fixture.autocmds.BufReadPost[1].callback({ buf = notebook_buffer })
   expect(fixture.calls.quarto == 1, "attachment autocmd did not activate Quarto")
   expect(fixture.calls.init == 0, "setup or attachment initialized Molten eagerly")
+end
+
+do
+  local fixture = new_fixture()
+  fixture:attach()
+  fixture.write_noop = true
+  expect(
+    fixture.workflow.save_outputs(notebook_buffer) == false,
+    "silent Jupytext source-write abort reported success"
+  )
+  expect(fixture.calls.writes == 1, "silent source-write abort skipped the write attempt")
+  expect(fixture.calls.save_export == 0, "silent source-write abort attempted output export")
+  expect(
+    fixture:last_notification():find("left the notebook buffer modified", 1, true),
+    "silent source-write abort diagnostic is unclear"
+  )
+
+  fixture.buffers[notebook_buffer].modified = false
+  expect(
+    fixture.workflow.save_outputs(notebook_buffer) == true,
+    "already-clean source-write no-op reported failure"
+  )
+  expect(
+    fixture:last_notification():find("Notebook source saved", 1, true),
+    "already-clean source-write no-op lost safe feedback"
+  )
 end
 
 do
@@ -831,6 +870,10 @@ do
   expect(fixture.commands[2].name == "MoltenInterrupt", "interrupt command changed")
   expect(fixture.commands[3].name == "MoltenRestart", "restart command changed")
   expect(fixture.calls.save_export == 1, "active-kernel save did not delegate to exporter")
+  expect(
+    fixture.calls.save_buffers[1] == notebook_buffer,
+    "active-kernel save delegated the wrong buffer"
+  )
 
   fixture.command_errors.MoltenInterrupt = "interrupt exploded"
   local ok = pcall(fixture.workflow.interrupt, notebook_buffer)
@@ -838,6 +881,18 @@ do
   expect(
     fixture:last_notification():find("interrupt exploded", 1, true),
     "kernel control command failure was not reported"
+  )
+end
+
+do
+  local fixture = new_fixture()
+  fixture:attach()
+  fixture.running = { "kernel-id" }
+  fixture.workflow.save_outputs(0)
+  expect(fixture.calls.save_export == 1, "buffer-zero save did not reach the exporter")
+  expect(
+    fixture.calls.save_buffers[1] == notebook_buffer,
+    "buffer-zero save was not normalized before export"
   )
 end
 

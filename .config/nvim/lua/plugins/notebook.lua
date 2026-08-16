@@ -11,6 +11,7 @@ return {
       jupytext = python.paths().jupytext,
       format = "markdown",
       update = true,
+      async_write = false,
       autosync = false,
       handle_url_schemes = false,
       filetype = function(path, _, metadata)

@@ -31,6 +31,7 @@ expect(
 )
 expect(jupytext.opts.format == "markdown", "notebooks must use Markdown representation")
 expect(jupytext.opts.update == true, "Jupytext must preserve notebook metadata and outputs")
+expect(jupytext.opts.async_write == false, "notebook writes must finish before save transactions")
 expect(jupytext.opts.autosync == false, "Jupytext paired-file synchronization must remain disabled")
 expect(jupytext.opts.handle_url_schemes == false, "Jupytext must not claim URL buffers")
 
