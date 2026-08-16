@@ -380,6 +380,8 @@ for _, fragment in ipairs({
   "parquet tool assertions: ok",
   "parquet viewer assertions: ok",
   "parquet health assertions: ok",
+  "Neovim Parquet resolver rejects malformed PATH uv and selects managed fallback",
+  "Neovim Parquet integration rejects a nonzero viewer exit",
   "Neovim Parquet viewer loads and exits without changing its source",
   "Neovim lockfile contains exactly fifteen object-valued pinned plugins",
   "Neovim fifteen-plugin revision and source trust gate satisfied",

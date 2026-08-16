@@ -2203,6 +2203,274 @@ parquet_file_fingerprint() {
     "$1"
 }
 
+run_nvim_parquet_resolver_selection_test() {
+  parquet_selection_root="$check_tmp/nvim-parquet-resolver-selection"
+  parquet_selection_path_bin="$parquet_selection_root/path-bin"
+  parquet_selection_home="$parquet_selection_root/home"
+  parquet_selection_managed_bin="$parquet_selection_home/.local/bin"
+  parquet_selection_tool_root="$parquet_selection_root/tools"
+  parquet_selection_environment="$parquet_selection_tool_root/visidata"
+  parquet_selection_python="$parquet_selection_environment/bin/python"
+  parquet_selection_viewer="$parquet_selection_environment/bin/vd"
+  parquet_selection_pyarrow="$parquet_selection_environment/lib/python3.13/site-packages/pyarrow/__init__.py"
+  parquet_selection_output="$parquet_selection_root/output.txt"
+  parquet_selection_log="$parquet_selection_root/nvim.log"
+  parquet_selection_nvim=$(command -v nvim 2>/dev/null || true)
+  parquet_selection_jq=$(command -v jq 2>/dev/null || true)
+
+  case "$parquet_selection_nvim" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case "$parquet_selection_jq" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  if ! (umask 077 && mkdir -p \
+    "$parquet_selection_path_bin" \
+    "$parquet_selection_managed_bin" \
+    "$parquet_selection_environment/bin" \
+    "$parquet_selection_environment/lib/python3.13/site-packages/pyarrow" \
+    "$parquet_selection_root/config" \
+    "$parquet_selection_root/data" \
+    "$parquet_selection_root/state" \
+    "$parquet_selection_root/cache" \
+    "$parquet_selection_root/runtime"); then
+    return 1
+  fi
+
+  # shellcheck disable=SC2016  # Preserve parameters for the generated fixture.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'if [ "${1:-}" = --version ]; then' \
+    "  printf '%s\\n' 'uv 0.11.6 unexpected-suffix'" \
+    '  exit 0' \
+    'fi' \
+    'exit 91' \
+    > "$parquet_selection_path_bin/uv"
+  # shellcheck disable=SC2016  # Preserve parameters for the generated fixture.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'case "${1:-}:${2:-}:${3:-}" in' \
+    '  --version::)' \
+    "    printf '%s\\n' 'uv 0.11.6'" \
+    '    ;;' \
+    '  tool:dir:--no-config)' \
+    "    printf '%s\\n' \"\$DOTFILES_PARQUET_SELF_TEST_TOOL_ROOT\"" \
+    '    ;;' \
+    '  *)' \
+    '    exit 92' \
+    '    ;;' \
+    'esac' \
+    > "$parquet_selection_managed_bin/uv"
+  # shellcheck disable=SC1003,SC2016  # Preserve fixture variables and continuations.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    '"$DOTFILES_PARQUET_SELF_TEST_JQ" -cn \' \
+    '  --arg path "$DOTFILES_PARQUET_SELF_TEST_PYARROW" \' \
+    "  '{pyarrow:{path:\$path,version:\"25.0.0\"},visidata:{version:\"3.4\"}}'" \
+    > "$parquet_selection_python"
+  printf '%s\n' '#!/bin/sh' 'exit 0' > "$parquet_selection_viewer"
+  : > "$parquet_selection_pyarrow"
+  chmod 700 \
+    "$parquet_selection_path_bin/uv" \
+    "$parquet_selection_managed_bin/uv" \
+    "$parquet_selection_python" \
+    "$parquet_selection_viewer"
+  : > "$parquet_selection_log"
+
+  if PATH="$parquet_selection_path_bin:$PATH" \
+    HOME="$parquet_selection_home" \
+    XDG_CONFIG_HOME="$parquet_selection_root/config" \
+    XDG_DATA_HOME="$parquet_selection_root/data" \
+    XDG_STATE_HOME="$parquet_selection_root/state" \
+    XDG_CACHE_HOME="$parquet_selection_root/cache" \
+    XDG_RUNTIME_DIR="$parquet_selection_root/runtime" \
+    NVIM_LOG_FILE="$parquet_selection_log" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_OFFLINE=1 \
+    DOTFILES_NVIM_ROOT="$nvim_root" \
+    DOTFILES_PARQUET_RESOLVER_SELECTION_TEST=1 \
+    DOTFILES_PARQUET_EXPECTED_UV="$parquet_selection_managed_bin/uv" \
+    DOTFILES_PARQUET_EXPECTED_ENVIRONMENT="$parquet_selection_environment" \
+    DOTFILES_PARQUET_EXPECTED_PYTHON="$parquet_selection_python" \
+    DOTFILES_PARQUET_EXPECTED_VIEWER="$parquet_selection_viewer" \
+    DOTFILES_PARQUET_EXPECTED_PYARROW="$parquet_selection_pyarrow" \
+    DOTFILES_PARQUET_SELF_TEST_TOOL_ROOT="$parquet_selection_tool_root" \
+    DOTFILES_PARQUET_SELF_TEST_PYARROW="$parquet_selection_pyarrow" \
+    DOTFILES_PARQUET_SELF_TEST_JQ="$parquet_selection_jq" \
+    "$parquet_selection_nvim" --clean --headless -u NONE -i NONE \
+    -c 'lua vim.opt.runtimepath:prepend(vim.env.DOTFILES_NVIM_ROOT)' \
+    -l "$nvim_root/tests/parquet_integration.lua" \
+    > "$parquet_selection_output" 2>&1 \
+    && ! nvim_log_has_error "$parquet_selection_output" \
+    && grep -Fqx 'parquet resolver selection assertions: ok' \
+      "$parquet_selection_output" \
+    && [ ! -s "$parquet_selection_log" ]; then
+    return 0
+  fi
+
+  [ ! -s "$parquet_selection_output" ] \
+    || sed 's/^/      /' "$parquet_selection_output" >&2
+  [ ! -s "$parquet_selection_log" ] \
+    || sed 's/^/      /' "$parquet_selection_log" >&2
+  return 1
+}
+
+resolve_nvim_parquet_tool() {
+  parquet_resolver_root="$check_tmp/nvim-parquet-resolver"
+  parquet_resolver_report="$parquet_resolver_root/report.json"
+  parquet_resolver_log="$parquet_resolver_root/nvim.log"
+  parquet_resolver_nvim=$(command -v nvim 2>/dev/null || true)
+  parquet_resolver_jq=$(command -v jq 2>/dev/null || true)
+  case "$parquet_resolver_nvim" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case "$parquet_resolver_jq" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  if ! (umask 077 && mkdir -p \
+    "$parquet_resolver_root/config" \
+    "$parquet_resolver_root/state" \
+    "$parquet_resolver_root/cache" \
+    "$parquet_resolver_root/runtime"); then
+    return 1
+  fi
+  : > "$parquet_resolver_log"
+
+  if ! env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
+    XDG_CONFIG_HOME="$parquet_resolver_root/config" \
+    XDG_DATA_HOME="$data_home" \
+    XDG_STATE_HOME="$parquet_resolver_root/state" \
+    XDG_CACHE_HOME="$parquet_resolver_root/cache" \
+    XDG_RUNTIME_DIR="$parquet_resolver_root/runtime" \
+    NVIM_LOG_FILE="$parquet_resolver_log" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_OFFLINE=1 \
+    DOTFILES_NVIM_ROOT="$nvim_root" \
+    DOTFILES_PARQUET_REPORT="$parquet_resolver_report" \
+    "$parquet_resolver_nvim" --clean --headless -u NONE -i NONE \
+    -c 'lua vim.opt.runtimepath:prepend(vim.env.DOTFILES_NVIM_ROOT)' \
+    -c 'lua local report = require("parquet.tool").probe({ refresh = true }); assert(vim.fn.writefile({ vim.json.encode(report) }, vim.env.DOTFILES_PARQUET_REPORT) == 0)' \
+    -c qa > "$parquet_probe_output" 2>&1 \
+    || nvim_log_has_error "$parquet_probe_output" \
+    || [ -s "$parquet_resolver_log" ]; then
+    return 1
+  fi
+
+  if ! "$parquet_resolver_jq" -e '
+      def safe_absolute:
+        type == "string"
+        and length > 1
+        and startswith("/")
+        and (test("[[:cntrl:]]") | not);
+      type == "object"
+      and .ok == true
+      and (.errors | type == "array" and length == 0)
+      and .expected == {"pyarrow":"25.0.0","uv":"0.11.6","visidata":"3.4"}
+      and (.uv | type == "object" and .ok == true and (.path | safe_absolute) and (.version | type == "string"))
+      and (.environment | safe_absolute)
+      and (.python | safe_absolute)
+      and (.viewer | type == "object" and .ok == true and .version == "3.4" and (.path | safe_absolute))
+      and (.pyarrow | type == "object" and .ok == true and .version == "25.0.0" and (.path | safe_absolute))
+    ' "$parquet_resolver_report" > /dev/null 2>> "$parquet_probe_output"; then
+    return 1
+  fi
+
+  parquet_tool_uv=$("$parquet_resolver_jq" -er '.uv.path' \
+    "$parquet_resolver_report" 2>> "$parquet_probe_output") || return 1
+  parquet_tool_environment=$("$parquet_resolver_jq" -er '.environment' \
+    "$parquet_resolver_report" 2>> "$parquet_probe_output") || return 1
+  parquet_tool_python=$("$parquet_resolver_jq" -er '.python' \
+    "$parquet_resolver_report" 2>> "$parquet_probe_output") || return 1
+  parquet_tool_viewer=$("$parquet_resolver_jq" -er '.viewer.path' \
+    "$parquet_resolver_report" 2>> "$parquet_probe_output") || return 1
+  parquet_tool_pyarrow=$("$parquet_resolver_jq" -er '.pyarrow.path' \
+    "$parquet_resolver_report" 2>> "$parquet_probe_output") || return 1
+  parquet_tool_uv_directory=${parquet_tool_uv%/*}
+  [ -n "$parquet_tool_uv_directory" ] || parquet_tool_uv_directory=/
+
+  [ -x "$parquet_tool_uv" ] \
+    && [ -d "$parquet_tool_uv_directory" ] \
+    && [ -d "$parquet_tool_environment" ] \
+    && [ -x "$parquet_tool_python" ] \
+    && [ -x "$parquet_tool_viewer" ] \
+    && [ -r "$parquet_tool_pyarrow" ] \
+    || return 1
+  case "$parquet_tool_viewer" in
+    "$parquet_tool_environment"/*) ;;
+    *) return 1 ;;
+  esac
+  case "$parquet_tool_pyarrow" in
+    "$parquet_tool_environment"/*) ;;
+    *) return 1 ;;
+  esac
+  nvim_parquet_versions_are_exact "$parquet_tool_python" \
+    >> "$parquet_probe_output" 2>&1
+}
+
+run_nvim_parquet_integration_test() {
+  [ "$#" -eq 5 ] || return 2
+  parquet_integration_mode=$1
+  parquet_integration_fixture=$2
+  parquet_integration_return=$3
+  parquet_integration_output=$4
+  parquet_integration_log=$5
+  case "$parquet_integration_mode" in
+    normal) parquet_integration_force_nonzero=0 ;;
+    nonzero) parquet_integration_force_nonzero=1 ;;
+    *) return 2 ;;
+  esac
+  for parquet_integration_owned_path in \
+    "$parquet_integration_fixture" \
+    "$parquet_integration_return" \
+    "$parquet_integration_output" \
+    "$parquet_integration_log"
+  do
+    case "$parquet_integration_owned_path" in
+      "$check_tmp"/*) ;;
+      *) return 2 ;;
+    esac
+  done
+  parquet_integration_nvim=$(command -v nvim 2>/dev/null || true)
+  case "$parquet_integration_nvim" in
+    /*) [ -x "$parquet_integration_nvim" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  [ -d "$parquet_tool_uv_directory" ] || return 1
+  : > "$parquet_integration_log"
+
+  env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
+    HOME="$check_tmp/nvim-parquet-home" \
+    PATH="$parquet_tool_uv_directory:$PATH" \
+    TMPDIR="$check_tmp" \
+    XDG_CONFIG_HOME="$config_root" \
+    XDG_DATA_HOME="$data_home" \
+    XDG_STATE_HOME="$XDG_STATE_HOME" \
+    XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+    XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+    NVIM_LOG_FILE="$parquet_integration_log" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_OFFLINE=1 \
+    TERM=xterm-256color \
+    TERM_PROGRAM=ghostty \
+    DOTFILES_NVIM_SKIP_PARSER_INSTALL=1 \
+    DOTFILES_PARQUET_FIXTURE="$parquet_integration_fixture" \
+    DOTFILES_PARQUET_RETURN="$parquet_integration_return" \
+    DOTFILES_PARQUET_FORCE_NONZERO="$parquet_integration_force_nonzero" \
+    DOTFILES_PARQUET_EXPECTED_UV="$parquet_tool_uv" \
+    DOTFILES_PARQUET_EXPECTED_ENVIRONMENT="$parquet_tool_environment" \
+    DOTFILES_PARQUET_EXPECTED_PYTHON="$parquet_tool_python" \
+    DOTFILES_PARQUET_EXPECTED_VIEWER="$parquet_tool_viewer" \
+    DOTFILES_PARQUET_EXPECTED_PYARROW="$parquet_tool_pyarrow" \
+    "$parquet_integration_nvim" --headless -i NONE \
+    -c 'lua vim.defer_fn(function() vim.api.nvim_err_writeln("parquet integration exceeded 30 seconds"); vim.cmd("cquit 124") end, 30000)' \
+    -c "luafile $nvim_root/tests/parquet_integration.lua" \
+    -c qa > "$parquet_integration_output" 2>&1
+}
+
 run_nvim_notebook_roundtrip() {
   [ "$#" -eq 6 ] || return 2
   nvim_roundtrip_name=$1
@@ -5733,6 +6001,19 @@ esac
 case "${DOTFILES_CHECK_MODE:-}" in
   "")
     ;;
+  nvim-parquet-resolver-self-test)
+    parquet_probe_output="$check_tmp/parquet-tool.txt"
+    : > "$parquet_probe_output"
+    if run_nvim_parquet_resolver_selection_test \
+      && resolve_nvim_parquet_tool; then
+      printf '%s\n' 'parquet resolver selection assertions: ok'
+      printf '%s\n' 'parquet authoritative resolver assertions: ok'
+      exit 0
+    fi
+    [ ! -s "$parquet_probe_output" ] \
+      || sed 's/^/      /' "$parquet_probe_output" >&2
+    exit 1
+    ;;
   nvim-trust-self-test)
     if run_nvim_trust_self_test; then
       exit 0
@@ -5785,42 +6066,28 @@ if command -v uv >/dev/null 2>&1; then
   fi
 fi
 
-parquet_runtime_ready=$uv_ready
-parquet_tool_root=""
+parquet_runtime_ready=false
+parquet_tool_uv=""
+parquet_tool_uv_directory=""
+parquet_tool_environment=""
 parquet_tool_python=""
 parquet_tool_viewer=""
-if [ "$uv_ready" = true ]; then
-  parquet_tool_root=$(UV_OFFLINE=1 uv tool dir --no-config 2>/dev/null || true)
-  case "$parquet_tool_root" in
-    /*)
-      if [ "$parquet_tool_root" != / ] \
-        && ! printf '%s' "$parquet_tool_root" | LC_ALL=C grep -q '[[:cntrl:]]' \
-        && [ -d "$parquet_tool_root" ]; then
-        parquet_tool_root=$(CDPATH='' cd -- "$parquet_tool_root" 2>/dev/null && pwd -P || true)
-      else
-        parquet_tool_root=""
-      fi
-      if [ -n "$parquet_tool_root" ] && [ "$parquet_tool_root" != / ]; then
-        parquet_tool_python=$parquet_tool_root/visidata/bin/python
-        parquet_tool_viewer=$parquet_tool_root/visidata/bin/vd
-      fi
-      ;;
-    *)
-      parquet_tool_root=""
-      ;;
-  esac
+parquet_tool_pyarrow=""
+parquet_probe_output="$check_tmp/parquet-tool.txt"
+
+if run_nvim_parquet_resolver_selection_test; then
+  pass "Neovim Parquet resolver rejects malformed PATH uv and selects managed fallback"
+else
+  fail "Neovim Parquet resolver selection regression failed"
 fi
 
-parquet_probe_output="$check_tmp/parquet-tool.txt"
-if [ -x "$parquet_tool_python" ] \
-  && [ -x "$parquet_tool_viewer" ] \
-  && nvim_parquet_versions_are_exact "$parquet_tool_python" \
-    > "$parquet_probe_output" 2>&1; then
+: > "$parquet_probe_output"
+if resolve_nvim_parquet_tool; then
   pass "Neovim Parquet viewer has exact VisiData 3.4 and PyArrow 25.0.0"
+  parquet_runtime_ready=true
 else
   [ ! -s "$parquet_probe_output" ] || sed 's/^/      /' "$parquet_probe_output" >&2
   fail "Neovim Parquet viewer is missing or mismatched; run the dotfiles bootstrap"
-  parquet_runtime_ready=false
 fi
 
 tree_sitter_version=""
@@ -10834,6 +11101,8 @@ parquet_fixture="$parquet_integration_root/read-only.parquet"
 parquet_return="$parquet_integration_root/return.md"
 parquet_output="$check_tmp/nvim-parquet-integration.out"
 parquet_log="$check_tmp/nvim-parquet-integration.log"
+parquet_nonzero_output="$check_tmp/nvim-parquet-integration-nonzero.out"
+parquet_nonzero_log="$check_tmp/nvim-parquet-integration-nonzero.log"
 
 if [ "$nvim_config_ready" = true ] \
   && [ "$parquet_runtime_ready" = true ] \
@@ -10846,28 +11115,33 @@ if [ "$nvim_config_ready" = true ] \
     'import pyarrow as pa,pyarrow.parquet as pq,sys; pq.write_table(pa.table({"id":[1,2],"label":["one","two"]}),sys.argv[1])' \
     "$parquet_fixture"; then
   parquet_before=$(parquet_file_fingerprint "$parquet_fixture" 2>/dev/null || true)
-  : > "$parquet_log"
+
+  run_nvim_parquet_integration_test \
+    nonzero "$parquet_fixture" "$parquet_return" \
+    "$parquet_nonzero_output" "$parquet_nonzero_log" || true
   if [ -n "$parquet_before" ] \
-    && env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
-    HOME="$check_tmp/nvim-parquet-home" \
-    TMPDIR="$check_tmp" \
-    XDG_CONFIG_HOME="$config_root" \
-    XDG_DATA_HOME="$data_home" \
-    XDG_STATE_HOME="$XDG_STATE_HOME" \
-    XDG_CACHE_HOME="$XDG_CACHE_HOME" \
-    XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-    NVIM_LOG_FILE="$parquet_log" \
-    PYTHONDONTWRITEBYTECODE=1 \
-    UV_OFFLINE=1 \
-    TERM=xterm-256color \
-    TERM_PROGRAM=ghostty \
-    DOTFILES_NVIM_SKIP_PARSER_INSTALL=1 \
-    DOTFILES_PARQUET_FIXTURE="$parquet_fixture" \
-    DOTFILES_PARQUET_RETURN="$parquet_return" \
-    nvim --headless -i NONE \
-    -c 'lua vim.defer_fn(function() vim.api.nvim_err_writeln("parquet integration exceeded 30 seconds"); vim.cmd("cquit 124") end, 30000)' \
-    -c "luafile $nvim_root/tests/parquet_integration.lua" \
-    -c qa > "$parquet_output" 2>&1 \
+    && nvim_log_has_error "$parquet_nonzero_output" \
+    && grep -Eq 'VisiData exited with status [1-9][0-9]*' \
+      "$parquet_nonzero_output" \
+    && ! grep -Fq 'parquet integration assertions: ok' \
+      "$parquet_nonzero_output" \
+    && ! grep -Fq 'parquet integration exceeded 30 seconds' \
+      "$parquet_nonzero_output" \
+    && [ ! -s "$parquet_nonzero_log" ] \
+    && [ "$(parquet_file_fingerprint "$parquet_fixture")" = "$parquet_before" ]; then
+    pass "Neovim Parquet integration rejects a nonzero viewer exit"
+  else
+    [ ! -s "$parquet_nonzero_output" ] \
+      || sed 's/^/      /' "$parquet_nonzero_output" >&2
+    [ ! -s "$parquet_nonzero_log" ] \
+      || sed 's/^/      /' "$parquet_nonzero_log" >&2
+    fail "Neovim Parquet integration accepted a nonzero viewer exit or changed its source"
+  fi
+
+  if [ -n "$parquet_before" ] \
+    && run_nvim_parquet_integration_test \
+      normal "$parquet_fixture" "$parquet_return" \
+      "$parquet_output" "$parquet_log" \
     && ! nvim_log_has_error "$parquet_output" \
     && grep -Fqx 'parquet integration assertions: ok' "$parquet_output" \
     && [ ! -s "$parquet_log" ] \
