@@ -157,7 +157,7 @@ make_term_ignoring_stdio_command() {
     "trap '' TERM" \
     "printf '%s\\n' \"\$\$\" >'$probe_pid_file'" \
     "printf '%s\\n' ready >'$probe_ready_file'" \
-    "kill -TERM \"\$PPID\"" \
+    "kill -TERM \"\${DOTFILES_BOOTSTRAP_TEST_PROBE_OWNER_PID:-\$PPID}\"" \
     'while :; do :; done' \
     >"$command_path"
   chmod 0755 "$command_path"
@@ -174,6 +174,113 @@ kill_matching_test_process() {
       kill -KILL "$matching_test_pid" >/dev/null 2>&1 || true
       ;;
   esac
+}
+
+test_process_is_matching() {
+  matching_test_pid=$1
+  matching_test_path=$2
+  matching_test_command=$(ps -p "$matching_test_pid" -o command= 2>/dev/null || true)
+  case "$matching_test_command" in
+    *"$matching_test_path"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+make_direct_probe_bootstrap() {
+  direct_probe_source=$1
+  direct_probe_target=$2
+  awk '
+    $0 == "platform=$(detect_platform)" {
+      print "if [ \"${DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE:-0}\" = 1 ]; then"
+      print "  if bounded_command_succeeds \"$DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_COMMAND\"; then"
+      print "    exit 0"
+      print "  fi"
+      print "  exit 42"
+      print "fi"
+      injected += 1
+    }
+    { print }
+    END {
+      if (injected != 1) exit 1
+    }
+  ' "$direct_probe_source" >"$direct_probe_target"
+  chmod 0755 "$direct_probe_target"
+}
+
+make_probe_tree_command() {
+  probe_tree_path=$1
+  probe_tree_mode=$2
+  probe_tree_pid_file=$3
+  probe_tree_child_pid_file=$4
+  probe_tree_auxiliary_file=$5
+  mkdir -p "$(dirname "$probe_tree_path")"
+  # shellcheck disable=SC2016 # These snippets are expanded by the generated fixture.
+  case "$probe_tree_mode" in
+    exit-zero-child)
+      probe_tree_body='"$0" child & child_pid=$!; printf "%s\n" "$child_pid" >"$probe_child_pid_file"; printf "%s|%s\n" "$$" "$child_pid" >"$probe_auxiliary_file"; exit 0'
+      ;;
+    exit-nonzero-child)
+      probe_tree_body='"$0" child & child_pid=$!; printf "%s\n" "$child_pid" >"$probe_child_pid_file"; printf "%s|%s\n" "$$" "$child_pid" >"$probe_auxiliary_file"; exit 23'
+      ;;
+    ignore-term-tree)
+      probe_tree_body='trap "" TERM; "$0" child-ignore-term & child_pid=$!; printf "%s\n" "$child_pid" >"$probe_child_pid_file"; while [ ! -s "$probe_auxiliary_file" ]; do sleep 1; done; while :; do sleep 1; done'
+      ;;
+    wait-for-release)
+      probe_tree_body='trap "" TERM; while [ ! -e "$probe_auxiliary_file" ]; do sleep 1; done; exit 1'
+      ;;
+    exit-seven)
+      probe_tree_body='exit 7'
+      ;;
+    self-hup)
+      probe_tree_body='kill -HUP "$$"; exit 0'
+      ;;
+    self-int)
+      probe_tree_body='kill -INT "$$"; exit 0'
+      ;;
+    self-term)
+      probe_tree_body='kill -TERM "$$"; exit 0'
+      ;;
+    marker-success)
+      probe_tree_body='[ -z "$probe_auxiliary_file" ] || printf "%s\n" started >"$probe_auxiliary_file"; exit 0'
+      ;;
+    *) return 1 ;;
+  esac
+  # shellcheck disable=SC2016 # The generated fixture expands private paths at runtime.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    "probe_pid_file='$probe_tree_pid_file'" \
+    "probe_child_pid_file='$probe_tree_child_pid_file'" \
+    "probe_auxiliary_file='$probe_tree_auxiliary_file'" \
+    'case "${1:-}" in' \
+    '  child) printf "%s\n" ready >"$probe_auxiliary_file.ready"; while :; do sleep 1; done ;;' \
+    '  child-ignore-term) trap "" TERM; printf "%s|%s\n" "$PPID" "$$" >"$probe_auxiliary_file"; while :; do sleep 1; done ;;' \
+    'esac' \
+    'printf "%s\n" "$$" >"$probe_pid_file"' \
+    "$probe_tree_body" \
+    >"$probe_tree_path"
+  chmod 0755 "$probe_tree_path"
+}
+
+run_direct_probe_case() {
+  direct_probe_name=$1
+  direct_probe_command=$2
+  direct_probe_harness=$3
+  shift 3
+  direct_probe_root=$test_tmp/direct-probe-$direct_probe_name
+  direct_probe_tmp=$direct_probe_root/tmp
+  direct_probe_home=$direct_probe_root/home
+  direct_probe_state=$direct_probe_root/state
+  direct_probe_output=$direct_probe_root/output
+  mkdir -p "$direct_probe_tmp" "$direct_probe_home" "$direct_probe_state"
+  run_capture "$direct_probe_output" env \
+    TMPDIR="$direct_probe_tmp" \
+    HOME="$direct_probe_home" \
+    XDG_STATE_HOME="$direct_probe_state" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE=1 \
+    DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_COMMAND="$direct_probe_command" \
+    "$@" \
+    "$direct_probe_harness" --apply
 }
 
 make_signal_boundary_command() {
@@ -230,7 +337,10 @@ make_managed_type_mutation_command() {
     '    directory-to-file)' \
     "      printf '%s\\n' 'mutated Taplo directory' >\"\$command_target\" || exit 1" \
     '      ;;' \
-    '    file-to-directory)' \
+    '    link-to-regular)' \
+    "      printf '%s\\n' 'mutated Taplo link bytes' >\"\$command_target\" || exit 1" \
+    '      ;;' \
+    '    link-to-directory)' \
     '      "$real_mkdir" "$command_target" || exit 1' \
     "      printf '%s\\n' 'mutated Taplo link' >\"\$command_target/sentinel\" || exit 1" \
     '      ;;' \
@@ -242,13 +352,73 @@ make_managed_type_mutation_command() {
   chmod 0755 "$mutation_command_path"
 }
 
+make_link_result_command() {
+  link_result_command_path=$1
+  link_result_real_command=$2
+  link_result_kind=$3
+  mkdir -p "$(dirname "$link_result_command_path")"
+  # shellcheck disable=SC2016 # This snippet is expanded by the generated fixture.
+  case "$link_result_kind" in
+    no-link)
+      link_result_body='exit 0'
+      ;;
+    wrong-link)
+      link_result_body='target=; for argument do target=$argument; done; "$real_command" -s /wrong/managed-link-target "$target"'
+      ;;
+    *) return 1 ;;
+  esac
+  # shellcheck disable=SC2016 # The generated fixture expands its arguments at runtime.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    "real_command='$link_result_real_command'" \
+    "$link_result_body" \
+    >"$link_result_command_path"
+  chmod 0755 "$link_result_command_path"
+}
+
+make_managed_link_control_bootstrap() {
+  control_bootstrap_source=$1
+  control_bootstrap_target=$2
+  awk '
+    $0 == "platform=$(detect_platform)" {
+      print "if [ \"${DOTFILES_BOOTSTRAP_TEST_CONTROL_LINK:-0}\" = 1 ]; then"
+      print "  managed_created_paths_file=$DOTFILES_BOOTSTRAP_TEST_CONTROL_LINK_JOURNAL"
+      print "  : >\"$managed_created_paths_file\""
+      print "  managed_publish_active=true"
+      print "  publish_managed_link \"$DOTFILES_BOOTSTRAP_TEST_CONTROL_LINK_SOURCE\" \"$DOTFILES_BOOTSTRAP_TEST_CONTROL_LINK_TARGET\""
+      print "  exit 0"
+      print "fi"
+      injected += 1
+    }
+    { print }
+    END {
+      if (injected != 1) exit 1
+    }
+  ' "$control_bootstrap_source" >"$control_bootstrap_target"
+  chmod 0755 "$control_bootstrap_target"
+}
+
+make_link_audit_command() {
+  link_audit_command_path=$1
+  link_audit_real_command=$2
+  mkdir -p "$(dirname "$link_audit_command_path")"
+  # shellcheck disable=SC2016 # The generated fixture expands its test environment.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    "real_command='$link_audit_real_command'" \
+    'printf "%s\n" called >>"$DOTFILES_BOOTSTRAP_TEST_LINK_AUDIT_FILE"' \
+    'exec "$real_command" "$@"' \
+    >"$link_audit_command_path"
+  chmod 0755 "$link_audit_command_path"
+}
+
 make_probe_spawn_signal_bootstrap() {
   probe_spawn_source=$1
   probe_spawn_target=$2
   awk '
     { print }
-    $0 == "    >\"$stdio_probe_tmp/stdout\" 2>\"$stdio_probe_tmp/stderr\" &" {
-      print "  printf \"%s\\n\" \"$!\" >\"$DOTFILES_BOOTSTRAP_TEST_PROBE_RACE_PID_FILE\""
+    $0 == "  active_probe_waiter_pid=$!" {
+      print "  printf \"%s\\n\" \"$active_probe_waiter_pid\" >\"$DOTFILES_BOOTSTRAP_TEST_PROBE_RACE_PID_FILE\""
       print "  kill -TERM \"$$\""
       injected += 1
     }
@@ -263,12 +433,16 @@ make_probe_temp_signal_bootstrap() {
   probe_temp_source=$1
   probe_temp_target=$2
   awk '
-    $0 == "  active_probe_tmp=$stdio_probe_tmp" {
-      print "  printf \"%s\\n\" \"$stdio_probe_tmp\" >\"$DOTFILES_BOOTSTRAP_TEST_PROBE_TEMP_RACE_PATH_FILE\""
-      print "  kill -TERM \"$$\""
-      injected += 1
+    $0 == "  active_probe_tmp=$(temporary_directory) || {" {
+      registering_probe_tmp = 1
     }
     { print }
+    registering_probe_tmp && $0 == "  }" {
+      print "  printf \"%s\\n\" \"$active_probe_tmp\" >\"$DOTFILES_BOOTSTRAP_TEST_PROBE_TEMP_RACE_PATH_FILE\""
+      print "  kill -TERM \"$$\""
+      injected += 1
+      registering_probe_tmp = 0
+    }
     END {
       if (injected != 1) exit 1
     }
@@ -976,6 +1150,7 @@ run_managed_failure_case() {
 run_managed_type_mutation_case() {
   mutation_name=$1
   mutation_kind=$2
+  mutation_label=${3:-$mutation_name cleanup refuses a changed Taplo path type}
   prepare_managed_failure_case "type-mutation-$mutation_name"
   mkdir -p \
     "$managed_failure_home/.local/bin" \
@@ -990,11 +1165,17 @@ run_managed_type_mutation_case() {
       mutation_publish_token=
       mutation_diagnostic='refusing unjournaled managed directory cleanup for changed path'
       ;;
-    file-to-directory)
+    link-to-regular)
       mutation_command='ln'
       mutation_target=$managed_failure_home/.local/bin/taplo
       mutation_publish_token=taplo-link
-      mutation_diagnostic='refusing managed file cleanup for changed path'
+      mutation_diagnostic='refusing unjournaled managed link cleanup for changed path'
+      ;;
+    link-to-directory)
+      mutation_command='ln'
+      mutation_target=$managed_failure_home/.local/bin/taplo
+      mutation_publish_token=taplo-link
+      mutation_diagnostic='refusing unjournaled managed link cleanup for changed path'
       ;;
     *) return 1 ;;
   esac
@@ -1039,7 +1220,13 @@ run_managed_type_mutation_case() {
       [ -f "$mutation_target" ] && [ ! -L "$mutation_target" ] \
         || mutation_pass=false
       ;;
-    file-to-directory)
+    link-to-regular)
+      [ -f "$mutation_target" ] && [ ! -L "$mutation_target" ] \
+        && [ "$(cat "$mutation_target" 2>/dev/null || true)" \
+          = 'mutated Taplo link bytes' ] \
+        || mutation_pass=false
+      ;;
+    link-to-directory)
       [ -d "$mutation_target" ] && [ ! -L "$mutation_target" ] \
         && [ "$(cat "$mutation_target/sentinel" 2>/dev/null || true)" \
           = 'mutated Taplo link' ] \
@@ -1052,11 +1239,118 @@ run_managed_type_mutation_case() {
   fi
 
   if [ "$mutation_pass" = true ]; then
-    pass "$mutation_name cleanup refuses a changed Taplo path type"
+    pass "$mutation_label"
   else
-    fail "$mutation_name cleanup refuses a changed Taplo path type"
+    fail "$mutation_label"
     sed "s/^/  $mutation_name output: /" \
       "$managed_failure_root/output" >&2
+  fi
+}
+
+run_journaled_link_mutation_case() {
+  journaled_mutation_name=$1
+  journaled_mutation_kind=$2
+  prepare_managed_failure_case "journaled-$journaled_mutation_name"
+  mkdir -p \
+    "$managed_failure_home/.local/bin" \
+    "$managed_failure_home/.local/opt"
+  journaled_mutation_target=$managed_failure_home/.local/bin/taplo
+  run_capture "$managed_failure_root/output" env \
+    PATH="$managed_failure_bin:$PATH" \
+    TMPDIR="$managed_failure_tmp" \
+    HOME="$managed_failure_home" \
+    XDG_STATE_HOME="$managed_failure_state" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+    DOTFILES_BOOTSTRAP_TEST_ARCH=x86_64 \
+    DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+    DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS= \
+    DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+    DOTFILES_BOOTSTRAP_TEST_REAL_MANAGED_INSTALL=1 \
+    DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT="$managed_failure_download" \
+    DOTFILES_BOOTSTRAP_TEST_PUBLISH_FAIL_AFTER=taplo-link \
+    DOTFILES_BOOTSTRAP_TEST_LINK_MUTATION_PHASE=after-journal \
+    DOTFILES_BOOTSTRAP_TEST_LINK_MUTATION_KIND="$journaled_mutation_kind" \
+    DOTFILES_BOOTSTRAP_TEST_LINK_MUTATION_TARGET="$journaled_mutation_target" \
+    DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+    DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$managed_failure_log" \
+    "$managed_failure_harness/bootstrap" --apply
+  journaled_mutation_status=$run_status
+  journaled_mutation_pass=true
+  [ "$journaled_mutation_status" -ne 0 ] || journaled_mutation_pass=false
+  grep -Fq 'refusing managed link cleanup for changed path' \
+    "$managed_failure_root/output" || journaled_mutation_pass=false
+  case "$journaled_mutation_kind" in
+    regular)
+      [ -f "$journaled_mutation_target" ] \
+        && [ ! -L "$journaled_mutation_target" ] \
+        && [ "$(cat "$journaled_mutation_target" 2>/dev/null || true)" \
+          = 'mutated Taplo link bytes' ] \
+        || journaled_mutation_pass=false
+      ;;
+    directory)
+      [ -d "$journaled_mutation_target" ] \
+        && [ ! -L "$journaled_mutation_target" ] \
+        && [ "$(cat "$journaled_mutation_target/sentinel" \
+          2>/dev/null || true)" = 'mutated Taplo link directory' ] \
+        || journaled_mutation_pass=false
+      ;;
+    *) return 1 ;;
+  esac
+  if find "$managed_failure_tmp" -mindepth 1 -maxdepth 1 \
+    -name 'dotfiles-bootstrap.*' -print -quit | grep -q .; then
+    journaled_mutation_pass=false
+  fi
+  if [ "$journaled_mutation_pass" = true ]; then
+    pass "$journaled_mutation_name"
+  else
+    fail "$journaled_mutation_name"
+  fi
+}
+
+run_link_result_case() {
+  link_result_name=$1
+  link_result_kind=$2
+  link_result_diagnostic=$3
+  prepare_managed_failure_case "$link_result_name"
+  mkdir -p \
+    "$managed_failure_home/.local/bin" \
+    "$managed_failure_home/.local/opt"
+  make_link_result_command \
+    "$managed_failure_bin/ln" "$(command -v ln)" "$link_result_kind"
+  run_capture "$managed_failure_root/output" env \
+    PATH="$managed_failure_bin:$PATH" \
+    TMPDIR="$managed_failure_tmp" \
+    HOME="$managed_failure_home" \
+    XDG_STATE_HOME="$managed_failure_state" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+    DOTFILES_BOOTSTRAP_TEST_ARCH=x86_64 \
+    DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+    DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS= \
+    DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+    DOTFILES_BOOTSTRAP_TEST_REAL_MANAGED_INSTALL=1 \
+    DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT="$managed_failure_download" \
+    DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+    DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$managed_failure_log" \
+    "$managed_failure_harness/bootstrap" --apply
+  link_result_status=$run_status
+  link_result_pass=true
+  [ "$link_result_status" -ne 0 ] || link_result_pass=false
+  grep -Fq "$link_result_diagnostic" "$managed_failure_root/output" \
+    || link_result_pass=false
+  managed_outputs_are_absent_except "$managed_failure_home" \
+    || link_result_pass=false
+  if find "$managed_failure_tmp" -mindepth 1 -maxdepth 1 \
+    -name 'dotfiles-bootstrap.*' -print -quit | grep -q .; then
+    link_result_pass=false
+  fi
+  if [ "$link_result_pass" = true ]; then
+    pass "$link_result_name"
+  else
+    fail "$link_result_name"
   fi
 }
 
@@ -1511,6 +1805,9 @@ trap cleanup 0
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+direct_probe_bootstrap=$test_tmp/direct-probe-bootstrap
+make_direct_probe_bootstrap "$bootstrap" "$direct_probe_bootstrap"
 
 if [ -x "$bootstrap" ]; then
   pass 'bootstrap is executable'
@@ -2282,6 +2579,401 @@ if [ "$satisfaction_taplo_pass" = true ]; then
   pass 'Taplo requires a stable version floor and bounded LSP capability'
 else
   fail 'Taplo requires a stable version floor and bounded LSP capability'
+fi
+
+setsid_contract_root=$test_tmp/setsid-contract
+setsid_contract_bin=$setsid_contract_root/bin
+setsid_contract_log=$setsid_contract_root/setsid.args
+setsid_contract_marker=$setsid_contract_root/target-started
+setsid_contract_command=$setsid_contract_bin/probe-target
+mkdir -p "$setsid_contract_bin"
+make_probe_tree_command \
+  "$setsid_contract_command" marker-success \
+  "$setsid_contract_root/target.pid" \
+  "$setsid_contract_root/child.pid" \
+  "$setsid_contract_marker"
+# shellcheck disable=SC2016 # The generated fixture expands its arguments at runtime.
+printf '%s\n' \
+  '#!/bin/sh' \
+  'printf "%s|%s\n" "${1:-}" "${2:-}" >"$DOTFILES_BOOTSTRAP_TEST_SETSID_LOG"' \
+  'exit 64' \
+  >"$setsid_contract_bin/setsid"
+chmod 0755 "$setsid_contract_bin/setsid"
+run_direct_probe_case setsid-contract "$setsid_contract_command" \
+  "$direct_probe_bootstrap" \
+  PATH="$setsid_contract_bin:/usr/bin:/bin" \
+  DOTFILES_BOOTSTRAP_TEST_SETSID_LOG="$setsid_contract_log"
+setsid_contract_pass=true
+[ "$run_status" -eq 42 ] || setsid_contract_pass=false
+[ "$(cat "$setsid_contract_log" 2>/dev/null || true)" = '-f|-w' ] \
+  || setsid_contract_pass=false
+[ ! -e "$setsid_contract_marker" ] || setsid_contract_pass=false
+if [ "$setsid_contract_pass" = true ]; then
+  pass 'Debian managed probes require util-linux setsid -f -w'
+else
+  fail 'Debian managed probes require util-linux setsid -f -w'
+fi
+
+missing_handshake_pass=true
+for missing_handshake_kind in missing-anchor missing-target; do
+  missing_handshake_root=$test_tmp/missing-handshake-$missing_handshake_kind
+  missing_handshake_command=$missing_handshake_root/probe-target
+  missing_handshake_marker=$missing_handshake_root/target-started
+  mkdir -p "$missing_handshake_root"
+  make_probe_tree_command \
+    "$missing_handshake_command" marker-success \
+    "$missing_handshake_root/target.pid" \
+    "$missing_handshake_root/child.pid" \
+    "$missing_handshake_marker"
+  run_direct_probe_case "missing-handshake-$missing_handshake_kind" \
+    "$missing_handshake_command" "$direct_probe_bootstrap" \
+    DOTFILES_BOOTSTRAP_TEST_PROBE_HANDSHAKE="$missing_handshake_kind"
+  [ "$run_status" -eq 42 ] || missing_handshake_pass=false
+  [ ! -e "$missing_handshake_marker" ] || missing_handshake_pass=false
+  if find "$direct_probe_tmp" -mindepth 1 -maxdepth 1 \
+    -name 'dotfiles-bootstrap.*' -print -quit | grep -q .; then
+    missing_handshake_pass=false
+  fi
+done
+if [ "$missing_handshake_pass" = true ]; then
+  pass 'missing probe handshakes fail closed'
+else
+  fail 'missing probe handshakes fail closed'
+fi
+
+malformed_handshake_pass=true
+for malformed_handshake_kind in \
+  malformed-anchor \
+  malformed-anchor-ack \
+  malformed-target \
+  malformed-status
+do
+  malformed_handshake_root=$test_tmp/malformed-handshake-$malformed_handshake_kind
+  malformed_handshake_command=$malformed_handshake_root/probe-target
+  malformed_handshake_marker=$malformed_handshake_root/target-started
+  mkdir -p "$malformed_handshake_root"
+  make_probe_tree_command \
+    "$malformed_handshake_command" marker-success \
+    "$malformed_handshake_root/target.pid" \
+    "$malformed_handshake_root/child.pid" \
+    "$malformed_handshake_marker"
+  run_direct_probe_case "malformed-handshake-$malformed_handshake_kind" \
+    "$malformed_handshake_command" "$direct_probe_bootstrap" \
+    DOTFILES_BOOTSTRAP_TEST_PROBE_HANDSHAKE="$malformed_handshake_kind"
+  [ "$run_status" -eq 42 ] || malformed_handshake_pass=false
+  case "$malformed_handshake_kind" in
+    malformed-status)
+      [ -e "$malformed_handshake_marker" ] || malformed_handshake_pass=false
+      ;;
+    *)
+      [ ! -e "$malformed_handshake_marker" ] || malformed_handshake_pass=false
+      ;;
+  esac
+  if find "$direct_probe_tmp" -mindepth 1 -maxdepth 1 \
+    -name 'dotfiles-bootstrap.*' -print -quit | grep -q .; then
+    malformed_handshake_pass=false
+  fi
+done
+if [ "$malformed_handshake_pass" = true ]; then
+  pass 'malformed probe handshakes fail closed'
+else
+  fail 'malformed probe handshakes fail closed'
+fi
+
+probe_ack_signal_root=$test_tmp/probe-ack-signal
+probe_ack_signal_command=$probe_ack_signal_root/probe-target
+probe_ack_signal_marker=$probe_ack_signal_root/target-started
+mkdir -p "$probe_ack_signal_root"
+make_probe_tree_command \
+  "$probe_ack_signal_command" marker-success \
+  "$probe_ack_signal_root/target.pid" \
+  "$probe_ack_signal_root/child.pid" \
+  "$probe_ack_signal_marker"
+run_direct_probe_case probe-ack-signal "$probe_ack_signal_command" \
+  "$direct_probe_bootstrap" \
+  DOTFILES_BOOTSTRAP_TEST_PROBE_SIGNAL_AT=before-anchor-ack
+probe_ack_signal_pass=true
+[ "$run_status" -eq 143 ] || probe_ack_signal_pass=false
+[ ! -e "$probe_ack_signal_marker" ] || probe_ack_signal_pass=false
+[ "$(grep -Fc 'received TERM; stopping safely' \
+  "$direct_probe_output" 2>/dev/null || true)" -eq 1 ] \
+  || probe_ack_signal_pass=false
+if find "$direct_probe_tmp" -mindepth 1 -maxdepth 1 \
+  -name 'dotfiles-bootstrap.*' -print -quit | grep -q .; then
+  probe_ack_signal_pass=false
+fi
+if [ "$probe_ack_signal_pass" = true ]; then
+  pass 'signal during probe ACK registration is deferred without starting an unowned target'
+else
+  fail 'signal during probe ACK registration is deferred without starting an unowned target'
+fi
+
+for child_exit_kind in exit-zero-child exit-nonzero-child; do
+  child_exit_root=$test_tmp/$child_exit_kind
+  child_exit_command=$child_exit_root/probe-target
+  child_exit_pid_file=$child_exit_root/target.pid
+  child_exit_child_pid_file=$child_exit_root/child.pid
+  child_exit_relation_file=$child_exit_root/relation
+  mkdir -p "$child_exit_root"
+  make_probe_tree_command \
+    "$child_exit_command" "$child_exit_kind" \
+    "$child_exit_pid_file" \
+    "$child_exit_child_pid_file" \
+    "$child_exit_relation_file"
+  run_direct_probe_case "$child_exit_kind" "$child_exit_command" \
+    "$direct_probe_bootstrap"
+  child_exit_pass=true
+  case "$child_exit_kind:$run_status" in
+    exit-zero-child:0|exit-nonzero-child:42) ;;
+    *) child_exit_pass=false ;;
+  esac
+  child_exit_pid=$(cat "$child_exit_pid_file" 2>/dev/null || true)
+  child_exit_child_pid=$(cat "$child_exit_child_pid_file" 2>/dev/null || true)
+  [ "$(cat "$child_exit_relation_file" 2>/dev/null || true)" \
+    = "$child_exit_pid|$child_exit_child_pid" ] || child_exit_pass=false
+  [ "$(cat "$child_exit_relation_file.ready" 2>/dev/null || true)" = ready ] \
+    || child_exit_pass=false
+  case "$child_exit_child_pid" in
+    ''|*[!0-9]*) child_exit_pass=false ;;
+    *)
+      if test_process_is_matching "$child_exit_child_pid" "$child_exit_command"; then
+        child_exit_pass=false
+        kill_matching_test_process "$child_exit_child_pid" "$child_exit_command"
+      fi
+      ;;
+  esac
+  if find "$direct_probe_tmp" -mindepth 1 -maxdepth 1 \
+    -name 'dotfiles-bootstrap.*' -print -quit | grep -q .; then
+    child_exit_pass=false
+  fi
+  case "$child_exit_kind" in
+    exit-zero-child)
+      child_exit_label='exit-zero probe reaps its distinct child before success'
+      ;;
+    exit-nonzero-child)
+      child_exit_label='nonzero probe reaps its distinct child before fallback'
+      ;;
+  esac
+  if [ "$child_exit_pass" = true ]; then
+    pass "$child_exit_label"
+  else
+    fail "$child_exit_label"
+  fi
+done
+
+probe_snapshot_root=$test_tmp/probe-status-snapshot
+probe_snapshot_command=$probe_snapshot_root/probe-target
+probe_snapshot_audit=$probe_snapshot_root/audit
+mkdir -p "$probe_snapshot_root"
+make_probe_tree_command \
+  "$probe_snapshot_command" exit-seven \
+  "$probe_snapshot_root/target.pid" \
+  "$probe_snapshot_root/child.pid" \
+  "$probe_snapshot_root/auxiliary"
+run_direct_probe_case probe-status-snapshot "$probe_snapshot_command" \
+  "$direct_probe_bootstrap" \
+  DOTFILES_BOOTSTRAP_TEST_PROBE_AUDIT_FILE="$probe_snapshot_audit"
+probe_snapshot_pass=true
+[ "$run_status" -eq 42 ] || probe_snapshot_pass=false
+grep -Eq '^status-before-term\|[0-9]+\|7$' "$probe_snapshot_audit" \
+  2>/dev/null || probe_snapshot_pass=false
+if find "$direct_probe_tmp" -mindepth 1 -maxdepth 1 \
+  -name 'dotfiles-bootstrap.*' -print -quit | grep -q .; then
+  probe_snapshot_pass=false
+fi
+if [ "$probe_snapshot_pass" = true ]; then
+  pass 'probe deadline uses the complete pre-TERM target status snapshot'
+else
+  fail 'probe deadline uses the complete pre-TERM target status snapshot'
+fi
+
+probe_escalation_root=$test_tmp/probe-group-escalation
+probe_escalation_command=$probe_escalation_root/probe-target
+probe_escalation_pid_file=$probe_escalation_root/target.pid
+probe_escalation_child_pid_file=$probe_escalation_root/child.pid
+probe_escalation_relation_file=$probe_escalation_root/relation
+probe_escalation_audit=$probe_escalation_root/audit
+mkdir -p "$probe_escalation_root"
+make_probe_tree_command \
+  "$probe_escalation_command" ignore-term-tree \
+  "$probe_escalation_pid_file" \
+  "$probe_escalation_child_pid_file" \
+  "$probe_escalation_relation_file"
+run_direct_probe_case probe-group-escalation "$probe_escalation_command" \
+  "$direct_probe_bootstrap" \
+  DOTFILES_BOOTSTRAP_TEST_PROBE_AUDIT_FILE="$probe_escalation_audit"
+probe_escalation_pass=true
+[ "$run_status" -eq 42 ] || probe_escalation_pass=false
+probe_escalation_pid=$(cat "$probe_escalation_pid_file" 2>/dev/null || true)
+probe_escalation_child_pid=$(cat "$probe_escalation_child_pid_file" 2>/dev/null || true)
+[ "$(cat "$probe_escalation_relation_file" 2>/dev/null || true)" \
+  = "$probe_escalation_pid|$probe_escalation_child_pid" ] \
+  || probe_escalation_pass=false
+for probe_escalation_check_pid in \
+  "$probe_escalation_pid" "$probe_escalation_child_pid"
+do
+  case "$probe_escalation_check_pid" in
+    ''|*[!0-9]*) probe_escalation_pass=false ;;
+    *)
+      if test_process_is_matching \
+        "$probe_escalation_check_pid" "$probe_escalation_command"; then
+        probe_escalation_pass=false
+        kill_matching_test_process \
+          "$probe_escalation_check_pid" "$probe_escalation_command"
+      fi
+      ;;
+  esac
+done
+if [ ! -r "$probe_escalation_audit" ] \
+  || [ "$(grep -Ec '^group-term\|[0-9]+$' \
+    "$probe_escalation_audit" || true)" -ne 1 ]; then
+  probe_escalation_pass=false
+fi
+if [ ! -r "$probe_escalation_audit" ] \
+  || [ "$(grep -Ec '^group-kill\|[0-9]+$' \
+    "$probe_escalation_audit" || true)" -ne 1 ]; then
+  probe_escalation_pass=false
+fi
+if find "$direct_probe_tmp" -mindepth 1 -maxdepth 1 \
+  -name 'dotfiles-bootstrap.*' -print -quit | grep -q .; then
+  probe_escalation_pass=false
+fi
+if [ "$probe_escalation_pass" = true ]; then
+  pass 'TERM-ignoring probe tree is removed by one owned group escalation'
+else
+  fail 'TERM-ignoring probe tree is removed by one owned group escalation'
+fi
+
+probe_signal_reset_pass=true
+for probe_signal_reset_kind in self-hup self-int self-term; do
+  probe_signal_reset_root=$test_tmp/probe-signal-reset-$probe_signal_reset_kind
+  probe_signal_reset_command=$probe_signal_reset_root/probe-target
+  mkdir -p "$probe_signal_reset_root"
+  make_probe_tree_command \
+    "$probe_signal_reset_command" "$probe_signal_reset_kind" \
+    "$probe_signal_reset_root/target.pid" \
+    "$probe_signal_reset_root/child.pid" \
+    "$probe_signal_reset_root/auxiliary"
+  run_direct_probe_case "probe-signal-reset-$probe_signal_reset_kind" \
+    "$probe_signal_reset_command" "$direct_probe_bootstrap"
+  [ "$run_status" -eq 42 ] || probe_signal_reset_pass=false
+done
+if [ "$probe_signal_reset_pass" = true ]; then
+  pass 'probe target starts with HUP INT TERM reset'
+else
+  fail 'probe target starts with HUP INT TERM reset'
+fi
+
+probe_teardown_signal_root=$test_tmp/probe-teardown-signal
+probe_teardown_signal_command=$probe_teardown_signal_root/probe-target
+probe_teardown_signal_audit=$probe_teardown_signal_root/audit
+probe_unrelated_command=$probe_teardown_signal_root/unrelated-target
+probe_unrelated_release=$probe_teardown_signal_root/unrelated.release
+probe_unrelated_pid_file=$probe_teardown_signal_root/unrelated.pid
+mkdir -p "$probe_teardown_signal_root"
+make_probe_tree_command \
+  "$probe_teardown_signal_command" wait-for-release \
+  "$probe_teardown_signal_root/target.pid" \
+  "$probe_teardown_signal_root/child.pid" \
+  "$probe_teardown_signal_root/target.release"
+make_probe_tree_command \
+  "$probe_unrelated_command" wait-for-release \
+  "$probe_unrelated_pid_file" \
+  "$probe_teardown_signal_root/unrelated-child.pid" \
+  "$probe_unrelated_release"
+setsid -f -w "$probe_unrelated_command" &
+probe_unrelated_waiter_pid=$!
+probe_unrelated_ready=false
+probe_unrelated_attempt=0
+while [ "$probe_unrelated_attempt" -lt 20 ]; do
+  if [ -s "$probe_unrelated_pid_file" ]; then
+    probe_unrelated_ready=true
+    break
+  fi
+  sleep 1
+  probe_unrelated_attempt=$((probe_unrelated_attempt + 1))
+done
+probe_unrelated_pid=$(cat "$probe_unrelated_pid_file" 2>/dev/null || true)
+probe_unrelated_pgid=$(ps -p "$probe_unrelated_pid" -o pgid= 2>/dev/null \
+  | awk '{ print $1 }')
+run_direct_probe_case probe-teardown-signal "$probe_teardown_signal_command" \
+  "$direct_probe_bootstrap" \
+  DOTFILES_BOOTSTRAP_TEST_PROBE_AUDIT_FILE="$probe_teardown_signal_audit" \
+  DOTFILES_BOOTSTRAP_TEST_PROBE_SIGNAL_AT=teardown
+probe_teardown_signal_pass=true
+[ "$probe_unrelated_ready" = true ] || probe_teardown_signal_pass=false
+[ "$run_status" -eq 143 ] || probe_teardown_signal_pass=false
+test_process_is_matching "$probe_unrelated_pid" "$probe_unrelated_command" \
+  || probe_teardown_signal_pass=false
+grep -Fqx 'teardown-signal|TERM' "$probe_teardown_signal_audit" \
+  2>/dev/null || probe_teardown_signal_pass=false
+if grep -Fqx "group-term|$probe_unrelated_pgid" \
+  "$probe_teardown_signal_audit" 2>/dev/null \
+  || grep -Fqx "group-kill|$probe_unrelated_pgid" \
+    "$probe_teardown_signal_audit" 2>/dev/null; then
+  probe_teardown_signal_pass=false
+fi
+: >"$probe_unrelated_release"
+set +e
+wait "$probe_unrelated_waiter_pid" >/dev/null 2>&1
+set -e
+if [ "$probe_teardown_signal_pass" = true ]; then
+  pass 'signal during teardown does not recurse or signal an unrelated PGID'
+else
+  fail 'signal during teardown does not recurse or signal an unrelated PGID'
+fi
+
+probe_lost_anchor_root=$test_tmp/probe-lost-anchor
+probe_lost_anchor_command=$probe_lost_anchor_root/probe-target
+probe_lost_anchor_release=$probe_lost_anchor_root/target.release
+probe_lost_anchor_audit=$probe_lost_anchor_root/audit
+probe_lost_anchor_pid_file=$probe_lost_anchor_root/target.pid
+mkdir -p "$probe_lost_anchor_root"
+make_probe_tree_command \
+  "$probe_lost_anchor_command" wait-for-release \
+  "$probe_lost_anchor_pid_file" \
+  "$probe_lost_anchor_root/child.pid" \
+  "$probe_lost_anchor_release"
+run_direct_probe_case probe-lost-anchor "$probe_lost_anchor_command" \
+  "$direct_probe_bootstrap" \
+  DOTFILES_BOOTSTRAP_TEST_PROBE_AUDIT_FILE="$probe_lost_anchor_audit" \
+  DOTFILES_BOOTSTRAP_TEST_PROBE_LOSE_ANCHOR_BEFORE_KILL=1 \
+  DOTFILES_BOOTSTRAP_TEST_PROBE_LOSS_RELEASE_FILE="$probe_lost_anchor_release"
+probe_lost_anchor_pass=true
+[ "$run_status" -eq 42 ] || probe_lost_anchor_pass=false
+grep -Fq 'bootstrap: probe anchor disappeared before forced group cleanup' \
+  "$direct_probe_output" || probe_lost_anchor_pass=false
+if grep -Eq '^group-kill\|' "$probe_lost_anchor_audit" 2>/dev/null; then
+  probe_lost_anchor_pass=false
+fi
+probe_lost_anchor_pid=$(cat "$probe_lost_anchor_pid_file" 2>/dev/null || true)
+case "$probe_lost_anchor_pid" in
+  ''|*[!0-9]*) probe_lost_anchor_pass=false ;;
+  *)
+    probe_lost_anchor_attempt=0
+    while [ "$probe_lost_anchor_attempt" -lt 5 ] \
+      && test_process_is_matching \
+        "$probe_lost_anchor_pid" "$probe_lost_anchor_command"
+    do
+      sleep 1
+      probe_lost_anchor_attempt=$((probe_lost_anchor_attempt + 1))
+    done
+    if test_process_is_matching \
+      "$probe_lost_anchor_pid" "$probe_lost_anchor_command"; then
+      probe_lost_anchor_pass=false
+      kill_matching_test_process \
+        "$probe_lost_anchor_pid" "$probe_lost_anchor_command"
+    fi
+    ;;
+esac
+if find "$direct_probe_tmp" -mindepth 1 -maxdepth 1 \
+  -name 'dotfiles-bootstrap.*' -print -quit | grep -q .; then
+  probe_lost_anchor_pass=false
+fi
+if [ "$probe_lost_anchor_pass" = true ]; then
+  pass 'lost probe anchor fails closed before group KILL'
+else
+  fail 'lost probe anchor fails closed before group KILL'
 fi
 
 probe_signal_root=$test_tmp/stdio-probe-signal
@@ -3272,7 +3964,69 @@ do
 done
 
 run_managed_type_mutation_case taplo-directory directory-to-file
-run_managed_type_mutation_case taplo-link file-to-directory
+run_managed_type_mutation_case taplo-link link-to-directory
+run_managed_type_mutation_case \
+  taplo-link-to-regular link-to-regular \
+  'unjournaled Taplo link cleanup preserves a regular-file replacement'
+run_journaled_link_mutation_case \
+  'journaled Taplo link cleanup preserves a regular-file replacement' regular
+run_journaled_link_mutation_case \
+  'journaled Taplo link cleanup preserves a real-directory replacement' directory
+run_link_result_case \
+  'managed link publication rejects a successful no-link command' \
+  no-link \
+  'managed language-tool link was not published'
+run_link_result_case \
+  'managed link publication rejects a successful wrong-target link' \
+  wrong-link \
+  'managed language-tool link has an unexpected target'
+
+control_link_root=$test_tmp/managed-link-controls
+control_link_harness=$control_link_root/bootstrap
+control_link_bin=$control_link_root/bin
+control_link_home=$control_link_root/home
+control_link_journal=$control_link_root/managed-created.paths
+control_link_audit=$control_link_root/ln.audit
+mkdir -p "$control_link_bin" "$control_link_home/.local/bin"
+make_managed_link_control_bootstrap "$bootstrap" "$control_link_harness"
+make_link_audit_command \
+  "$control_link_bin/ln" "$(command -v ln)"
+control_link_pass=true
+for control_link_character in lf cr tab; do
+  case "$control_link_character" in
+    lf) control_link_value=$(printf 'left\nright') ;;
+    cr) control_link_value=$(printf 'left\rright') ;;
+    tab) control_link_value=$(printf 'left\tright') ;;
+  esac
+  for control_link_position in source target; do
+    control_link_source=$control_link_root/source
+    control_link_target=$control_link_home/.local/bin/taplo
+    case "$control_link_position" in
+      source) control_link_source=$control_link_root/$control_link_value ;;
+      target) control_link_target=$control_link_home/.local/bin/$control_link_value ;;
+    esac
+    : >"$control_link_audit"
+    run_capture "$control_link_root/$control_link_character-$control_link_position.output" env \
+      PATH="$control_link_bin:/usr/bin:/bin" \
+      TMPDIR="$control_link_root" \
+      HOME="$control_link_home" \
+      XDG_STATE_HOME="$control_link_root/state" \
+      DOTFILES_BOOTSTRAP_TESTING=1 \
+      DOTFILES_BOOTSTRAP_TEST_CONTROL_LINK=1 \
+      DOTFILES_BOOTSTRAP_TEST_CONTROL_LINK_JOURNAL="$control_link_journal" \
+      DOTFILES_BOOTSTRAP_TEST_CONTROL_LINK_SOURCE="$control_link_source" \
+      DOTFILES_BOOTSTRAP_TEST_CONTROL_LINK_TARGET="$control_link_target" \
+      DOTFILES_BOOTSTRAP_TEST_LINK_AUDIT_FILE="$control_link_audit" \
+      "$control_link_harness" --apply
+    [ "$run_status" -ne 0 ] || control_link_pass=false
+    [ ! -s "$control_link_audit" ] || control_link_pass=false
+  done
+done
+if [ "$control_link_pass" = true ]; then
+  pass 'managed link publication rejects LF CR and TAB before ln'
+else
+  fail 'managed link publication rejects LF CR and TAB before ln'
+fi
 
 while IFS='|' read -r selective_name selective_tools selective_links selective_kind; do
   run_selective_managed_case \

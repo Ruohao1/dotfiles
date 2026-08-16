@@ -599,40 +599,535 @@ tool_is_satisfied() {
   version_at_least "$installed_version" "$required_version"
 }
 
-stop_stdio_probe() {
-  stopping_probe_pid=$1
-  [ -n "$stopping_probe_pid" ] || return 0
-  kill "$stopping_probe_pid" >/dev/null 2>&1 || true
-  if kill -0 "$stopping_probe_pid" >/dev/null 2>&1; then
-    sleep 1
-  fi
-  if kill -0 "$stopping_probe_pid" >/dev/null 2>&1; then
-    kill -KILL "$stopping_probe_pid" >/dev/null 2>&1 || true
-  fi
-  if [ "$active_probe_pid" = "$stopping_probe_pid" ]; then
-    active_probe_pid=
-  fi
-  wait "$stopping_probe_pid" >/dev/null 2>&1 || true
+probe_decimal_id_is_safe() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$1" -gt 1 ]
 }
 
-bounded_command_succeeds() {
-  begin_cleanup_registration_critical
-  "$@" </dev/null >/dev/null 2>&1 &
-  active_probe_pid=$!
-  bounded_probe_pid=$active_probe_pid
-  finish_cleanup_registration_critical
+probe_record_is_safe() {
+  case "$1" in
+    ''|*"
+"*|*""*|*"	"*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
 
-  sleep 1
-  if kill -0 "$bounded_probe_pid" >/dev/null 2>&1; then
-    stop_stdio_probe "$bounded_probe_pid"
-    active_probe_pid=
+read_probe_pair_record() {
+  probe_pair_path=$1
+  [ -r "$probe_pair_path" ] || return 1
+  probe_pair_record=$(cat "$probe_pair_path") || return 1
+  probe_record_is_safe "$probe_pair_record" || return 1
+  case "$probe_pair_record" in
+    *'|'*) ;;
+    *) return 1 ;;
+  esac
+  probe_record_first=${probe_pair_record%%|*}
+  probe_record_second=${probe_pair_record#*|}
+  case "$probe_record_second" in
+    *'|'*) return 1 ;;
+  esac
+  case "$probe_record_first:$probe_record_second" in
+    *[!0-9:]*|:*) return 1 ;;
+  esac
+  return 0
+}
+
+probe_process_identity() {
+  probe_identity_pid=$1
+  probe_identity=$(ps -o pid= -o ppid= -o pgid= -o sid= \
+    -p "$probe_identity_pid" 2>/dev/null \
+    | awk '
+      NF == 4 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ \
+        && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ {
+        print $1, $2, $3, $4
+        valid += 1
+      }
+      END { if (valid != 1) exit 1 }
+    ') || return 1
+  probe_identity_pid_value=
+  probe_identity_parent_value=
+  probe_identity_group_value=
+  probe_identity_session_value=
+  probe_identity_extra=
+  IFS=' ' read -r \
+    probe_identity_pid_value \
+    probe_identity_parent_value \
+    probe_identity_group_value \
+    probe_identity_session_value \
+    probe_identity_extra <<PROBE_IDENTITY
+$probe_identity
+PROBE_IDENTITY
+  [ -z "$probe_identity_extra" ]
+}
+
+probe_anchor_identity_is_valid() {
+  probe_anchor_check_pid=$1
+  probe_anchor_check_parent=$2
+  probe_decimal_id_is_safe "$probe_anchor_check_pid" || return 1
+  probe_decimal_id_is_safe "$probe_anchor_check_parent" || return 1
+  probe_process_identity "$probe_anchor_check_pid" || return 1
+  [ "$probe_identity_pid_value" = "$probe_anchor_check_pid" ] \
+    && [ "$probe_identity_parent_value" = "$probe_anchor_check_parent" ] \
+    && [ "$probe_identity_group_value" = "$probe_anchor_check_pid" ] \
+    && [ "$probe_identity_session_value" = "$probe_anchor_check_pid" ]
+}
+
+probe_target_identity_is_valid() {
+  probe_target_check_pid=$1
+  probe_target_check_parent=$2
+  probe_target_check_group=$3
+  probe_decimal_id_is_safe "$probe_target_check_pid" || return 1
+  probe_process_identity "$probe_target_check_pid" || return 1
+  [ "$probe_identity_pid_value" = "$probe_target_check_pid" ] \
+    && [ "$probe_identity_parent_value" = "$probe_target_check_parent" ] \
+    && [ "$probe_identity_group_value" = "$probe_target_check_group" ] \
+    && [ "$probe_identity_session_value" = "$probe_target_check_group" ]
+}
+
+probe_atomic_record() {
+  probe_record_target=$1
+  probe_record_content=$2
+  probe_record_tmp=$probe_record_target.tmp.$$
+  (umask 077 && printf '%s\n' "$probe_record_content" >"$probe_record_tmp") \
+    || return 1
+  mv -f "$probe_record_tmp" "$probe_record_target"
+}
+
+record_probe_test_audit() {
+  [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] || return 0
+  probe_audit_path=${DOTFILES_BOOTSTRAP_TEST_PROBE_AUDIT_FILE:-}
+  [ -n "$probe_audit_path" ] || return 0
+  case "$probe_audit_path" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  probe_record_is_safe "$probe_audit_path" || return 1
+  printf '%s\n' "$1" >>"$probe_audit_path"
+}
+
+probe_wait_for_record() {
+  probe_wait_path=$1
+  probe_wait_attempt=0
+  while [ "$probe_wait_attempt" -lt 40 ]; do
+    [ -e "$probe_wait_path" ] && return 0
+    sleep 0.05
+    probe_wait_attempt=$((probe_wait_attempt + 1))
+  done
+  return 1
+}
+
+write_probe_helper_scripts() {
+  probe_helper_root=$1
+  active_probe_supervisor=$probe_helper_root/supervisor
+  active_probe_target_wrapper=$probe_helper_root/target-wrapper
+
+  cat >"$active_probe_target_wrapper" <<'PROBE_TARGET_WRAPPER'
+#!/bin/sh
+set -u
+probe_root=$1
+probe_anchor_pid=$2
+probe_stdin=$3
+probe_stdout=$4
+probe_stderr=$5
+shift 5
+trap - HUP INT TERM
+
+atomic_record() {
+  record_target=$1
+  record_content=$2
+  record_tmp=$record_target.tmp.$$
+  (umask 077 && printf '%s\n' "$record_content" >"$record_tmp") || exit 121
+  mv -f "$record_tmp" "$record_target" || exit 121
+}
+
+case ${DOTFILES_BOOTSTRAP_TEST_PROBE_HANDSHAKE:-} in
+  malformed-target) atomic_record "$probe_root/target.ready" 'malformed-target' ;;
+  *) atomic_record "$probe_root/target.ready" "$$|$PPID" ;;
+esac
+
+target_ack_expected=$$\|$probe_anchor_pid
+target_ack_attempt=0
+while [ "$target_ack_attempt" -lt 120 ]; do
+  [ ! -e "$probe_root/cancel.ready" ] || exit 122
+  if [ -e "$probe_root/target.ack" ]; then
+    target_ack=$(cat "$probe_root/target.ack") || exit 123
+    [ "$target_ack" = "$target_ack_expected" ] || exit 124
+    exec "$@" <"$probe_stdin" >"$probe_stdout" 2>"$probe_stderr"
+    exit 125
+  fi
+  sleep 0.05
+  target_ack_attempt=$((target_ack_attempt + 1))
+done
+exit 126
+PROBE_TARGET_WRAPPER
+
+  cat >"$active_probe_supervisor" <<'PROBE_SUPERVISOR'
+#!/bin/sh
+set -u
+probe_root=$1
+target_wrapper=$2
+probe_stdin=$3
+probe_stdout=$4
+probe_stderr=$5
+shift 5
+trap '' HUP INT TERM
+
+atomic_record() {
+  record_target=$1
+  record_content=$2
+  record_tmp=$record_target.tmp.$$
+  (umask 077 && printf '%s\n' "$record_content" >"$record_tmp") || exit 111
+  mv -f "$record_tmp" "$record_target" || exit 111
+}
+
+case ${DOTFILES_BOOTSTRAP_TEST_PROBE_HANDSHAKE:-} in
+  missing-anchor) ;;
+  malformed-anchor) atomic_record "$probe_root/anchor.ready" 'malformed-anchor' ;;
+  *) atomic_record "$probe_root/anchor.ready" "$$|$PPID" ;;
+esac
+
+anchor_ack_expected=$$\|$PPID
+anchor_ack_attempt=0
+anchor_acknowledged=false
+while [ "$anchor_ack_attempt" -lt 120 ]; do
+  [ ! -e "$probe_root/cancel.ready" ] || exit 112
+  if [ -e "$probe_root/anchor.ack" ]; then
+    anchor_ack=$(cat "$probe_root/anchor.ack") || exit 113
+    [ "$anchor_ack" = "$anchor_ack_expected" ] || exit 114
+    anchor_acknowledged=true
+    break
+  fi
+  sleep 0.05
+  anchor_ack_attempt=$((anchor_ack_attempt + 1))
+done
+[ "$anchor_acknowledged" = true ] || exit 115
+
+if [ "${DOTFILES_BOOTSTRAP_TEST_PROBE_HANDSHAKE:-}" = missing-target ]; then
+  while [ ! -e "$probe_root/release.ready" ]; do :; done
+  exit 116
+fi
+
+env --default-signal=HUP,INT,TERM \
+  "$target_wrapper" "$probe_root" "$$" \
+  "$probe_stdin" "$probe_stdout" "$probe_stderr" "$@" &
+probe_target_pid=$!
+probe_target_status=0
+wait "$probe_target_pid" || probe_target_status=$?
+case ${DOTFILES_BOOTSTRAP_TEST_PROBE_HANDSHAKE:-} in
+  missing-status) ;;
+  malformed-status) atomic_record "$probe_root/status.ready" 'malformed-status' ;;
+  *) atomic_record "$probe_root/status.ready" "$probe_target_pid|$probe_target_status" ;;
+esac
+while [ ! -e "$probe_root/release.ready" ]; do :; done
+exit 0
+PROBE_SUPERVISOR
+
+  chmod 0755 "$active_probe_supervisor" "$active_probe_target_wrapper"
+}
+
+clear_active_probe_state() {
+  active_probe_tmp=
+  active_probe_waiter_pid=
+  active_probe_anchor_pid=
+  active_probe_anchor_parent=
+  active_probe_group_id=
+  active_probe_target_pid=
+  active_probe_acknowledged=false
+  active_probe_target_acknowledged=false
+  active_probe_fifo=
+  active_probe_supervisor=
+  active_probe_target_wrapper=
+}
+
+cancel_unacknowledged_probe() {
+  if [ -n "$active_probe_tmp" ] && [ -d "$active_probe_tmp" ]; then
+    probe_atomic_record "$active_probe_tmp/cancel.ready" cancel >/dev/null 2>&1 \
+      || true
+  fi
+  if [ -n "$active_probe_waiter_pid" ]; then
+    wait "$active_probe_waiter_pid" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$active_probe_tmp" ] && [ -d "$active_probe_tmp" ]; then
+    remove_temporary_directory "$active_probe_tmp"
+  fi
+  clear_active_probe_state
+}
+
+probe_group_has_non_anchor_member() {
+  probe_group_check_id=$1
+  probe_group_check_anchor=$2
+  probe_group_processes=$(ps -e -o pid= -o pgid= 2>/dev/null) || return 0
+  printf '%s\n' "$probe_group_processes" | awk \
+    -v group_id="$probe_group_check_id" \
+    -v anchor_pid="$probe_group_check_anchor" '
+      $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ \
+        && $2 == group_id && $1 != anchor_pid { found = 1 }
+      END { exit !found }
+    '
+}
+
+snapshot_probe_status_before_term() {
+  last_probe_status_available=false
+  last_probe_status=
+  [ -n "$active_probe_tmp" ] || return 1
+  [ "$active_probe_target_acknowledged" = true ] || return 0
+  [ -e "$active_probe_tmp/status.ready" ] || return 0
+  if ! read_probe_pair_record "$active_probe_tmp/status.ready" \
+    || [ "$probe_record_first" != "$active_probe_target_pid" ] \
+    || [ "$probe_record_second" -gt 255 ]; then
+    printf '%s\n' 'bootstrap: malformed probe target status record' >&2
+    return 1
+  fi
+  last_probe_status_available=true
+  last_probe_status=$probe_record_second
+  record_probe_test_audit \
+    "status-before-term|$active_probe_target_pid|$last_probe_status" \
+    || return 1
+  return 0
+}
+
+stop_owned_probe() {
+  if [ "$probe_cleanup_active" = true ]; then
+    printf '%s\n' 'bootstrap: refusing recursive probe cleanup' >&2
+    return 1
+  fi
+  probe_cleanup_active=true
+  probe_cleanup_status=0
+  probe_cleanup_owns_deferral=false
+  if [ "$cleanup_registration_critical" = false ]; then
+    cleanup_registration_critical=true
+    probe_cleanup_owns_deferral=true
+  fi
+
+  exec 3>&-
+  snapshot_probe_status_before_term || probe_cleanup_status=1
+
+  if [ "$active_probe_acknowledged" = true ] \
+    && [ -n "$active_probe_anchor_pid" ]; then
+    if probe_anchor_identity_is_valid \
+      "$active_probe_anchor_pid" "$active_probe_anchor_parent"; then
+      record_probe_test_audit "group-term|$active_probe_group_id" \
+        || probe_cleanup_status=1
+      kill -TERM -- "-$active_probe_group_id" >/dev/null 2>&1 \
+        || probe_cleanup_status=1
+      if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+        && [ "${DOTFILES_BOOTSTRAP_TEST_PROBE_SIGNAL_AT:-}" = teardown ]; then
+        record_probe_test_audit 'teardown-signal|TERM' \
+          || probe_cleanup_status=1
+        kill -TERM "$$"
+      fi
+
+      probe_group_grace_attempt=0
+      while [ "$probe_group_grace_attempt" -lt 20 ] \
+        && probe_group_has_non_anchor_member \
+          "$active_probe_group_id" "$active_probe_anchor_pid"
+      do
+        sleep 0.05
+        probe_group_grace_attempt=$((probe_group_grace_attempt + 1))
+      done
+
+      if probe_group_has_non_anchor_member \
+        "$active_probe_group_id" "$active_probe_anchor_pid"; then
+        if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+          && [ "${DOTFILES_BOOTSTRAP_TEST_PROBE_LOSE_ANCHOR_BEFORE_KILL:-0}" = 1 ]; then
+          probe_loss_release=${DOTFILES_BOOTSTRAP_TEST_PROBE_LOSS_RELEASE_FILE:-}
+          case "$probe_loss_release" in
+            /*) : >"$probe_loss_release" ;;
+          esac
+          kill -KILL "$active_probe_anchor_pid" >/dev/null 2>&1 || true
+          sleep 0.05
+        fi
+        if probe_anchor_identity_is_valid \
+          "$active_probe_anchor_pid" "$active_probe_anchor_parent"; then
+          record_probe_test_audit "group-kill|$active_probe_group_id" \
+            || probe_cleanup_status=1
+          kill -KILL -- "-$active_probe_group_id" >/dev/null 2>&1 \
+            || probe_cleanup_status=1
+        else
+          printf '%s\n' \
+            'bootstrap: probe anchor disappeared before forced group cleanup' >&2
+          probe_cleanup_status=1
+        fi
+      else
+        if probe_anchor_identity_is_valid \
+          "$active_probe_anchor_pid" "$active_probe_anchor_parent"; then
+          probe_atomic_record "$active_probe_tmp/release.ready" release \
+            || probe_cleanup_status=1
+        else
+          printf '%s\n' \
+            'bootstrap: probe anchor disappeared before release' >&2
+          probe_cleanup_status=1
+        fi
+      fi
+    else
+      printf '%s\n' \
+        'bootstrap: probe anchor identity changed before group cleanup' >&2
+      probe_cleanup_status=1
+    fi
+    wait "$active_probe_waiter_pid" >/dev/null 2>&1 || true
+  else
+    cancel_unacknowledged_probe
+  fi
+
+  probe_cleanup_tmp=$active_probe_tmp
+  clear_active_probe_state
+  if [ -n "$probe_cleanup_tmp" ] && [ -d "$probe_cleanup_tmp" ]; then
+    remove_temporary_directory "$probe_cleanup_tmp"
+  fi
+  probe_cleanup_active=false
+  if [ "$probe_cleanup_owns_deferral" = true ]; then
+    cleanup_registration_critical=false
+    replay_pending_transaction_signal
+  fi
+  return "$probe_cleanup_status"
+}
+
+start_owned_probe() {
+  probe_start_mode=$1
+  shift
+  begin_cleanup_registration_critical
+  active_probe_tmp=$(temporary_directory) || {
+    finish_cleanup_registration_critical
+    return 1
+  }
+  if [ -n "$pending_transaction_signal_name" ]; then
+    cancel_unacknowledged_probe
+    finish_cleanup_registration_critical
+    return 1
+  fi
+  active_probe_waiter_pid=
+  active_probe_anchor_pid=
+  active_probe_anchor_parent=
+  active_probe_group_id=
+  active_probe_target_pid=
+  active_probe_acknowledged=false
+  active_probe_target_acknowledged=false
+  active_probe_fifo=
+
+  if ! command -v setsid >/dev/null 2>&1; then
+    printf '%s\n' \
+      'bootstrap: util-linux setsid -f -w is required for Debian language-server probes' >&2
+    cancel_unacknowledged_probe
+    finish_cleanup_registration_critical
+    return 1
+  fi
+  if ! write_probe_helper_scripts "$active_probe_tmp"; then
+    printf '%s\n' 'bootstrap: could not create private probe helpers' >&2
+    cancel_unacknowledged_probe
+    finish_cleanup_registration_critical
     return 1
   fi
 
-  bounded_probe_status=0
-  wait "$bounded_probe_pid" >/dev/null 2>&1 || bounded_probe_status=$?
-  active_probe_pid=
-  [ "$bounded_probe_status" -eq 0 ]
+  probe_start_stdin=/dev/null
+  probe_start_stdout=/dev/null
+  probe_start_stderr=/dev/null
+  if [ "$probe_start_mode" = stdio ]; then
+    active_probe_fifo=$active_probe_tmp/stdin
+    mkfifo "$active_probe_fifo" || {
+      cancel_unacknowledged_probe
+      finish_cleanup_registration_critical
+      return 1
+    }
+    probe_start_stdin=$active_probe_fifo
+    probe_start_stdout=$active_probe_tmp/stdout
+    probe_start_stderr=$active_probe_tmp/stderr
+  fi
+
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ]; then
+    DOTFILES_BOOTSTRAP_TEST_PROBE_OWNER_PID=$$
+    export DOTFILES_BOOTSTRAP_TEST_PROBE_OWNER_PID
+  fi
+
+  setsid -f -w "$active_probe_supervisor" \
+    "$active_probe_tmp" "$active_probe_target_wrapper" \
+    "$probe_start_stdin" "$probe_start_stdout" "$probe_start_stderr" \
+    "$@" &
+  active_probe_waiter_pid=$!
+  if [ -n "$pending_transaction_signal_name" ]; then
+    cancel_unacknowledged_probe
+    finish_cleanup_registration_critical
+    return 1
+  fi
+
+  if ! probe_wait_for_record "$active_probe_tmp/anchor.ready" \
+    || ! read_probe_pair_record "$active_probe_tmp/anchor.ready" \
+    || ! probe_anchor_identity_is_valid \
+      "$probe_record_first" "$probe_record_second" \
+    || [ "$probe_record_second" != "$active_probe_waiter_pid" ]; then
+    printf '%s\n' 'bootstrap: probe anchor handshake failed closed' >&2
+    cancel_unacknowledged_probe
+    finish_cleanup_registration_critical
+    return 1
+  fi
+  active_probe_anchor_pid=$probe_record_first
+  active_probe_anchor_parent=$probe_record_second
+  active_probe_group_id=$probe_record_first
+
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_PROBE_SIGNAL_AT:-}" = before-anchor-ack ]; then
+    kill -TERM "$$"
+  fi
+  if [ -n "$pending_transaction_signal_name" ]; then
+    cancel_unacknowledged_probe
+    finish_cleanup_registration_critical
+    return 1
+  fi
+
+  probe_anchor_ack=$active_probe_anchor_pid\|$active_probe_waiter_pid
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_PROBE_HANDSHAKE:-}" = malformed-anchor-ack ]; then
+    probe_anchor_ack=malformed-anchor-ack
+  fi
+  probe_atomic_record "$active_probe_tmp/anchor.ack" "$probe_anchor_ack" || {
+    cancel_unacknowledged_probe
+    finish_cleanup_registration_critical
+    return 1
+  }
+  if [ "$probe_anchor_ack" \
+    = "$active_probe_anchor_pid|$active_probe_waiter_pid" ]; then
+    active_probe_acknowledged=true
+  fi
+
+  if ! probe_wait_for_record "$active_probe_tmp/target.ready" \
+    || ! read_probe_pair_record "$active_probe_tmp/target.ready" \
+    || [ "$probe_record_second" != "$active_probe_anchor_pid" ] \
+    || ! probe_target_identity_is_valid \
+      "$probe_record_first" "$active_probe_anchor_pid" \
+      "$active_probe_group_id"; then
+    printf '%s\n' 'bootstrap: probe target handshake failed closed' >&2
+    stop_owned_probe || true
+    finish_cleanup_registration_critical
+    return 1
+  fi
+  active_probe_target_pid=$probe_record_first
+  probe_target_ack=$active_probe_target_pid\|$active_probe_anchor_pid
+  probe_atomic_record "$active_probe_tmp/target.ack" "$probe_target_ack" || {
+    stop_owned_probe || true
+    finish_cleanup_registration_critical
+    return 1
+  }
+  active_probe_target_acknowledged=true
+  finish_cleanup_registration_critical
+
+  if [ "$probe_start_mode" = stdio ]; then
+    exec 3>"$active_probe_fifo" || {
+      stop_owned_probe || true
+      return 1
+    }
+  fi
+  return 0
+}
+
+bounded_command_succeeds() {
+  start_owned_probe bounded "$@" || return 1
+  sleep 1
+  bounded_probe_cleanup_status=0
+  stop_owned_probe || bounded_probe_cleanup_status=$?
+  [ "$bounded_probe_cleanup_status" -eq 0 ] \
+    && [ "$last_probe_status_available" = true ] \
+    && [ "$last_probe_status" -eq 0 ]
 }
 
 replay_pending_transaction_signal() {
@@ -675,45 +1170,20 @@ stdio_server_is_satisfied() {
   fi
 
   command -v "$stdio_command" >/dev/null 2>&1 || return 1
-  begin_cleanup_registration_critical
-  stdio_probe_tmp=$(temporary_directory) || {
-    finish_cleanup_registration_critical
-    return 1
-  }
-  active_probe_tmp=$stdio_probe_tmp
-  finish_cleanup_registration_critical
-  stdio_probe_fifo=$stdio_probe_tmp/stdin
-  mkfifo "$stdio_probe_fifo" || {
-    remove_temporary_directory "$stdio_probe_tmp"
-    active_probe_tmp=
-    return 1
-  }
-
-  begin_cleanup_registration_critical
-  "$stdio_command" "$@" <"$stdio_probe_fifo" \
-    >"$stdio_probe_tmp/stdout" 2>"$stdio_probe_tmp/stderr" &
-  active_probe_pid=$!
-  stdio_probe_pid=$active_probe_pid
-  finish_cleanup_registration_critical
-  exec 3>"$stdio_probe_fifo" || {
-    stop_stdio_probe "$stdio_probe_pid"
-    remove_temporary_directory "$stdio_probe_tmp"
-    active_probe_pid=
-    active_probe_tmp=
-    return 1
-  }
+  start_owned_probe stdio "$stdio_command" "$@" || return 1
   sleep 1
-  if kill -0 "$stdio_probe_pid" >/dev/null 2>&1; then
+  if [ ! -e "$active_probe_tmp/status.ready" ] \
+    && probe_target_identity_is_valid \
+      "$active_probe_target_pid" "$active_probe_anchor_pid" \
+      "$active_probe_group_id"; then
     stdio_probe_result=0
   else
     stdio_probe_result=1
   fi
-  exec 3>&-
-  stop_stdio_probe "$stdio_probe_pid"
-  active_probe_pid=
-  remove_temporary_directory "$stdio_probe_tmp"
-  active_probe_tmp=
-  return "$stdio_probe_result"
+  stdio_probe_cleanup_status=0
+  stop_owned_probe || stdio_probe_cleanup_status=$?
+  [ "$stdio_probe_result" -eq 0 ] \
+    && [ "$stdio_probe_cleanup_status" -eq 0 ]
 }
 
 stable_taplo_version() {
@@ -1220,33 +1690,66 @@ record_managed_created_path() {
     || die 'could not record a managed-created path'
 }
 
-managed_created_path_is_allowed() {
+classify_managed_created_path() {
   candidate_managed_path=$1
+  managed_created_path_kind=
   case "$candidate_managed_path" in
-    "$HOME/.local"|"$HOME/.local/bin"|"$HOME/.local/opt"|\
+    "$HOME/.local"|"$HOME/.local/bin"|"$HOME/.local/opt")
+      managed_created_path_kind=parent
+      return 0
+      ;;
+    "$HOME/.local/bin/lua-language-server")
+      managed_created_path_kind=regular
+      return 0
+      ;;
     "$HOME/.local/bin/node"|"$HOME/.local/bin/npm"|\
-    "$HOME/.local/bin/lua-language-server"|\
     "$HOME/.local/bin/bash-language-server"|\
     "$HOME/.local/bin/vscode-json-language-server"|\
     "$HOME/.local/bin/pyright-langserver"|\
     "$HOME/.local/bin/taplo"|\
     "$HOME/.local/bin/yaml-language-server")
+      managed_created_path_kind='link'
       return 0
       ;;
   esac
   [ -n "$managed_node_target" ] \
-    && [ "$candidate_managed_path" = "$managed_node_target" ] \
-    && return 0
+    && [ "$candidate_managed_path" = "$managed_node_target" ] && {
+      managed_created_path_kind=directory
+      return 0
+    }
   [ -n "$managed_lua_target" ] \
-    && [ "$candidate_managed_path" = "$managed_lua_target" ] \
-    && return 0
+    && [ "$candidate_managed_path" = "$managed_lua_target" ] && {
+      managed_created_path_kind=directory
+      return 0
+    }
   [ -n "$managed_taplo_target" ] \
-    && [ "$candidate_managed_path" = "$managed_taplo_target" ] \
-    && return 0
+    && [ "$candidate_managed_path" = "$managed_taplo_target" ] && {
+      managed_created_path_kind=directory
+      return 0
+    }
   [ -n "$managed_npm_target" ] \
-    && [ "$candidate_managed_path" = "$managed_npm_target" ] \
-    && return 0
+    && [ "$candidate_managed_path" = "$managed_npm_target" ] && {
+      managed_created_path_kind=directory
+      return 0
+    }
   return 1
+}
+
+managed_path_matches_kind() {
+  managed_match_path=$1
+  managed_match_kind=$2
+  case "$managed_match_kind" in
+    parent|directory)
+      [ -d "$managed_match_path" ] && [ ! -L "$managed_match_path" ]
+      ;;
+    regular)
+      [ -f "$managed_match_path" ] && [ ! -L "$managed_match_path" ]
+      ;;
+    link)
+      [ -L "$managed_match_path" ]
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 begin_managed_publication_critical() {
@@ -1265,9 +1768,13 @@ track_managed_unjournaled_path() {
   managed_unjournaled_path=$1
   managed_unjournaled_kind=$2
   case "$managed_unjournaled_kind" in
-    parent|directory|file) ;;
+    parent|directory|regular|link) ;;
     *) die "unsupported managed publication path kind: $managed_unjournaled_kind" ;;
   esac
+  classify_managed_created_path "$managed_unjournaled_path" \
+    || die "unexpected managed publication path: $managed_unjournaled_path"
+  [ "$managed_created_path_kind" = "$managed_unjournaled_kind" ] \
+    || die "managed publication path kind mismatch: $managed_unjournaled_path"
 }
 
 clear_managed_unjournaled_path() {
@@ -1300,45 +1807,40 @@ remove_managed_unjournaled_path() {
   [ -n "$managed_unjournaled_path" ] || return 0
   cleanup_unjournaled_path=$managed_unjournaled_path
   cleanup_unjournaled_kind=$managed_unjournaled_kind
-  if ! managed_created_path_is_allowed "$cleanup_unjournaled_path"; then
+  if ! classify_managed_created_path "$cleanup_unjournaled_path"; then
     printf 'bootstrap: refusing unjournaled managed cleanup for unexpected path: %s\n' \
+      "$cleanup_unjournaled_path" >&2
+    return 1
+  fi
+  if [ "$managed_created_path_kind" != "$cleanup_unjournaled_kind" ]; then
+    printf 'bootstrap: refusing unjournaled managed cleanup for mismatched path kind: %s\n' \
       "$cleanup_unjournaled_path" >&2
     return 1
   fi
 
   unjournaled_cleanup_status=0
+  if ! path_exists "$cleanup_unjournaled_path"; then
+    clear_managed_unjournaled_path
+    return 0
+  fi
+  if ! managed_path_matches_kind \
+    "$cleanup_unjournaled_path" "$cleanup_unjournaled_kind"; then
+    printf 'bootstrap: refusing unjournaled managed %s cleanup for changed path: %s\n' \
+      "$cleanup_unjournaled_kind" "$cleanup_unjournaled_path" >&2
+    return 1
+  fi
   case "$cleanup_unjournaled_kind" in
     parent)
-      if path_exists "$cleanup_unjournaled_path"; then
-        rmdir "$cleanup_unjournaled_path" >/dev/null 2>&1 \
-          || unjournaled_cleanup_status=1
-      fi
+      rmdir "$cleanup_unjournaled_path" >/dev/null 2>&1 \
+        || unjournaled_cleanup_status=1
       ;;
     directory)
-      if path_exists "$cleanup_unjournaled_path"; then
-        if [ -d "$cleanup_unjournaled_path" ] \
-          && [ ! -L "$cleanup_unjournaled_path" ]; then
-          rm -rf -- "$cleanup_unjournaled_path" \
-            || unjournaled_cleanup_status=1
-        else
-          printf 'bootstrap: refusing unjournaled managed directory cleanup for changed path: %s\n' \
-            "$cleanup_unjournaled_path" >&2
-          unjournaled_cleanup_status=1
-        fi
-      fi
+      rm -rf -- "$cleanup_unjournaled_path" \
+        || unjournaled_cleanup_status=1
       ;;
-    file)
-      if path_exists "$cleanup_unjournaled_path"; then
-        if [ -d "$cleanup_unjournaled_path" ] \
-          && [ ! -L "$cleanup_unjournaled_path" ]; then
-          printf 'bootstrap: refusing unjournaled managed file cleanup for changed path: %s\n' \
-            "$cleanup_unjournaled_path" >&2
-          unjournaled_cleanup_status=1
-        else
-          rm -f -- "$cleanup_unjournaled_path" \
-            || unjournaled_cleanup_status=1
-        fi
-      fi
+    regular|link)
+      rm -f -- "$cleanup_unjournaled_path" \
+        || unjournaled_cleanup_status=1
       ;;
     *)
       printf 'bootstrap: refusing unjournaled managed cleanup for unsupported path kind: %s\n' \
@@ -1369,42 +1871,38 @@ remove_managed_created_paths() {
         continue
         ;;
     esac
-    if ! managed_created_path_is_allowed "$cleanup_managed_path"; then
+    if ! classify_managed_created_path "$cleanup_managed_path"; then
       printf 'bootstrap: refusing managed cleanup for unexpected path: %s\n' \
         "$cleanup_managed_path" >&2
       managed_cleanup_status=1
       continue
     fi
-    case "$cleanup_managed_path" in
-      "$HOME/.local"|"$HOME/.local/bin"|"$HOME/.local/opt")
-        if path_exists "$cleanup_managed_path"; then
-          rmdir "$cleanup_managed_path" >/dev/null 2>&1 \
-            || managed_cleanup_status=1
-        fi
+    cleanup_managed_kind=$managed_created_path_kind
+    path_exists "$cleanup_managed_path" || continue
+    if ! managed_path_matches_kind \
+      "$cleanup_managed_path" "$cleanup_managed_kind"; then
+      printf 'bootstrap: refusing managed %s cleanup for changed path: %s\n' \
+        "$cleanup_managed_kind" "$cleanup_managed_path" >&2
+      managed_cleanup_status=1
+      continue
+    fi
+    case "$cleanup_managed_kind" in
+      parent)
+        rmdir "$cleanup_managed_path" >/dev/null 2>&1 \
+          || managed_cleanup_status=1
         ;;
-      "$managed_node_target"|"$managed_lua_target"|"$managed_taplo_target"|"$managed_npm_target")
-        if path_exists "$cleanup_managed_path"; then
-          if [ -d "$cleanup_managed_path" ] && [ ! -L "$cleanup_managed_path" ]; then
-            rm -rf -- "$cleanup_managed_path" \
-              || managed_cleanup_status=1
-          else
-            printf 'bootstrap: refusing managed directory cleanup for changed path: %s\n' \
-              "$cleanup_managed_path" >&2
-            managed_cleanup_status=1
-          fi
-        fi
+      directory)
+        rm -rf -- "$cleanup_managed_path" \
+          || managed_cleanup_status=1
+        ;;
+      regular|link)
+        rm -f -- "$cleanup_managed_path" \
+          || managed_cleanup_status=1
         ;;
       *)
-        if path_exists "$cleanup_managed_path"; then
-          if [ -d "$cleanup_managed_path" ] && [ ! -L "$cleanup_managed_path" ]; then
-            printf 'bootstrap: refusing managed file cleanup for changed path: %s\n' \
-              "$cleanup_managed_path" >&2
-            managed_cleanup_status=1
-          else
-            rm -f -- "$cleanup_managed_path" \
-              || managed_cleanup_status=1
-          fi
-        fi
+        printf 'bootstrap: refusing managed cleanup for unsupported path kind: %s\n' \
+          "$cleanup_managed_kind" >&2
+        managed_cleanup_status=1
         ;;
     esac
   done <"$managed_reverse_file"
@@ -1457,17 +1955,72 @@ publish_managed_directory() {
   maybe_fail_managed_publication "$publication_token"
 }
 
+mutate_managed_link_for_test() {
+  managed_link_mutation_phase=$1
+  managed_link_mutation_path=$2
+  [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] || return 0
+  [ "${DOTFILES_BOOTSTRAP_TEST_LINK_MUTATION_PHASE:-}" \
+    = "$managed_link_mutation_phase" ] || return 0
+  [ "${DOTFILES_BOOTSTRAP_TEST_LINK_MUTATION_TARGET:-}" \
+    = "$managed_link_mutation_path" ] || return 0
+  [ -L "$managed_link_mutation_path" ] \
+    || die 'managed link mutation hook requires the exact published link'
+  rm -f -- "$managed_link_mutation_path" \
+    || die 'managed link mutation hook could not remove the published link'
+  case "${DOTFILES_BOOTSTRAP_TEST_LINK_MUTATION_KIND:-}" in
+    regular)
+      printf '%s\n' 'mutated Taplo link bytes' \
+        >"$managed_link_mutation_path" \
+        || die 'managed link mutation hook could not create a regular file'
+      ;;
+    directory)
+      mkdir "$managed_link_mutation_path" \
+        || die 'managed link mutation hook could not create a directory'
+      printf '%s\n' 'mutated Taplo link directory' \
+        >"$managed_link_mutation_path/sentinel" \
+        || die 'managed link mutation hook could not create a directory sentinel'
+      ;;
+    *) die 'managed link mutation hook has an unsupported replacement kind' ;;
+  esac
+}
+
 publish_managed_link() {
   link_source=$1
   link_target=$2
+  case "$link_source" in
+    ''|*"
+"*|*""*|*"	"*)
+      die 'managed language-tool link source contains control characters'
+      ;;
+  esac
+  case "$link_target" in
+    ''|*"
+"*|*""*|*"	"*)
+      die 'managed language-tool link target contains control characters'
+      ;;
+  esac
   require_managed_target_free "$link_target"
   begin_managed_publication_critical
   if ! ln -s "$link_source" "$link_target"; then
     fail_managed_publication_critical \
       "could not publish managed language-tool link: $link_target"
   fi
-  track_managed_unjournaled_path "$link_target" file
+  track_managed_unjournaled_path "$link_target" link
+  mutate_managed_link_for_test before-journal "$link_target"
+  if [ ! -L "$link_target" ]; then
+    fail_managed_publication_critical \
+      "managed language-tool link was not published: $link_target"
+  fi
+  if ! published_link_source=$(readlink -- "$link_target"); then
+    fail_managed_publication_critical \
+      "could not inspect managed language-tool link: $link_target"
+  fi
+  if [ "$published_link_source" != "$link_source" ]; then
+    fail_managed_publication_critical \
+      "managed language-tool link has an unexpected target: $link_target"
+  fi
   complete_managed_publication_critical
+  mutate_managed_link_for_test after-journal "$link_target"
 }
 
 record_managed_language_server_actions() {
@@ -1538,7 +2091,7 @@ publish_debian_language_servers() {
         'could not publish the managed LuaLS wrapper'
     fi
     track_managed_unjournaled_path \
-      "$HOME/.local/bin/lua-language-server" file
+      "$HOME/.local/bin/lua-language-server" regular
     if [ -e "$publish_stage_root/lua-language-server.wrapper" ] \
       || [ -L "$publish_stage_root/lua-language-server.wrapper" ]; then
       fail_managed_publication_critical \
@@ -3302,6 +3855,7 @@ handle_transaction_signal() {
   signal_code=$2
   if [ "$managed_publication_critical" = true ] \
     || [ "$cleanup_registration_critical" = true ] \
+    || [ "$probe_cleanup_active" = true ] \
     || [ -n "$pending_transaction_signal_name" ]; then
     if [ -z "$pending_transaction_signal_name" ]; then
       pending_transaction_signal_name=$signal_name
@@ -3315,14 +3869,8 @@ handle_transaction_signal() {
 handle_process_exit() {
   trap '' 0 HUP INT TERM
   process_status=$1
-  if [ -n "$active_probe_pid" ]; then
-    exec 3>&-
-    stop_stdio_probe "$active_probe_pid"
-    active_probe_pid=
-  fi
-  if [ -n "$active_probe_tmp" ] && [ -d "$active_probe_tmp" ]; then
-    remove_temporary_directory "$active_probe_tmp"
-    active_probe_tmp=
+  if [ -n "$active_probe_waiter_pid" ] || [ -n "$active_probe_tmp" ]; then
+    stop_owned_probe || true
   fi
   if [ "$process_status" -ne 0 ] && [ "$managed_publish_active" = true ]; then
     managed_cleanup_incomplete=false
@@ -3400,7 +3948,19 @@ pending_transaction_signal_code=
 selected_node=
 selected_npm=
 active_probe_tmp=
-active_probe_pid=
+active_probe_waiter_pid=
+active_probe_anchor_pid=
+active_probe_anchor_parent=
+active_probe_group_id=
+active_probe_target_pid=
+active_probe_acknowledged=false
+active_probe_target_acknowledged=false
+active_probe_fifo=
+active_probe_supervisor=
+active_probe_target_wrapper=
+probe_cleanup_active=false
+last_probe_status_available=false
+last_probe_status=
 
 trap 'handle_process_exit "$?"' 0
 trap 'handle_transaction_signal HUP 129' HUP
