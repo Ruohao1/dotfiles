@@ -709,6 +709,7 @@ end
 local function new_runtime(deps)
   local state = {
     stopped = false,
+    startup_visible = false,
     snapshot = nil,
     profile = nil,
     cache = nil,
@@ -718,13 +719,16 @@ local function new_runtime(deps)
   }
   local controller = {}
 
+  local function apply_status_ownership()
+    local laststatus = (deps.inside_tmux or state.startup_visible) and 0 or 3
+    deps.set_option("laststatus", laststatus)
+  end
+
   deps.set_option("cmdheight", 0)
   deps.set_option("showmode", false)
+  apply_status_ownership()
   if deps.inside_tmux then
-    deps.set_option("laststatus", 0)
     deps.set_option("statusline", "")
-  else
-    deps.set_option("laststatus", 3)
   end
   deps.apply_highlights()
 
@@ -820,6 +824,19 @@ local function new_runtime(deps)
     replace_snapshot(git_refresh_events[reason] or reason == "manual", reason)
   end
 
+  function controller:set_startup_visible(visible)
+    assert(type(visible) == "boolean", "startup visibility must be boolean")
+    if state.stopped then
+      return false
+    end
+    if state.startup_visible == visible then
+      return true
+    end
+    state.startup_visible = visible
+    apply_status_ownership()
+    return true
+  end
+
   function controller:shutdown()
     if state.stopped then
       return
@@ -844,6 +861,7 @@ local function new_runtime(deps)
   function controller:debug_state()
     return {
       stopped = state.stopped,
+      startup_visible = state.startup_visible,
       snapshot = copy_semantic(state.snapshot),
       profile = state.profile,
       has_cache = state.cache ~= nil,
@@ -928,6 +946,14 @@ function M.refresh(reason)
   if runtime and not runtime:is_stopped() then
     runtime:refresh(reason)
   end
+end
+
+function M.set_startup_visible(visible)
+  assert(type(visible) == "boolean", "startup visibility must be boolean")
+  if not runtime or runtime:is_stopped() then
+    return false
+  end
+  return runtime:set_startup_visible(visible)
 end
 
 function M.shutdown()

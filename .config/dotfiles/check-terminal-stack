@@ -2146,7 +2146,7 @@ nvim_lock_is_exact() {
   [ "$#" -eq 1 ] || return 2
 
   jq -e '
-    keys == ["fzf-lua", "lazy.nvim", "mini.icons", "mini.pairs", "mini.surround", "nvim-treesitter", "oil.nvim", "smart-splits.nvim", "tokyonight.nvim"]
+    keys == ["fzf-lua", "lazy.nvim", "mini.icons", "mini.pairs", "mini.starter", "mini.surround", "nvim-treesitter", "oil.nvim", "smart-splits.nvim", "tokyonight.nvim"]
     and all(.[];
       if type == "object" then
         ((.commit? | type) == "string")
@@ -2267,6 +2267,9 @@ nvim_plugin_generated_tags_are_exact() {
       ;;
     mini.pairs)
       nvim_tags_sources='doc/mini-pairs.txt'
+      ;;
+    mini.starter)
+      nvim_tags_sources='doc/mini-starter.txt'
       ;;
     mini.surround)
       nvim_tags_sources='doc/mini-surround.txt'
@@ -2430,7 +2433,7 @@ nvim_plugin_source_is_exact() {
     lazy.nvim|fzf-lua|oil.nvim|nvim-treesitter|tokyonight.nvim)
       nvim_source_expected_status='!! doc/tags'
       ;;
-    mini.icons|mini.pairs|mini.surround)
+    mini.icons|mini.pairs|mini.starter|mini.surround)
       nvim_source_expected_status='?? doc/tags'
       ;;
     *)
@@ -2524,6 +2527,7 @@ nvim_trust_write_lock_fixture() {
     '  "lazy.nvim": {"branch":"main","commit":"306a05526ada86a7b30af95c5cc81ffba93fef97"},' \
     "  \"mini.icons\": $nvim_lock_fixture_mini," \
     '  "mini.pairs": {"branch":"main","commit":"4a014143fcb4e9df26198ccb3ecff3b9e77a048c"},' \
+    '  "mini.starter": {"branch":"main","commit":"2222222222222222222222222222222222222222"},' \
     '  "mini.surround": {"branch":"main","commit":"580e4cb98c5900d9fe743865fb5a5b2178b4ab18"},' \
     '  "nvim-treesitter": {"branch":"main","commit":"3d3321b560a63ff92a8692401f303a5123336b86"},' \
     '  "oil.nvim": {"branch":"master","commit":"b73018b75affd13fa38e2fc94ef753b465f770d7"},' \
@@ -2672,7 +2676,7 @@ run_nvim_trust_self_test() {
     fi
   done
   nvim_trust_expect_accept \
-    "exact nine-object lock is accepted" \
+    "exact ten-object lock is accepted" \
     nvim_lock_is_exact "$check_tmp/nvim-lock-valid.json" || true
   nvim_trust_expect_reject \
     "extra lock key is rejected" \
@@ -5613,8 +5617,10 @@ for static_lint_file in \
   "$nvim_root/lua/plugins/editing.lua" \
   "$nvim_root/lua/plugins/navigation.lua" \
   "$nvim_root/lua/plugins/smart-splits.lua" \
+  "$nvim_root/lua/plugins/startup.lua" \
   "$nvim_root/lua/plugins/theme.lua" \
   "$nvim_root/lua/plugins/treesitter.lua" \
+  "$nvim_root/lua/ui/startup.lua" \
   "$nvim_root/lua/ui/statusline.lua" \
   "$nvim_root/tests/bashls.lua" \
   "$nvim_root/tests/jsonls.lua" \
@@ -5628,6 +5634,7 @@ for static_lint_file in \
   "$nvim_root/tests/platform.lua" \
   "$nvim_root/tests/pyright.lua" \
   "$nvim_root/tests/yamlls.lua" \
+  "$nvim_root/tests/startup.lua" \
   "$nvim_root/tests/statusline.lua" \
   "$nvim_root/tests/theme_treesitter.lua"
 do
@@ -9929,8 +9936,10 @@ for nvim_file in \
   "$nvim_root/lua/plugins/editing.lua" \
   "$nvim_root/lua/plugins/navigation.lua" \
   "$nvim_root/lua/plugins/smart-splits.lua" \
+  "$nvim_root/lua/plugins/startup.lua" \
   "$nvim_root/lua/plugins/theme.lua" \
   "$nvim_root/lua/plugins/treesitter.lua" \
+  "$nvim_root/lua/ui/startup.lua" \
   "$nvim_root/lua/ui/statusline.lua" \
   "$nvim_root/lua/integrations/tmux_status.lua" \
   "$nvim_root/tests/platform.lua" \
@@ -9945,6 +9954,7 @@ for nvim_file in \
   "$nvim_root/tests/plugin_source.lua" \
   "$nvim_root/tests/pyright.lua" \
   "$nvim_root/tests/yamlls.lua" \
+  "$nvim_root/tests/startup.lua" \
   "$nvim_root/tests/statusline.lua" \
   "$nvim_root/tests/theme_treesitter.lua" \
   "$config_root/dotfiles/git-summary"
@@ -9954,7 +9964,7 @@ do
   fi
 done
 
-approved_nvim_plugins='fzf-lua lazy.nvim mini.icons mini.pairs mini.surround nvim-treesitter oil.nvim smart-splits.nvim tokyonight.nvim'
+approved_nvim_plugins='fzf-lua lazy.nvim mini.icons mini.pairs mini.starter mini.surround nvim-treesitter oil.nvim smart-splits.nvim tokyonight.nvim'
 mini_icons_dir="$nvim_data_root/lazy/mini.icons"
 oil_dir="$nvim_data_root/lazy/oil.nvim"
 plugins_ready=true
@@ -9978,9 +9988,9 @@ if command -v jq >/dev/null 2>&1 \
   && [ -r "$nvim_root/lazy-lock.json" ] \
   && nvim_lock_is_exact "$nvim_root/lazy-lock.json"; then
   lock_valid=true
-  pass "Neovim lockfile contains exactly nine object-valued pinned plugins"
+  pass "Neovim lockfile contains exactly ten object-valued pinned plugins"
 else
-  fail "Neovim lockfile must contain the exact nine-plugin object boundary"
+  fail "Neovim lockfile must contain the exact ten-plugin object boundary"
 fi
 
 if [ "$lock_valid" = true ] && [ "$plugins_ready" = true ]; then
@@ -10020,7 +10030,7 @@ if [ "$nvim_config_ready" = true ] \
   && [ "$plugin_revisions_match" = true ] \
   && [ "$plugin_worktrees_clean" = true ]; then
   plugins_trusted=true
-  pass "Neovim nine-plugin revision and source trust gate satisfied"
+  pass "Neovim ten-plugin revision and source trust gate satisfied"
 else
   fail "Neovim plugin trust gate is closed; live plugin code will not run"
   printf '%s\n' \
@@ -10228,13 +10238,39 @@ if [ "$nvim_config_ready" = true ] && [ "$plugins_trusted" = true ] && command -
     -c "luafile $nvim_root/tests/editing.lua" \
     -c "luafile $nvim_root/tests/navigation.lua" \
     -c "luafile $nvim_root/tests/statusline.lua" \
+    -c "luafile $nvim_root/tests/startup.lua" \
     -c 'lua for _, name in ipairs({ "bashls", "jsonls", "lua_ls", "pyright", "yamlls" }) do assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned during configured foundation assertions") end' \
     -c qa > "$check_tmp/nvim-tests.txt" 2>&1 \
     && ! nvim_log_has_error "$check_tmp/nvim-tests.txt"; then
-    pass "Neovim platform, native Bash, JSON, Lua, Python, and YAML LSP startup and completion, navigation, TokyoNight, Treesitter, parser, FzfLua, Oil, MiniIcons, MiniPairs, MiniSurround, smart-splits, and statusline assertions pass"
+    pass "Neovim platform, native Bash, JSON, Lua, Python, and YAML LSP startup and completion, navigation, TokyoNight, Treesitter, parser, FzfLua, Oil, MiniIcons, MiniPairs, MiniStarter, MiniSurround, smart-splits, statusline, and startup assertions pass"
   else
     sed 's/^/      /' "$check_tmp/nvim-tests.txt" >&2
     fail "Neovim headless foundation assertions failed"
+  fi
+
+  nvim_startup_root="$check_tmp/nvim-startup"
+  nvim_startup_output="$check_tmp/nvim-startup.txt"
+  if [ ! -e "$nvim_startup_root" ] \
+    && [ ! -L "$nvim_startup_root" ] \
+    && mkdir "$nvim_startup_root" \
+    && env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
+      DOTFILES_NVIM_SKIP_PARSER_INSTALL=1 \
+      DOTFILES_STARTUP_LIVE=1 \
+      DOTFILES_NVIM_ROOT="$nvim_root" \
+      DOTFILES_STARTUP_DATA_HOME="$data_home" \
+      DOTFILES_STARTUP_ALLOWED_ROOT="$check_tmp" \
+      DOTFILES_STARTUP_TEST_ROOT="$nvim_startup_root" \
+      nvim --clean --headless -u NONE -i NONE \
+      -c 'lua vim.opt.runtimepath:prepend(vim.env.DOTFILES_NVIM_ROOT)' \
+      -l "$nvim_root/tests/startup.lua" \
+      > "$nvim_startup_output" 2>&1 \
+    && ! nvim_log_has_error "$nvim_startup_output" \
+    && grep -Fqx 'Configured MiniStarter startup matrix: ok' "$nvim_startup_output"; then
+    pass "configured MiniStarter startup matrix passes"
+  else
+    [ ! -f "$nvim_startup_output" ] \
+      || sed 's/^/      /' "$nvim_startup_output" >&2
+    fail "configured MiniStarter startup matrix failed"
   fi
 
   for DOTFILES_OIL_TEST_MODE in failure success; do

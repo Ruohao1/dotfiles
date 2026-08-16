@@ -68,11 +68,11 @@ local function new(dependencies)
   end
 
   return {
-    files = function()
+    files = function(cwd)
       if not check_fzf() or not check_file_provider() then
         return
       end
-      dependencies.fzf().files({ cwd = dependencies.root() })
+      dependencies.fzf().files({ cwd = cwd or dependencies.root() })
     end,
     grep = function()
       if not check_fzf() or not check_grep_provider() then
@@ -91,6 +91,35 @@ local function new(dependencies)
         return
       end
       dependencies.fzf().oldfiles()
+    end,
+    projects = function(projects, on_select)
+      assert(type(projects) == "table", "projects must be a table")
+      assert(type(on_select) == "function", "project callback must be a function")
+      if not check_fzf() then
+        return
+      end
+
+      local labels = {}
+      local roots = {}
+      for _, project in ipairs(projects) do
+        assert(type(project.label) == "string", "project label must be a string")
+        assert(type(project.root) == "string", "project root must be a string")
+        table.insert(labels, project.label)
+        roots[project.label] = project.root
+      end
+
+      dependencies.fzf().fzf_exec(labels, {
+        prompt = "Projects> ",
+        previewer = false,
+        actions = {
+          enter = function(selected)
+            local root_path = selected and roots[selected[1]] or nil
+            if root_path then
+              on_select(root_path)
+            end
+          end,
+        },
+      })
     end,
     help = function()
       if not check_fzf() then
@@ -163,6 +192,7 @@ M.files = runtime.files
 M.grep = runtime.grep
 M.buffers = runtime.buffers
 M.recent = runtime.recent
+M.projects = runtime.projects
 M.help = runtime.help
 M.lsp_locations = runtime.lsp_locations
 M.document_symbols = runtime.document_symbols

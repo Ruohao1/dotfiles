@@ -10,6 +10,16 @@ local function local_path(path)
   return vim.fs.normalize(vim.fs.abspath(path))
 end
 
+local function find_path(path)
+  local start = local_path(path)
+  if not start then
+    return nil
+  end
+
+  local resolved = vim.fs.root(start, markers)
+  return resolved and vim.fs.normalize(vim.fs.abspath(resolved)) or nil
+end
+
 local function resolve_context(context)
   local cwd = assert(local_path(context.cwd), "cwd must be a local path")
   local oil_dir = local_path(context.oil_dir)
@@ -20,8 +30,7 @@ local function resolve_context(context)
     start = local_path(context.name)
   end
 
-  local resolved = vim.fs.root(start or cwd, markers)
-  return resolved and vim.fs.normalize(vim.fs.abspath(resolved)) or cwd
+  return find_path(start or cwd) or cwd
 end
 
 local function new(dependencies)
@@ -48,7 +57,11 @@ local function new(dependencies)
   }
 end
 
-M._test = { new = new, resolve_context = resolve_context }
+M._test = {
+  find_path = find_path,
+  new = new,
+  resolve_context = resolve_context,
+}
 
 local function oil_directory(bufnr)
   local loaded, oil = pcall(require, "oil")
@@ -84,6 +97,10 @@ local runtime = new({
 
 function M.resolve(context)
   return runtime.resolve(context)
+end
+
+function M.find(path)
+  return find_path(path)
 end
 
 return M

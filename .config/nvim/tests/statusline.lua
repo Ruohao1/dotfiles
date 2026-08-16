@@ -1160,6 +1160,7 @@ local function ownership_harness(options)
   options = options or {}
   local state = {
     options = {},
+    option_writes = {},
     augroup_calls = 0,
     autocmds = {},
     scheduled = {},
@@ -1238,6 +1239,7 @@ local function ownership_harness(options)
     end,
     set_option = function(name, value)
       state.options[name] = value
+      table.insert(state.option_writes, { name = name, value = value })
     end,
     apply_highlights = function()
       state.highlight_calls = state.highlight_calls + 1
@@ -1348,6 +1350,31 @@ do
   end)
 end
 
+do
+  local h = ownership_harness()
+  with_runtime(h, function(controller)
+    eq(controller:debug_state().startup_visible, false, "startup initially hidden")
+    eq(controller:set_startup_visible(true), true, "controller accepts startup visibility")
+    eq(h.options.laststatus, 0, "standalone starter suppresses status row")
+    local writes = #h.option_writes
+    eq(controller:set_startup_visible(true), true, "repeated startup visibility succeeds")
+    eq(#h.option_writes, writes, "repeated startup visibility is idempotent")
+    eq(controller:set_startup_visible(false), true, "controller restores normal visibility")
+    eq(h.options.laststatus, 3, "standalone status row restored")
+    eq(controller:debug_state().startup_visible, false, "debug state reports restoration")
+  end)
+end
+
+do
+  local h = ownership_harness({ inside_tmux = true, pane = "%12" })
+  with_runtime(h, function(controller)
+    controller:set_startup_visible(true)
+    eq(h.options.laststatus, 0, "tmux starter keeps native row hidden")
+    controller:set_startup_visible(false)
+    eq(h.options.laststatus, 0, "tmux restoration cannot create a native row")
+  end)
+end
+
 for _, case in ipairs({
   { label = "invalid pane", pane = "invalid-pane", executable = true },
   { label = "missing tmux", pane = "%12", executable = false },
@@ -1411,6 +1438,15 @@ do
   statusline.shutdown()
   eq(h.publisher.stop_calls, 1, "shutdown stops publisher once")
 end
+
+statusline.shutdown()
+eq(statusline.set_startup_visible(true), false, "missing runtime rejects startup visibility")
+local public_harness = ownership_harness()
+statusline.setup(public_harness.deps)
+eq(statusline.set_startup_visible(true), true, "public startup visibility dispatch")
+eq(public_harness.options.laststatus, 0, "public startup suppression")
+statusline.shutdown()
+eq(statusline.set_startup_visible(false), false, "stopped runtime rejects startup visibility")
 
 do
   local h = ownership_harness()

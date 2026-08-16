@@ -167,6 +167,7 @@ local tags_allowed = {
   ["lazy.nvim"] = true,
   ["mini.icons"] = true,
   ["mini.pairs"] = true,
+  ["mini.starter"] = true,
   ["mini.surround"] = true,
   ["nvim-treesitter"] = true,
   ["oil.nvim"] = true,

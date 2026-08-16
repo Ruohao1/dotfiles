@@ -351,22 +351,25 @@ local plugin_source_test =
   table.concat(vim.fn.readfile(vim.fs.joinpath(nvim_root, "tests", "plugin_source.lua")), "\n")
 
 for _, fragment in ipairs({
-  'keys == ["fzf-lua", "lazy.nvim", "mini.icons", "mini.pairs", "mini.surround", "nvim-treesitter", "oil.nvim", "smart-splits.nvim", "tokyonight.nvim"]',
+  'keys == ["fzf-lua", "lazy.nvim", "mini.icons", "mini.pairs", "mini.starter", "mini.surround", "nvim-treesitter", "oil.nvim", "smart-splits.nvim", "tokyonight.nvim"]',
   '"$nvim_root/lua/editing/buffers.lua"',
   '"$nvim_root/lua/plugins/editing.lua"',
   '"$nvim_root/tests/editing.lua"',
   "mini.pairs)",
   "nvim_tags_sources='doc/mini-pairs.txt'",
+  "mini.starter)",
+  "nvim_tags_sources='doc/mini-starter.txt'",
   "mini.surround)",
   "nvim_tags_sources='doc/mini-surround.txt'",
-  "mini.icons|mini.pairs|mini.surround)",
+  "mini.icons|mini.pairs|mini.starter|mini.surround)",
   '"mini.pairs": {"branch":"main","commit":"4a014143fcb4e9df26198ccb3ecff3b9e77a048c"}',
+  '"mini.starter": {"branch":"main","commit":"2222222222222222222222222222222222222222"}',
   '"mini.surround": {"branch":"main","commit":"580e4cb98c5900d9fe743865fb5a5b2178b4ab18"}',
-  "approved_nvim_plugins='fzf-lua lazy.nvim mini.icons mini.pairs mini.surround nvim-treesitter oil.nvim smart-splits.nvim tokyonight.nvim'",
+  "approved_nvim_plugins='fzf-lua lazy.nvim mini.icons mini.pairs mini.starter mini.surround nvim-treesitter oil.nvim smart-splits.nvim tokyonight.nvim'",
   "DOTFILES_REQUIRE_EDITING_PLUGINS=1",
   '-c "luafile $nvim_root/tests/editing.lua"',
-  "Neovim lockfile contains exactly nine object-valued pinned plugins",
-  "Neovim nine-plugin revision and source trust gate satisfied",
+  "Neovim lockfile contains exactly ten object-valued pinned plugins",
+  "Neovim ten-plugin revision and source trust gate satisfied",
 }) do
   assert(
     checker_source:find(fragment, 1, true),
@@ -376,6 +379,7 @@ end
 
 for _, fragment in ipairs({
   '["mini.pairs"] = true',
+  '["mini.starter"] = true',
   '["mini.surround"] = true',
 }) do
   assert(

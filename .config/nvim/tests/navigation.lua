@@ -59,10 +59,12 @@ assert(type(root.resolve) == "function", "root.resolve must be public")
 assert(type(root._test) == "table", "root test boundary missing")
 assert(type(root._test.new) == "function", "root test constructor missing")
 assert(type(root._test.resolve_context) == "function", "pure root resolver missing")
+assert(type(root.find) == "function", "root.find must be public")
+assert(type(root._test.find_path) == "function", "pure non-fallback root lookup missing")
 
 with_fixture(function(fixture)
   local paths = {
-    outside = vim.fs.joinpath(fixture, "outside"),
+    outside = "/",
     git_dir = vim.fs.joinpath(fixture, "git-dir"),
     worktree = vim.fs.joinpath(fixture, "worktree"),
     outer = vim.fs.joinpath(fixture, "outer"),
@@ -76,7 +78,6 @@ with_fixture(function(fixture)
     window = vim.fs.joinpath(fixture, "window"),
   }
 
-  make_directory(vim.fs.joinpath(paths.outside, ".git"))
   make_directory(vim.fs.joinpath(paths.git_dir, ".git"))
   make_directory(vim.fs.joinpath(paths.git_dir, "src"))
   make_directory(vim.fs.joinpath(paths.worktree, "src"))
@@ -95,6 +96,30 @@ with_fixture(function(fixture)
     make_directory(vim.fs.joinpath(repo, ".git"))
     make_directory(vim.fs.joinpath(repo, "src"))
   end
+
+  eq(
+    root._test.find_path(vim.fs.joinpath(paths.git_dir, "src", "main.lua")),
+    paths.git_dir,
+    "non-fallback .git directory root"
+  )
+  eq(
+    root._test.find_path(vim.fs.joinpath(paths.worktree, "src", "main.lua")),
+    paths.worktree,
+    "non-fallback .git file root"
+  )
+  eq(
+    root._test.find_path(vim.fs.joinpath(paths.nested, "src", "main.lua")),
+    paths.nested,
+    "non-fallback nearest .jj root"
+  )
+  eq(root._test.find_path(paths.outside), nil, "non-project directory has no root")
+  eq(root._test.find_path("oil-ssh://host/project/file.lua"), nil, "remote path has no root")
+  eq(root._test.find_path(""), nil, "empty path has no root")
+  eq(
+    root.find(vim.fs.joinpath(paths.git_inner, "src", "main.lua")),
+    paths.git_inner,
+    "public root lookup"
+  )
 
   eq(
     root._test.resolve_context({
@@ -360,6 +385,14 @@ local function picker_harness(options)
     end
   end
 
+  api.fzf_exec = function(contents, call_options)
+    table.insert(calls, {
+      name = "fzf_exec",
+      contents = vim.deepcopy(contents),
+      options = call_options,
+    })
+  end
+
   local controller = pickers._test.new({
     executable = function(name)
       return available[name] == true
@@ -439,6 +472,37 @@ eq(dispatch.calls[8], { name = "lsp_live_workspace_symbols" }, "workspace symbol
 eq(dispatch.calls[9], { name = "diagnostics_document" }, "document diagnostics dispatch")
 eq(dispatch.calls[10], { name = "diagnostics_workspace" }, "all diagnostics dispatch")
 eq(dispatch.counts(), { system = 1, fzf = 10, root = 2 }, "successful dispatch counts")
+
+local explicit = picker_harness()
+explicit.controller.files("/selected/project")
+eq(
+  explicit.calls[1],
+  { name = "files", options = { cwd = "/selected/project" } },
+  "explicit file root"
+)
+eq(explicit.counts().root, 0, "explicit file root bypasses root resolver")
+
+local project_selection
+local projects = picker_harness()
+projects.controller.projects({
+  { label = "~/src/alpha", root = "/home/test/src/alpha" },
+  { label = "/srv/alpha", root = "/srv/alpha" },
+}, function(root_path)
+  project_selection = root_path
+end)
+
+eq(projects.calls[1].name, "fzf_exec", "project picker API")
+eq(projects.calls[1].contents, { "~/src/alpha", "/srv/alpha" }, "project display order")
+eq(projects.calls[1].options.prompt, "Projects> ", "project prompt")
+eq(projects.calls[1].options.previewer, false, "project preview disabled")
+projects.calls[1].options.actions.enter({ "/srv/alpha" })
+eq(project_selection, "/srv/alpha", "project picker retains canonical root")
+
+project_selection = nil
+projects.calls[1].options.actions.enter({})
+eq(project_selection, nil, "project cancellation has no callback")
+projects.calls[1].options.actions.enter({ "not-an-entry" })
+eq(project_selection, nil, "unknown project label has no callback")
 
 for _, version_case in ipairs({
   { version = "0.36.0", accepted = true },
@@ -566,6 +630,7 @@ local expected_public_pickers = {
   "grep",
   "buffers",
   "recent",
+  "projects",
   "help",
   "lsp_locations",
   "document_symbols",

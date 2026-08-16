@@ -56,6 +56,8 @@ assert(pcall(require, "fzf-lua"), "fzf-lua must be installed and loadable")
 assert(pcall(require, "oil"), "oil.nvim must be eagerly available")
 assert(pcall(require, "mini.icons"), "mini.icons must be installed and loadable")
 assert(type(_G.MiniIcons) == "table", "MiniIcons must be configured")
+assert(pcall(require, "mini.starter"), "mini.starter must be installed and loadable")
+assert(type(_G.MiniStarter) == "table", "MiniStarter must be configured")
 
 local fzf_actions = require("fzf-lua.actions")
 local fzf_config = require("fzf-lua.config")
