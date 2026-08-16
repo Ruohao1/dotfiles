@@ -37,6 +37,11 @@ dotfiles_bootstrap --apply --window-manager aerospace
 dotfiles_bootstrap --apply --window-manager none
 ```
 
+The AeroSpace profile installs Karabiner Elements and configures Option plus left-drag to rearrange tiled windows.
+After the first apply, open Karabiner Elements and complete its required macOS setup by keeping its background items enabled, granting Accessibility, and approving its Driver Extension.
+Karabiner Elements 15.9.0 or earlier may also require Input Monitoring.
+Bootstrap reports this manual step but does not claim that macOS completed it.
+
 ### Arch, EndeavourOS, or Manjaro
 
 ```sh
@@ -83,6 +88,20 @@ dotfiles remote add origin <git-repo-url>
 dotfiles branch -M main
 dotfiles push -u origin main
 ```
+
+---
+
+## Modifier contract
+
+Shared actions keep the same suffix key, action, and modifier tier on every platform.
+Only the platform modifier name changes.
+
+| Responsibility | Linux modifier | macOS modifier |
+| --- | --- | --- |
+| Workspace and window-manager actions | Super | Option |
+| Terminal and multiplexer actions | Alt | Command |
+
+Hyprland, i3, and AeroSpace window-manager bindings are maintained as one checked contract.
 
 ---
 
