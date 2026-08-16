@@ -22,6 +22,7 @@ end
 for _, argv in ipairs({
   { "nvim" },
   { "nvim", "--headless" },
+  { "nvim", "--embed" },
   { "nvim", "--clean", "--noplugin", "-n", "-R" },
   { "nvim", "-u", "NONE", "-U", "NONE", "-i", "NONE" },
   { "nvim", "-uNONE", "-UNONE", "-iNONE" },
@@ -35,6 +36,8 @@ end
 
 for _, argv in ipairs({
   { "nvim", "file.lua" },
+  { "nvim", "--embed", "file.lua" },
+  { "nvim", "--embed", "-c", "set number" },
   { "nvim", "/tmp/project" },
   { "nvim", "-" },
   { "nvim", "-c", "set number" },
@@ -56,6 +59,7 @@ end
 
 local bare_context = {
   argv = { "nvim", "--headless", "--listen", "/tmp/nvim.sock" },
+  builtin_tui = false,
   stdin_seen = false,
   this_session = "",
   buffers = { 1 },
@@ -70,7 +74,20 @@ local bare_context = {
   },
 }
 
-eq(test.is_bare_launch(bare_context), true, "valid bare launch")
+eq(test.is_bare_launch(bare_context), true, "configured non-embed headless bare launch")
+
+local embedded_tui_context = vim.deepcopy(bare_context)
+embedded_tui_context.argv = { "nvim", "--embed", "--listen", "/tmp/nvim.sock" }
+embedded_tui_context.builtin_tui = true
+eq(test.is_bare_launch(embedded_tui_context), true, "builtin TUI embedded bare launch")
+
+local direct_embed_context = vim.deepcopy(embedded_tui_context)
+direct_embed_context.builtin_tui = false
+eq(test.is_bare_launch(direct_embed_context), false, "direct embedded launch remains non-bare")
+
+local external_embed_context = vim.deepcopy(embedded_tui_context)
+external_embed_context.builtin_tui = nil
+eq(test.is_bare_launch(external_embed_context), false, "external embedded launch remains non-bare")
 
 local invalid_contexts = {
   function(context)
@@ -954,6 +971,108 @@ local function start_none_child(case)
   return connect_child(case, paths, process)
 end
 
+local function tui_output(child)
+  local output = table.concat(child.output, "\n")
+  return output:sub(math.max(1, #output - 4000))
+end
+
+local function stop_tui_job(job)
+  local status = vim.fn.jobwait({ job }, 0)[1]
+  local stopped = false
+  if status == -1 then
+    stopped = vim.fn.jobstop(job) == 1
+    status = vim.fn.jobwait({ job }, 5000)[1]
+  end
+  return status, stopped
+end
+
+local function start_tui_child(case)
+  local paths = make_case_directories(case)
+  local output = {}
+  local argv = {
+    "env",
+    "-u",
+    "NVIM",
+    "-u",
+    "TMUX",
+    "-u",
+    "TMUX_PANE",
+    "-u",
+    "NVIM_APPNAME",
+    "XDG_CONFIG_HOME=" .. vim.fs.dirname(nvim_root),
+    "XDG_DATA_HOME=" .. data_home,
+    "XDG_STATE_HOME=" .. paths.state,
+    "XDG_CACHE_HOME=" .. paths.cache,
+    "XDG_RUNTIME_DIR=" .. paths.runtime,
+    "NVIM_LOG_FILE=" .. vim.fs.joinpath(paths.root, "nvim.log"),
+    "DOTFILES_NVIM_SKIP_PARSER_INSTALL=1",
+    "TERM=xterm-256color",
+    "TERM_PROGRAM=ghostty",
+    "nvim",
+    "--listen",
+    paths.socket,
+    "-i",
+    "NONE",
+  }
+  vim.list_extend(argv, case.arguments or {})
+
+  local job = vim.fn.jobstart(argv, {
+    cwd = case.cwd or paths.root,
+    pty = true,
+    width = 80,
+    height = 23,
+    on_stdout = function(_, data)
+      for _, chunk in ipairs(data or {}) do
+        if chunk ~= "" then
+          table.insert(output, chunk)
+        end
+      end
+    end,
+  })
+  assert(job > 0, "could not start TUI child: " .. case.name)
+
+  local child = {
+    channel = nil,
+    job = job,
+    output = output,
+    root = paths.root,
+    socket = paths.socket,
+  }
+  local listening = vim.wait(10000, function()
+    return vim.uv.fs_stat(paths.socket) ~= nil
+  end, 20)
+  if not listening then
+    local status, stopped = stop_tui_job(job)
+    error(
+      string.format(
+        "TUI child listen socket timed out: %s; status: %s; stopped: %s\n%s",
+        case.name,
+        tostring(status),
+        tostring(stopped),
+        tui_output(child)
+      ),
+      0
+    )
+  end
+
+  local connected, channel = pcall(vim.fn.sockconnect, "pipe", paths.socket, { rpc = true })
+  if not connected or type(channel) ~= "number" or channel <= 0 then
+    local status, stopped = stop_tui_job(job)
+    error(
+      string.format(
+        "could not connect TUI child RPC socket: %s; status: %s; stopped: %s\n%s",
+        case.name,
+        tostring(status),
+        tostring(stopped),
+        tui_output(child)
+      ),
+      0
+    )
+  end
+  child.channel = channel
+  return child
+end
+
 local function child_lua(child, source)
   return vim.rpcrequest(child.channel, "nvim_exec_lua", source, {})
 end
@@ -1009,6 +1128,29 @@ local function stop_child(child)
   assert(result.code == 0 and result.signal == 0, result.stderr or result.stdout or "child failed")
 end
 
+local function stop_tui_child(child)
+  local rpc_ok, rpc_error = pcall(vim.rpcnotify, child.channel, "nvim_command", "qa!")
+  local status = vim.fn.jobwait({ child.job }, 5000)[1]
+  local stopped = false
+  if status == -1 then
+    stopped = vim.fn.jobstop(child.job) == 1
+    status = vim.fn.jobwait({ child.job }, 5000)[1]
+  end
+  pcall(vim.fn.chanclose, child.channel)
+
+  assert(
+    rpc_ok and status == 0,
+    string.format(
+      "TUI child stop failed: rpc=%s (%s); status=%s; stopped=%s\n%s",
+      tostring(rpc_ok),
+      tostring(rpc_error),
+      tostring(status),
+      tostring(stopped),
+      tui_output(child)
+    )
+  )
+end
+
 local function delete_case_root(root)
   assert(root ~= test_root and path_is_within(root, test_root), "case cleanup escaped test root")
   assert(vim.fn.delete(root, "rf") == 0, "could not delete startup case " .. root)
@@ -1030,6 +1172,40 @@ local function with_child(case, callback, launcher)
   if child then
     local stop_ok, stop_error = xpcall(function()
       stop_child(child)
+    end, debug.traceback)
+    if not stop_ok then
+      table.insert(errors, stop_error)
+    end
+  end
+  if vim.uv.fs_lstat(root) then
+    local cleanup_ok, cleanup_error = xpcall(function()
+      delete_case_root(root)
+    end, debug.traceback)
+    if not cleanup_ok then
+      table.insert(errors, cleanup_error)
+    end
+  end
+  if #errors > 0 then
+    error(table.concat(errors, "\n"), 0)
+  end
+  return case_result
+end
+
+local function with_tui_child(case, callback)
+  local root = validated_case_root(case.name)
+  local child
+  local case_ok, case_result = xpcall(function()
+    child = start_tui_child(case)
+    return callback(child)
+  end, debug.traceback)
+
+  local errors = {}
+  if not case_ok then
+    table.insert(errors, case_result)
+  end
+  if child then
+    local stop_ok, stop_error = xpcall(function()
+      stop_tui_child(child)
     end, debug.traceback)
     if not stop_ok then
       table.insert(errors, stop_error)
@@ -1101,6 +1277,41 @@ local function inspect_starter(child)
     }
   ]]
   )
+end
+
+local function inspect_tui_context(child)
+  return child_lua(
+    child,
+    [[
+    local clients = {}
+    for _, ui in ipairs(vim.api.nvim_list_uis()) do
+      local ok, info = pcall(vim.api.nvim_get_chan_info, ui.chan)
+      if ok then
+        table.insert(clients, {
+          chan = ui.chan,
+          name = info.client and info.client.name or nil,
+          type = info.client and info.client.type or nil,
+        })
+      end
+    end
+    return {
+      argv = vim.deepcopy(vim.v.argv),
+      clients = clients,
+    }
+  ]]
+  )
+end
+
+local function assert_builtin_tui_context(state, label)
+  assert(vim.tbl_contains(state.argv, "--embed"), label .. " core argv omitted --embed")
+  local found = false
+  for _, client in ipairs(state.clients) do
+    if client.name == "nvim-tui" and client.type == "ui" then
+      found = true
+      break
+    end
+  end
+  assert(found, label .. " omitted the exact builtin nvim-tui client")
 end
 
 local function assert_bare_starter(state, label)
@@ -1178,6 +1389,24 @@ local live_ok, live_error = xpcall(function()
   write_file(vim.fs.joinpath(tag_fixture, "tags"), {
     "StartupTarget\ttarget.lua\t/^local StartupTarget = true$/",
   })
+
+  with_tui_child({ name = "tui-bare" }, function(child)
+    wait_for_starter(child, "configured TUI bare startup")
+    assert_builtin_tui_context(inspect_tui_context(child), "configured TUI bare startup")
+    assert_bare_starter(inspect_starter(child), "configured TUI bare launch")
+  end)
+
+  with_tui_child({ name = "tui-file", arguments = { regular_file } }, function(child)
+    local state = wait_for_vimenter(child, "configured TUI file startup")
+    assert(state.filetype ~= "ministarter", "configured TUI file unexpectedly opened MiniStarter")
+    eq(state.name, vim.fs.normalize(regular_file), "configured TUI file target becomes current")
+    local context = inspect_tui_context(child)
+    assert_builtin_tui_context(context, "configured TUI file startup")
+    assert(
+      vim.tbl_contains(context.argv, regular_file),
+      "configured TUI core argv omitted file target"
+    )
+  end)
 
   local nonbare_cases = {
     { name = "file", arguments = { regular_file } },

@@ -2,6 +2,7 @@ local M = {}
 
 local allowed_flags = {
   ["--clean"] = true,
+  ["--embed"] = true,
   ["--headless"] = true,
   ["--noplugin"] = true,
   ["-M"] = true,
@@ -55,8 +56,22 @@ local function has_editing_intent(argv)
   return false
 end
 
+local function argv_contains(argv, target)
+  for index = 2, #argv do
+    if argv[index] == target then
+      return true
+    end
+  end
+  return false
+end
+
 local function is_bare_launch(context)
-  if context.stdin_seen or context.this_session ~= "" or has_editing_intent(context.argv) then
+  if
+    context.stdin_seen
+    or context.this_session ~= ""
+    or has_editing_intent(context.argv)
+    or (argv_contains(context.argv, "--embed") and context.builtin_tui ~= true)
+  then
     return false
   end
   if #context.buffers ~= 1 or context.current_buffer ~= context.buffers[1] then
@@ -77,6 +92,17 @@ local function is_bare_launch(context)
     and initial.buftype == ""
     and initial.modified == false
     and vim.deep_equal(initial.lines, { "" })
+end
+
+local function has_builtin_tui()
+  for _, ui in ipairs(vim.api.nvim_list_uis()) do
+    local ok, channel = pcall(vim.api.nvim_get_chan_info, ui.chan)
+    local client = ok and type(channel) == "table" and channel.client or nil
+    if type(client) == "table" and client.name == "nvim-tui" and client.type == "ui" then
+      return true
+    end
+  end
+  return false
 end
 
 local function minimal_content(content)
@@ -314,6 +340,7 @@ local function startup_context(stdin_seen)
 
   return {
     argv = vim.deepcopy(vim.v.argv),
+    builtin_tui = has_builtin_tui(),
     stdin_seen = stdin_seen,
     this_session = vim.v.this_session,
     buffers = buffers,
