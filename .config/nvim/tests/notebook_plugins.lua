@@ -5,6 +5,8 @@ local function expect(value, message)
 end
 
 local specs = require("plugins.notebook")
+expect(vim.fn.exists(":NotebookBootstrap") == 2, "NotebookBootstrap command is missing")
+expect(vim.fn.exists(":NotebookHealth") == 2, "NotebookHealth command is missing")
 local by_repo = {}
 for _, spec in ipairs(specs) do
   by_repo[spec[1]] = spec
@@ -76,6 +78,10 @@ end
 local molten = by_repo["benlubas/molten-nvim"]
 expect(molten.init ~= nil, "Molten globals must be initialized before load")
 expect(vim.tbl_contains(molten.dependencies, "3rd/image.nvim"), "Molten must depend on image.nvim")
+expect(
+  molten.cmd == nil,
+  "Lazy command stubs must not shadow Molten commands registered by rplugin.vim"
+)
 
 local otter = by_repo["jmbuhr/otter.nvim"]
 expect(

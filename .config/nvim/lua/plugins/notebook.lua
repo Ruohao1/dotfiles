@@ -1,6 +1,7 @@
 local python = require("notebook.python")
 
 python.setup()
+require("notebook.health").setup()
 
 return {
   {
@@ -80,14 +81,6 @@ return {
         error("Notebook Python bootstrap failed")
       end
     end,
-    cmd = {
-      "MoltenInit",
-      "MoltenImportOutput",
-      "MoltenExportOutput",
-      "MoltenEnterOutput",
-      "MoltenInterrupt",
-      "MoltenRestart",
-    },
     init = function()
       vim.g.molten_auto_init_behavior = "raise"
       vim.g.molten_image_provider = "image.nvim"
