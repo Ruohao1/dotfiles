@@ -118,6 +118,35 @@ make_stdio_command() {
   chmod 0755 "$command_path"
 }
 
+make_taplo_command() {
+  command_path=$1
+  version_text=$2
+  lsp_behavior=$3
+  mkdir -p "$(dirname "$command_path")"
+  case "$lsp_behavior" in
+    success) lsp_command='exit 0' ;;
+    fail) lsp_command='exit 1' ;;
+    hang) lsp_command='exec sleep 30' ;;
+    *) return 1 ;;
+  esac
+  # shellcheck disable=SC2016 # The generated fixture expands its arguments at runtime.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'if [ "${1:-}" = --version ]; then' \
+    "  printf '%s\\n' '$version_text'" \
+    '  exit 0' \
+    'fi' \
+    'if [ "${1:-}" = lsp ] && [ "${2:-}" = stdio ] && [ "${3:-}" = --help ]; then' \
+    '  if [ -n "${DOTFILES_BOOTSTRAP_TEST_TAPLO_PROBE_PID_FILE:-}" ]; then' \
+    '    printf "%s\\n" "$$" >"$DOTFILES_BOOTSTRAP_TEST_TAPLO_PROBE_PID_FILE"' \
+    '  fi' \
+    "  $lsp_command" \
+    'fi' \
+    'exit 1' \
+    >"$command_path"
+  chmod 0755 "$command_path"
+}
+
 make_term_ignoring_stdio_command() {
   command_path=$1
   probe_pid_file=$2
@@ -471,6 +500,8 @@ prepare_satisfaction_commands() {
   satisfaction_pyright_version=$8
   satisfaction_yaml_version=$9
   satisfaction_uv_version=${10}
+  satisfaction_taplo_version=${11-taplo 0.10.0}
+  satisfaction_taplo_behavior=${12:-success}
 
   mkdir -p "$satisfaction_bin"
   make_version_command "$satisfaction_bin/node" "$satisfaction_node_version"
@@ -482,6 +513,8 @@ prepare_satisfaction_commands() {
   make_stdio_command "$satisfaction_bin/pyright-langserver" \
     "$satisfaction_pyright_behavior"
   make_version_command "$satisfaction_bin/pyright" "$satisfaction_pyright_version"
+  make_taplo_command "$satisfaction_bin/taplo" \
+    "$satisfaction_taplo_version" "$satisfaction_taplo_behavior"
   make_version_command "$satisfaction_bin/yaml-language-server" "$satisfaction_yaml_version"
   make_version_command "$satisfaction_bin/uv" "$satisfaction_uv_version"
   make_version_command "$satisfaction_bin/nvim" '0.12.4'
@@ -516,6 +549,7 @@ run_satisfaction_case() {
     DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
     DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
     DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+    DOTFILES_BOOTSTRAP_TEST_TAPLO_PROBE_PID_FILE="$satisfaction_root/taplo-probe.pid" \
     DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$satisfaction_log" \
     "$bootstrap" --apply
   satisfaction_case_status=$run_status
@@ -617,6 +651,22 @@ create_fake_lua_archive() {
   fake_lua_sha=$(file_sha256_for_test "$fake_download_root/$fake_lua_asset")
 }
 
+create_fake_taplo_asset() {
+  fake_download_root=$1
+  fake_source_root=$2
+  fake_architecture=$3
+  case "$fake_architecture" in
+    x86_64) fake_taplo_asset=taplo-linux-x86_64.gz ;;
+    arm64) fake_taplo_asset=taplo-linux-aarch64.gz ;;
+    *) return 1 ;;
+  esac
+  fake_taplo_path=$fake_source_root/taplo-$fake_architecture
+  make_taplo_command "$fake_taplo_path" 'taplo 0.10.0' success
+  gzip -c "$fake_taplo_path" >"$fake_download_root/$fake_taplo_asset"
+  fake_taplo_sha=$(file_sha256_for_test \
+    "$fake_download_root/$fake_taplo_asset")
+}
+
 file_sha256_for_test() {
   test_checksum_path=$1
   if command -v sha256sum >/dev/null 2>&1; then
@@ -687,9 +737,11 @@ managed_outputs_are_absent_except() {
     "$managed_absence_home/.local/bin/bash-language-server" \
     "$managed_absence_home/.local/bin/vscode-json-language-server" \
     "$managed_absence_home/.local/bin/pyright-langserver" \
+    "$managed_absence_home/.local/bin/taplo" \
     "$managed_absence_home/.local/bin/yaml-language-server" \
     "$managed_absence_home/.local/opt"/node-* \
     "$managed_absence_home/.local/opt"/lua-language-server-* \
+    "$managed_absence_home/.local/opt"/taplo-* \
     "$managed_absence_home/.local/opt"/dotfiles-lsp-node-*
   do
     if path_exists_for_test "$managed_absence_path" \
@@ -1127,6 +1179,11 @@ run_selective_managed_case() {
   printf '%s\n' '#!/bin/sh' 'exit 0' >"$selective_bin/apt-cache"
   chmod 0755 "$selective_bin/dpkg-query" "$selective_bin/apt-cache"
   selective_node_bin=$managed_fixture_source/x86_64/node-v24.19.0-linux-x64/bin
+  selective_taplo_target=$selective_home/.local/opt/taplo-0.10.0-x86_64
+  selective_external_taplo=$selective_bin/taplo
+  make_taplo_command "$selective_external_taplo" 'taplo 0.10.0' success
+  selective_external_taplo_before=$(file_sha256_for_test \
+    "$selective_external_taplo")
 
   run_capture "$selective_root/output" env \
     PATH="$selective_bin:$selective_node_bin:/usr/bin:/bin" \
@@ -1163,10 +1220,12 @@ run_selective_managed_case() {
       [ -x "$selective_home/.local/bin/lua-language-server" ] \
         && [ ! -L "$selective_home/.local/bin/lua-language-server" ] \
         || selective_pass=false
+      [ ! -e "$selective_taplo_target" ] || selective_pass=false
       [ ! -e "$selective_npm_target" ] || selective_pass=false
       ;;
     npm)
       [ ! -e "$selective_lua_target" ] || selective_pass=false
+      [ ! -e "$selective_taplo_target" ] || selective_pass=false
       [ -d "$selective_npm_target" ] || selective_pass=false
       for selective_package in \
         bash-language-server \
@@ -1178,6 +1237,12 @@ run_selective_managed_case() {
           || selective_pass=false
       done
       ;;
+    taplo)
+      [ ! -e "$selective_lua_target" ] || selective_pass=false
+      [ -d "$selective_taplo_target" ] || selective_pass=false
+      [ -x "$selective_taplo_target/taplo" ] || selective_pass=false
+      [ ! -e "$selective_npm_target" ] || selective_pass=false
+      ;;
     *) selective_pass=false ;;
   esac
 
@@ -1186,6 +1251,7 @@ run_selective_managed_case() {
     vscode-json-language-server \
     lua-language-server \
     pyright-langserver \
+    taplo \
     yaml-language-server
   do
     case ",$selective_expected_links," in
@@ -1200,6 +1266,11 @@ run_selective_managed_case() {
         ;;
     esac
   done
+
+  selective_external_taplo_after=$(file_sha256_for_test \
+    "$selective_external_taplo")
+  [ "$selective_external_taplo_before" = "$selective_external_taplo_after" ] \
+    || selective_pass=false
 
   if [ "$selective_pass" = true ]; then
     pass "$selective_name publishes only its selected managed server commands"
@@ -1223,6 +1294,7 @@ retained_language_server_actions_are_present() {
   for retained_language_server_action in \
     'direct node' \
     'direct lua-language-server' \
+    'direct taplo' \
     'npm bash-language-server@5.6.0' \
     'npm vscode-langservers-extracted@4.10.0' \
     'npm pyright@1.1.411' \
@@ -1889,22 +1961,24 @@ apt_update_line=$(printf '%s\n' "$apt_apply_commands" | grep -nF 'sudo apt-get u
 apt_install_line=$(printf '%s\n' "$apt_apply_commands" | grep -nF 'sudo apt-get install ' | head -n 1 | cut -d: -f1)
 managed_node_line=$(printf '%s\n' "$apt_apply_commands" | grep -nF 'direct-install node' | head -n 1 | cut -d: -f1)
 managed_lua_line=$(printf '%s\n' "$apt_apply_commands" | grep -nF 'direct-install lua-language-server' | head -n 1 | cut -d: -f1)
+managed_taplo_line=$(printf '%s\n' "$apt_apply_commands" | grep -nF 'direct-install taplo' | head -n 1 | cut -d: -f1)
 managed_npm_line=$(printf '%s\n' "$apt_apply_commands" | grep -nF 'npm-ci --ignore-scripts --omit=dev --no-audit --no-fund' | head -n 1 | cut -d: -f1)
 if [ -n "$apt_update_line" ] \
   && [ "$apt_update_line" -lt "$apt_install_line" ] \
   && [ "$apt_install_line" -lt "$managed_node_line" ] \
   && [ "$managed_node_line" -lt "$managed_lua_line" ] \
-  && [ "$managed_lua_line" -lt "$managed_npm_line" ]; then
-  pass 'Debian apply preserves apt Node LuaLS and npm installation order'
+  && [ "$managed_lua_line" -lt "$managed_taplo_line" ] \
+  && [ "$managed_taplo_line" -lt "$managed_npm_line" ]; then
+  pass 'Debian apply preserves apt Node LuaLS Taplo and npm installation order'
 else
-  fail 'Debian apply preserves apt Node LuaLS and npm installation order'
+  fail 'Debian apply preserves apt Node LuaLS Taplo and npm installation order'
 fi
 
 run_satisfaction_case exact \
   22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0 0.11.6
 if [ "$satisfaction_case_status" -eq 0 ] \
   && ! printf '%s\n' "$satisfaction_case_commands" \
-    | grep -Eq '^(direct-install (node|lua-language-server)|npm-ci )'; then
+    | grep -Eq '^(direct-install (node|lua-language-server|taplo)|npm-ci )'; then
   pass 'exact Node npm and language-server floors are preserved'
 else
   fail 'exact Node npm and language-server floors are preserved'
@@ -1963,6 +2037,56 @@ if [ "$satisfaction_stdio_pass" = true ]; then
   pass 'stdio startup and the Pyright companion floor select managed fallbacks'
 else
   fail 'stdio startup and the Pyright companion floor select managed fallbacks'
+fi
+
+satisfaction_taplo_pass=true
+run_satisfaction_case taplo-newer \
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0 \
+  0.11.6 'taplo 0.10.1' success
+printf '%s\n' "$satisfaction_case_commands" | grep -Fqx 'direct-install taplo' \
+  && satisfaction_taplo_pass=false
+run_satisfaction_case taplo-low \
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0 \
+  0.11.6 'taplo 0.9.9' success
+printf '%s\n' "$satisfaction_case_commands" | grep -Fqx 'direct-install taplo' \
+  || satisfaction_taplo_pass=false
+run_satisfaction_case taplo-prerelease \
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0 \
+  0.11.6 'taplo 0.10.0-rc.1' success
+printf '%s\n' "$satisfaction_case_commands" | grep -Fqx 'direct-install taplo' \
+  || satisfaction_taplo_pass=false
+run_satisfaction_case taplo-no-lsp \
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0 \
+  0.11.6 'taplo 0.10.0' fail
+printf '%s\n' "$satisfaction_case_commands" | grep -Fqx 'direct-install taplo' \
+  || satisfaction_taplo_pass=false
+run_satisfaction_case taplo-malformed-version \
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0 \
+  0.11.6 'Taplo version unknown' success
+printf '%s\n' "$satisfaction_case_commands" | grep -Fqx 'direct-install taplo' \
+  || satisfaction_taplo_pass=false
+run_satisfaction_case taplo-empty-version \
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0 \
+  0.11.6 '' success
+printf '%s\n' "$satisfaction_case_commands" | grep -Fqx 'direct-install taplo' \
+  || satisfaction_taplo_pass=false
+run_satisfaction_case taplo-hanging-lsp \
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0 \
+  0.11.6 'taplo 0.10.0' hang
+printf '%s\n' "$satisfaction_case_commands" | grep -Fqx 'direct-install taplo' \
+  || satisfaction_taplo_pass=false
+taplo_hanging_pid=$(cat "$satisfaction_root/taplo-probe.pid" 2>/dev/null || true)
+case "$taplo_hanging_pid" in
+  ''|*[!0-9]*) satisfaction_taplo_pass=false ;;
+  *)
+    kill -0 "$taplo_hanging_pid" >/dev/null 2>&1 \
+      && satisfaction_taplo_pass=false
+    ;;
+esac
+if [ "$satisfaction_taplo_pass" = true ]; then
+  pass 'Taplo requires a stable version floor and bounded LSP capability'
+else
+  fail 'Taplo requires a stable version floor and bounded LSP capability'
 fi
 
 probe_signal_root=$test_tmp/stdio-probe-signal
@@ -2429,18 +2553,26 @@ fake_node_x86_sha=$fake_node_sha
 create_fake_lua_archive \
   "$managed_fixture_download" "$managed_fixture_source/x86_64" x86_64
 fake_lua_x86_sha=$fake_lua_sha
+create_fake_taplo_asset \
+  "$managed_fixture_download" "$managed_fixture_source/x86_64" x86_64
+fake_taplo_x86_sha=$fake_taplo_sha
 create_fake_node_archive \
   "$managed_fixture_download" "$managed_fixture_source/arm64" arm64
 fake_node_arm_sha=$fake_node_sha
 create_fake_lua_archive \
   "$managed_fixture_download" "$managed_fixture_source/arm64" arm64
 fake_lua_arm_sha=$fake_lua_sha
+create_fake_taplo_asset \
+  "$managed_fixture_download" "$managed_fixture_source/arm64" arm64
+fake_taplo_arm_sha=$fake_taplo_sha
 
 awk -F '\t' -v OFS='\t' \
   -v node_x86_sha="$fake_node_x86_sha" \
   -v node_arm_sha="$fake_node_arm_sha" \
   -v lua_x86_sha="$fake_lua_x86_sha" \
-  -v lua_arm_sha="$fake_lua_arm_sha" '
+  -v lua_arm_sha="$fake_lua_arm_sha" \
+  -v taplo_x86_sha="$fake_taplo_x86_sha" \
+  -v taplo_arm_sha="$fake_taplo_arm_sha" '
   $1 == "node" && $3 == "x86_64" {
     $6 = "https://fixtures.invalid/node-v24.19.0-linux-x64.tar.xz"
     $7 = node_x86_sha
@@ -2456,6 +2588,14 @@ awk -F '\t' -v OFS='\t' \
   $1 == "lua-language-server" && $3 == "arm64" {
     $6 = "https://fixtures.invalid/lua-language-server-3.19.1-linux-arm64.tar.gz"
     $7 = lua_arm_sha
+  }
+  $1 == "taplo" && $3 == "x86_64" {
+    $6 = "https://fixtures.invalid/taplo-linux-x86_64.gz"
+    $7 = taplo_x86_sha
+  }
+  $1 == "taplo" && $3 == "arm64" {
+    $6 = "https://fixtures.invalid/taplo-linux-aarch64.gz"
+    $7 = taplo_arm_sha
   }
   { print }
 ' "$managed_fixture_root/manifests/packages-direct.tsv" \
@@ -2532,21 +2672,26 @@ for managed_test_architecture in x86_64 arm64; do
   managed_case_pass=true
   managed_node_directory=$managed_case_home/.local/opt/node-24.19.0-$managed_test_architecture
   managed_lua_directory=$managed_case_home/.local/opt/lua-language-server-3.19.1-$managed_test_architecture
+  managed_taplo_directory=$managed_case_home/.local/opt/taplo-0.10.0-$managed_test_architecture
   managed_npm_directory=$managed_case_home/.local/opt/dotfiles-lsp-node-$actual_npm_lock_sha256
   case "$managed_test_architecture" in
     x86_64)
       expected_node_asset=node-v24.19.0-linux-x64.tar.xz
       expected_lua_asset=lua-language-server-3.19.1-linux-x64.tar.gz
+      expected_taplo_asset=taplo-linux-x86_64.gz
       ;;
     arm64)
       expected_node_asset=node-v24.19.0-linux-arm64.tar.xz
       expected_lua_asset=lua-language-server-3.19.1-linux-arm64.tar.gz
+      expected_taplo_asset=taplo-linux-aarch64.gz
       ;;
   esac
 
   [ "$managed_case_status" -eq 0 ] || managed_case_pass=false
   [ -d "$managed_node_directory" ] || managed_case_pass=false
   [ -d "$managed_lua_directory" ] || managed_case_pass=false
+  [ -d "$managed_taplo_directory" ] || managed_case_pass=false
+  [ -x "$managed_taplo_directory/taplo" ] || managed_case_pass=false
   [ -d "$managed_npm_directory" ] || managed_case_pass=false
   [ "$(readlink "$managed_case_home/.local/bin/node" 2>/dev/null || true)" \
     = "$managed_node_directory/bin/node" ] || managed_case_pass=false
@@ -2559,10 +2704,13 @@ for managed_test_architecture in x86_64 arm64; do
     "../opt/lua-language-server-3.19.1-$managed_test_architecture/bin/lua-language-server" \
     "$managed_case_home/.local/bin/lua-language-server" \
     || managed_case_pass=false
+  [ "$(readlink "$managed_case_home/.local/bin/taplo" 2>/dev/null || true)" \
+    = "$managed_taplo_directory/taplo" ] || managed_case_pass=false
   for managed_command in \
     bash-language-server \
     vscode-json-language-server \
     pyright-langserver \
+    taplo \
     yaml-language-server
   do
     [ -L "$managed_case_home/.local/bin/$managed_command" ] \
@@ -2589,13 +2737,16 @@ for managed_test_architecture in x86_64 arm64; do
       && [ ! -L "$managed_case_home/.local/bin/$unpublished_command" ] \
       || managed_case_pass=false
   done
-  [ "$(find "$managed_case_home/.local/bin" -mindepth 1 -maxdepth 1 | wc -l)" -eq 7 ] \
+  [ "$(find "$managed_case_home/.local/bin" -mindepth 1 -maxdepth 1 | wc -l)" -eq 8 ] \
     || managed_case_pass=false
   printf '%s\n' "$managed_case_commands" \
     | grep -Fqx "download https://fixtures.invalid/$expected_node_asset" \
     || managed_case_pass=false
   printf '%s\n' "$managed_case_commands" \
     | grep -Fqx "download https://fixtures.invalid/$expected_lua_asset" \
+    || managed_case_pass=false
+  printf '%s\n' "$managed_case_commands" \
+    | grep -Fqx "download https://fixtures.invalid/$expected_taplo_asset" \
     || managed_case_pass=false
   printf '%s\n' "$managed_case_commands" \
     | grep -Fqx 'npm-ci --ignore-scripts --omit=dev --no-audit --no-fund' \
@@ -2858,12 +3009,13 @@ while IFS='|' read -r selective_name selective_tools selective_links selective_k
   run_selective_managed_case \
     "$selective_name" "$selective_tools" "$selective_links" "$selective_kind"
 done <<'SELECTIVE_CASES'
-bash-only|node,npm,vscode-json-language-server,lua-language-server,pyright-langserver,yaml-language-server,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd|bash-language-server|npm
-json-only|node,npm,bash-language-server,lua-language-server,pyright-langserver,yaml-language-server,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd|vscode-json-language-server|npm
-lua-only|node,npm,bash-language-server,vscode-json-language-server,pyright-langserver,yaml-language-server,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd|lua-language-server|lua
-pyright-only|node,npm,bash-language-server,vscode-json-language-server,lua-language-server,yaml-language-server,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd|pyright-langserver|npm
-yaml-only|node,npm,bash-language-server,vscode-json-language-server,lua-language-server,pyright-langserver,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd|yaml-language-server|npm
-json-and-pyright|node,npm,bash-language-server,lua-language-server,yaml-language-server,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd|vscode-json-language-server,pyright-langserver|npm
+bash-only|node,npm,vscode-json-language-server,lua-language-server,pyright-langserver,taplo,yaml-language-server,uv,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd|bash-language-server|npm
+json-only|node,npm,bash-language-server,lua-language-server,pyright-langserver,taplo,yaml-language-server,uv,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd|vscode-json-language-server|npm
+lua-only|node,npm,bash-language-server,vscode-json-language-server,pyright-langserver,taplo,yaml-language-server,uv,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd|lua-language-server|lua
+pyright-only|node,npm,bash-language-server,vscode-json-language-server,lua-language-server,taplo,yaml-language-server,uv,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd|pyright-langserver|npm
+taplo-only|node,npm,bash-language-server,vscode-json-language-server,lua-language-server,pyright-langserver,yaml-language-server,uv,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd|taplo|taplo
+yaml-only|node,npm,bash-language-server,vscode-json-language-server,lua-language-server,pyright-langserver,taplo,uv,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd|yaml-language-server|npm
+json-and-pyright|node,npm,bash-language-server,lua-language-server,taplo,yaml-language-server,uv,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd|vscode-json-language-server,pyright-langserver|npm
 SELECTIVE_CASES
 
 idempotent_home=$test_tmp/managed-x86_64-home
@@ -2883,7 +3035,7 @@ run_capture "$idempotent_root/output" env \
   DOTFILES_BOOTSTRAP_TESTING=1 \
   DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
   DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
-  DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS='node,npm,bash-language-server,vscode-json-language-server,lua-language-server,pyright-langserver,yaml-language-server,uv,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd,visidata' \
+  DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS='node,npm,bash-language-server,vscode-json-language-server,lua-language-server,pyright-langserver,taplo,yaml-language-server,uv,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd,visidata' \
   DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
   DOTFILES_BOOTSTRAP_TEST_REAL_MANAGED_INSTALL=1 \
   DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT="$managed_fixture_download" \
@@ -4009,9 +4161,11 @@ else
 fi
 failure_node_directory=$failure_home/.local/opt/node-24.19.0-x86_64
 failure_lua_directory=$failure_home/.local/opt/lua-language-server-3.19.1-x86_64
+failure_taplo_directory=$failure_home/.local/opt/taplo-0.10.0-x86_64
 failure_npm_directory=$failure_home/.local/opt/dotfiles-lsp-node-$actual_npm_lock_sha256
 if [ -d "$failure_node_directory" ] \
   && [ -d "$failure_lua_directory" ] \
+  && [ -d "$failure_taplo_directory" ] \
   && [ -d "$failure_npm_directory" ]; then
   pass 'configuration rollback retains managed language-tool directories'
 else

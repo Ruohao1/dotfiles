@@ -615,6 +615,26 @@ stop_stdio_probe() {
   wait "$stopping_probe_pid" >/dev/null 2>&1 || true
 }
 
+bounded_command_succeeds() {
+  begin_cleanup_registration_critical
+  "$@" </dev/null >/dev/null 2>&1 &
+  active_probe_pid=$!
+  bounded_probe_pid=$active_probe_pid
+  finish_cleanup_registration_critical
+
+  sleep 1
+  if kill -0 "$bounded_probe_pid" >/dev/null 2>&1; then
+    stop_stdio_probe "$bounded_probe_pid"
+    active_probe_pid=
+    return 1
+  fi
+
+  bounded_probe_status=0
+  wait "$bounded_probe_pid" >/dev/null 2>&1 || bounded_probe_status=$?
+  active_probe_pid=
+  [ "$bounded_probe_status" -eq 0 ]
+}
+
 replay_pending_transaction_signal() {
   [ -n "$pending_transaction_signal_name" ] || return 0
   replayed_signal_name=$pending_transaction_signal_name
@@ -696,6 +716,25 @@ stdio_server_is_satisfied() {
   return "$stdio_probe_result"
 }
 
+stable_taplo_version() {
+  taplo_version_command=$1
+  "$taplo_version_command" --version 2>/dev/null | awk '
+    NR == 1 {
+      if (NF == 2 && $1 == "taplo" \
+        && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/) {
+        version = $2
+      } else {
+        invalid = 1
+      }
+      next
+    }
+    { invalid = 1 }
+    END {
+      if (!invalid && NR == 1) print version
+    }
+  '
+}
+
 language_server_is_satisfied() {
   language_server_command=$1
   if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
@@ -724,6 +763,13 @@ language_server_is_satisfied() {
           return 1
         fi
       fi
+      ;;
+    taplo)
+      taplo_command=$(command -v taplo) || return 1
+      taplo_version=$(stable_taplo_version "$taplo_command")
+      [ -n "$taplo_version" ] || return 1
+      version_at_least "$taplo_version" 0.10.0 || return 1
+      bounded_command_succeeds "$taplo_command" lsp stdio --help
       ;;
     yaml-language-server)
       tool_is_satisfied yaml-language-server 1.24.0
@@ -1061,6 +1107,58 @@ stage_lua_language_server() {
   done
 }
 
+stage_taplo() {
+  taplo_manifest_root=$1
+  taplo_stage_root=$2
+  taplo_asset_data=$(direct_asset_record \
+    taplo linux "$managed_architecture" \
+    "$taplo_manifest_root/packages-direct.tsv")
+  old_ifs=$IFS
+  tab_character=$(printf '\t')
+  IFS=$tab_character
+  set -f
+  # shellcheck disable=SC2086 # Intentional split on the verified manifest tab delimiter.
+  set -- $taplo_asset_data
+  set +f
+  IFS=$old_ifs
+  [ "$#" -eq 4 ] || die 'malformed direct asset entry: taplo'
+  taplo_asset_version=$1
+  taplo_asset_format=$2
+  taplo_asset_url=$3
+  taplo_asset_sha256=$4
+  [ "$taplo_asset_version" = 0.10.0 ] \
+    || die 'unexpected managed Taplo version'
+  [ "$taplo_asset_format" = gzip ] \
+    || die 'unexpected managed Taplo archive format'
+  case "$taplo_asset_url" in
+    https://*) ;;
+    *) die 'direct asset URL must use HTTPS: taplo' ;;
+  esac
+
+  taplo_asset_path=$taplo_stage_root/taplo.asset
+  taplo_ready_root=$taplo_stage_root/taplo.ready
+  download_verified "$taplo_asset_url" "$taplo_asset_sha256" \
+    "$taplo_asset_path"
+  gzip -t "$taplo_asset_path" \
+    || die 'verified Taplo asset is not valid gzip'
+  mkdir "$taplo_ready_root" \
+    || die 'could not create managed Taplo staging directory'
+  gzip -dc "$taplo_asset_path" >"$taplo_ready_root/taplo" \
+    || die 'could not decompress the verified Taplo asset'
+  [ -s "$taplo_ready_root/taplo" ] \
+    && [ -f "$taplo_ready_root/taplo" ] \
+    && [ ! -L "$taplo_ready_root/taplo" ] \
+    || die 'verified Taplo asset did not produce one regular executable'
+  chmod 0755 "$taplo_ready_root/taplo" \
+    || die 'could not make the staged Taplo executable'
+  staged_taplo_version=$("$taplo_ready_root/taplo" --version 2>/dev/null)
+  [ "$staged_taplo_version" = 'taplo 0.10.0' ] \
+    || die 'staged Taplo version does not match taplo 0.10.0'
+  bounded_command_succeeds \
+    "$taplo_ready_root/taplo" lsp stdio --help \
+    || die 'staged Taplo does not expose lsp stdio'
+}
+
 stage_npm_language_servers() {
   npm_manifest_root=$1
   npm_stage_root=$2
@@ -1131,6 +1229,7 @@ managed_created_path_is_allowed() {
     "$HOME/.local/bin/bash-language-server"|\
     "$HOME/.local/bin/vscode-json-language-server"|\
     "$HOME/.local/bin/pyright-langserver"|\
+    "$HOME/.local/bin/taplo"|\
     "$HOME/.local/bin/yaml-language-server")
       return 0
       ;;
@@ -1140,6 +1239,9 @@ managed_created_path_is_allowed() {
     && return 0
   [ -n "$managed_lua_target" ] \
     && [ "$candidate_managed_path" = "$managed_lua_target" ] \
+    && return 0
+  [ -n "$managed_taplo_target" ] \
+    && [ "$candidate_managed_path" = "$managed_taplo_target" ] \
     && return 0
   [ -n "$managed_npm_target" ] \
     && [ "$candidate_managed_path" = "$managed_npm_target" ] \
@@ -1280,7 +1382,7 @@ remove_managed_created_paths() {
             || managed_cleanup_status=1
         fi
         ;;
-      "$managed_node_target"|"$managed_lua_target"|"$managed_npm_target")
+      "$managed_node_target"|"$managed_lua_target"|"$managed_taplo_target"|"$managed_npm_target")
         if path_exists "$cleanup_managed_path"; then
           if [ -d "$cleanup_managed_path" ] && [ ! -L "$cleanup_managed_path" ]; then
             rm -rf -- "$cleanup_managed_path" \
@@ -1375,6 +1477,9 @@ record_managed_language_server_actions() {
   if [ "$managed_lua_required" = true ]; then
     record_package_action direct lua-language-server
   fi
+  if [ "$managed_taplo_required" = true ]; then
+    record_package_action direct taplo
+  fi
   if [ "$managed_npm_required" = true ]; then
     record_package_action npm bash-language-server@5.6.0
     record_package_action npm vscode-langservers-extracted@4.10.0
@@ -1409,6 +1514,11 @@ publish_debian_language_servers() {
     publish_managed_directory \
       "$publish_stage_root/lua.ready" "$managed_lua_target" lua-directory
   fi
+  if [ "$managed_taplo_required" = true ]; then
+    publish_managed_directory \
+      "$publish_stage_root/taplo.ready" \
+      "$managed_taplo_target" taplo-directory
+  fi
   if [ "$managed_npm_required" = true ]; then
     publish_managed_directory \
       "$publish_stage_root/npm.ready" "$managed_npm_target" npm-directory
@@ -1441,6 +1551,10 @@ publish_debian_language_servers() {
     fi
     complete_managed_publication_critical
   fi
+  if [ "$managed_taplo_required" = true ]; then
+    publish_managed_link \
+      "$managed_taplo_target/taplo" "$HOME/.local/bin/taplo"
+  fi
   if [ "$managed_bash_required" = true ]; then
     publish_managed_link \
       "$managed_npm_target/node_modules/.bin/bash-language-server" \
@@ -1471,6 +1585,7 @@ install_debian_language_servers() {
   debian_manifest_root=$1
   if [ "$managed_node_required" != true ] \
     && [ "$managed_lua_required" != true ] \
+    && [ "$managed_taplo_required" != true ] \
     && [ "$managed_npm_required" != true ]; then
     return 0
   fi
@@ -1482,6 +1597,9 @@ install_debian_language_servers() {
     fi
     if [ "$managed_lua_required" = true ]; then
       record_test_command direct-install lua-language-server
+    fi
+    if [ "$managed_taplo_required" = true ]; then
+      record_test_command direct-install taplo
     fi
     if [ "$managed_npm_required" = true ]; then
       record_test_command npm-ci --ignore-scripts --omit=dev --no-audit --no-fund
@@ -1511,6 +1629,9 @@ install_debian_language_servers() {
   fi
   if [ "$managed_lua_required" = true ]; then
     stage_lua_language_server "$debian_manifest_root" "$managed_stage_root"
+  fi
+  if [ "$managed_taplo_required" = true ]; then
+    stage_taplo "$debian_manifest_root" "$managed_stage_root"
   fi
   if [ "$managed_npm_required" = true ]; then
     stage_npm_language_servers "$debian_manifest_root" "$managed_stage_root"
@@ -2032,11 +2153,13 @@ prepare_debian_language_servers() {
   managed_bash_required=false
   managed_json_required=false
   managed_pyright_required=false
+  managed_taplo_required=false
   managed_yaml_required=false
   managed_npm_required=false
   managed_architecture=
   managed_node_target=
   managed_lua_target=
+  managed_taplo_target=
   validate_home_directory
 
   tool_is_satisfied node 22.0.0 \
@@ -2050,6 +2173,8 @@ prepare_debian_language_servers() {
     || managed_lua_required=true
   language_server_is_satisfied pyright-langserver \
     || managed_pyright_required=true
+  language_server_is_satisfied taplo \
+    || managed_taplo_required=true
   language_server_is_satisfied yaml-language-server \
     || managed_yaml_required=true
 
@@ -2061,7 +2186,8 @@ prepare_debian_language_servers() {
   fi
 
   if [ "$managed_node_required" = true ] \
-    || [ "$managed_lua_required" = true ]; then
+    || [ "$managed_lua_required" = true ] \
+    || [ "$managed_taplo_required" = true ]; then
     managed_architecture=$(normalized_architecture) || exit $?
   fi
   if [ "$managed_node_required" = true ]; then
@@ -2069,6 +2195,9 @@ prepare_debian_language_servers() {
   fi
   if [ "$managed_lua_required" = true ]; then
     managed_lua_target=$HOME/.local/opt/lua-language-server-3.19.1-$managed_architecture
+  fi
+  if [ "$managed_taplo_required" = true ]; then
+    managed_taplo_target=$HOME/.local/opt/taplo-0.10.0-$managed_architecture
   fi
   managed_lock_sha256=$npm_language_servers_lock_sha256
   case "$managed_lock_sha256" in
@@ -2086,6 +2215,7 @@ prepare_debian_language_servers() {
 
   if [ "$managed_node_required" = true ] \
     || [ "$managed_lua_required" = true ] \
+    || [ "$managed_taplo_required" = true ] \
     || [ "$managed_npm_required" = true ]; then
     require_managed_parent_directory "$HOME/.local"
     require_managed_parent_directory "$HOME/.local/bin"
@@ -2100,6 +2230,10 @@ prepare_debian_language_servers() {
   if [ "$managed_lua_required" = true ]; then
     require_managed_target_free "$managed_lua_target"
     require_managed_target_free "$HOME/.local/bin/lua-language-server"
+  fi
+  if [ "$managed_taplo_required" = true ]; then
+    require_managed_target_free "$managed_taplo_target"
+    require_managed_target_free "$HOME/.local/bin/taplo"
   fi
   if [ "$managed_npm_required" = true ]; then
     require_managed_target_free "$managed_npm_target"
@@ -3246,10 +3380,12 @@ managed_lua_required=false
 managed_bash_required=false
 managed_json_required=false
 managed_pyright_required=false
+managed_taplo_required=false
 managed_yaml_required=false
 managed_npm_required=false
 managed_node_target=
 managed_lua_target=
+managed_taplo_target=
 managed_npm_target=
 managed_lock_sha256=
 managed_publish_active=false
