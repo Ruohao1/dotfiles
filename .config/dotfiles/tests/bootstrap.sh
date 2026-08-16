@@ -205,6 +205,43 @@ make_signal_boundary_command() {
   chmod 0755 "$boundary_command_path"
 }
 
+make_managed_type_mutation_command() {
+  mutation_command_path=$1
+  mutation_real_command=$2
+  mutation_real_move=$3
+  mutation_real_mkdir=$4
+  mkdir -p "$(dirname "$mutation_command_path")"
+  # shellcheck disable=SC2016 # The generated wrapper expands its test environment.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    "real_command='$mutation_real_command'" \
+    "real_move='$mutation_real_move'" \
+    "real_mkdir='$mutation_real_mkdir'" \
+    'command_target=' \
+    'for command_argument do' \
+    '  command_target=$command_argument' \
+    'done' \
+    '"$real_command" "$@"' \
+    'command_status=$?' \
+    '[ "$command_status" -eq 0 ] || exit "$command_status"' \
+    'if [ "$command_target" = "$DOTFILES_BOOTSTRAP_TEST_MUTATION_TARGET" ]; then' \
+    '  "$real_move" -- "$command_target" "$command_target.original" || exit 1' \
+    '  case "$DOTFILES_BOOTSTRAP_TEST_MUTATION_KIND" in' \
+    '    directory-to-file)' \
+    "      printf '%s\\n' 'mutated Taplo directory' >\"\$command_target\" || exit 1" \
+    '      ;;' \
+    '    file-to-directory)' \
+    '      "$real_mkdir" "$command_target" || exit 1' \
+    "      printf '%s\\n' 'mutated Taplo link' >\"\$command_target/sentinel\" || exit 1" \
+    '      ;;' \
+    '    *) exit 2 ;;' \
+    '  esac' \
+    'fi' \
+    'exit 0' \
+    >"$mutation_command_path"
+  chmod 0755 "$mutation_command_path"
+}
+
 make_probe_spawn_signal_bootstrap() {
   probe_spawn_source=$1
   probe_spawn_target=$2
@@ -793,6 +830,38 @@ set_failure_case_direct_asset() {
   mv "$failure_asset_manifest.new" "$failure_asset_manifest"
 }
 
+set_failure_case_taplo_field() {
+  failure_taplo_field=$1
+  failure_taplo_value=$2
+  failure_asset_manifest=$managed_failure_harness/manifests/packages-direct.tsv
+  awk -F '\t' -v OFS='\t' \
+    -v field="$failure_taplo_field" \
+    -v value="$failure_taplo_value" '
+    $1 == "taplo" && $2 == "linux" && $3 == "x86_64" {
+      $field = value
+    }
+    { print }
+  ' "$failure_asset_manifest" >"$failure_asset_manifest.new"
+  mv "$failure_asset_manifest.new" "$failure_asset_manifest"
+}
+
+remove_failure_case_taplo_record() {
+  failure_asset_manifest=$managed_failure_harness/manifests/packages-direct.tsv
+  awk -F '\t' '
+    !($1 == "taplo" && $2 == "linux" && $3 == "x86_64") { print }
+  ' "$failure_asset_manifest" >"$failure_asset_manifest.new"
+  mv "$failure_asset_manifest.new" "$failure_asset_manifest"
+}
+
+duplicate_failure_case_taplo_record() {
+  failure_asset_manifest=$managed_failure_harness/manifests/packages-direct.tsv
+  awk -F '\t' '
+    { print }
+    $1 == "taplo" && $2 == "linux" && $3 == "x86_64" { print }
+  ' "$failure_asset_manifest" >"$failure_asset_manifest.new"
+  mv "$failure_asset_manifest.new" "$failure_asset_manifest"
+}
+
 refresh_failure_case_lock_hash() {
   failure_lock_path=$managed_failure_harness/manifests/packages-npm-language-servers-lock.json
   failure_lock_sha256=$(file_sha256_for_test "$failure_lock_path")
@@ -837,6 +906,14 @@ run_managed_failure_case() {
     lua-wrapper)
       managed_failure_signal_command='mv'
       managed_failure_signal_target=$managed_failure_home/.local/bin/lua-language-server
+      ;;
+    taplo-directory)
+      managed_failure_signal_command='mv'
+      managed_failure_signal_target=$managed_failure_home/.local/opt/taplo-0.10.0-$managed_failure_architecture
+      ;;
+    taplo-link)
+      managed_failure_signal_command='ln'
+      managed_failure_signal_target=$managed_failure_home/.local/bin/taplo
       ;;
     *)
       return 1
@@ -892,6 +969,93 @@ run_managed_failure_case() {
   else
     fail "$managed_failure_name rejects invalid managed provisioning without publication"
     sed "s/^/  $managed_failure_name output: /" \
+      "$managed_failure_root/output" >&2
+  fi
+}
+
+run_managed_type_mutation_case() {
+  mutation_name=$1
+  mutation_kind=$2
+  prepare_managed_failure_case "type-mutation-$mutation_name"
+  mkdir -p \
+    "$managed_failure_home/.local/bin" \
+    "$managed_failure_home/.local/opt"
+  printf '%s\n' 'type mutation sentinel' \
+    >"$managed_failure_home/preexisting-sentinel"
+
+  case "$mutation_kind" in
+    directory-to-file)
+      mutation_command='mv'
+      mutation_target=$managed_failure_home/.local/opt/taplo-0.10.0-x86_64
+      mutation_publish_token=
+      mutation_diagnostic='refusing unjournaled managed directory cleanup for changed path'
+      ;;
+    file-to-directory)
+      mutation_command='ln'
+      mutation_target=$managed_failure_home/.local/bin/taplo
+      mutation_publish_token=taplo-link
+      mutation_diagnostic='refusing managed file cleanup for changed path'
+      ;;
+    *) return 1 ;;
+  esac
+
+  make_managed_type_mutation_command \
+    "$managed_failure_bin/$mutation_command" \
+    "$(command -v "$mutation_command")" \
+    "$(command -v mv)" \
+    "$(command -v mkdir)"
+
+  run_capture "$managed_failure_root/output" env \
+    PATH="$managed_failure_bin:$PATH" \
+    TMPDIR="$managed_failure_tmp" \
+    HOME="$managed_failure_home" \
+    XDG_STATE_HOME="$managed_failure_state" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+    DOTFILES_BOOTSTRAP_TEST_ARCH=x86_64 \
+    DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+    DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS= \
+    DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+    DOTFILES_BOOTSTRAP_TEST_REAL_MANAGED_INSTALL=1 \
+    DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT="$managed_failure_download" \
+    DOTFILES_BOOTSTRAP_TEST_PUBLISH_FAIL_AFTER="$mutation_publish_token" \
+    DOTFILES_BOOTSTRAP_TEST_MUTATION_TARGET="$mutation_target" \
+    DOTFILES_BOOTSTRAP_TEST_MUTATION_KIND="$mutation_kind" \
+    DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+    DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$managed_failure_log" \
+    "$managed_failure_harness/bootstrap" --apply
+  mutation_status=$run_status
+  mutation_pass=true
+  [ "$mutation_status" -ne 0 ] || mutation_pass=false
+  grep -Fq "$mutation_diagnostic" "$managed_failure_root/output" \
+    || mutation_pass=false
+  path_exists_for_test "$mutation_target.original" \
+    || mutation_pass=false
+  [ "$(cat "$managed_failure_home/preexisting-sentinel" 2>/dev/null || true)" \
+    = 'type mutation sentinel' ] || mutation_pass=false
+  case "$mutation_kind" in
+    directory-to-file)
+      [ -f "$mutation_target" ] && [ ! -L "$mutation_target" ] \
+        || mutation_pass=false
+      ;;
+    file-to-directory)
+      [ -d "$mutation_target" ] && [ ! -L "$mutation_target" ] \
+        && [ "$(cat "$mutation_target/sentinel" 2>/dev/null || true)" \
+          = 'mutated Taplo link' ] \
+        || mutation_pass=false
+      ;;
+  esac
+  if find "$managed_failure_tmp" -mindepth 1 -maxdepth 1 \
+    -name 'dotfiles-bootstrap.*' -print -quit | grep -q .; then
+    mutation_pass=false
+  fi
+
+  if [ "$mutation_pass" = true ]; then
+    pass "$mutation_name cleanup refuses a changed Taplo path type"
+  else
+    fail "$mutation_name cleanup refuses a changed Taplo path type"
+    sed "s/^/  $mutation_name output: /" \
       "$managed_failure_root/output" >&2
   fi
 }
@@ -996,6 +1160,37 @@ create_failure_lua_archive() {
   failure_lua_sha256=$(file_sha256_for_test "$failure_lua_path")
   set_failure_case_direct_asset lua-language-server \
     "https://fixtures.invalid/$failure_lua_asset" "$failure_lua_sha256"
+}
+
+create_failure_taplo_asset() {
+  failure_taplo_variant=$1
+  failure_taplo_asset=taplo-$managed_failure_name.gz
+  failure_taplo_path=$managed_failure_download/$failure_taplo_asset
+  failure_taplo_source=$managed_failure_source/taplo-$managed_failure_name
+
+  case "$failure_taplo_variant" in
+    malformed-gzip)
+      printf '%s\n' 'not a gzip stream' >"$failure_taplo_path"
+      ;;
+    empty)
+      : >"$failure_taplo_source"
+      gzip -c "$failure_taplo_source" >"$failure_taplo_path"
+      ;;
+    wrong-version)
+      make_taplo_command "$failure_taplo_source" 'taplo 0.9.9' success
+      gzip -c "$failure_taplo_source" >"$failure_taplo_path"
+      ;;
+    missing-lsp)
+      make_taplo_command "$failure_taplo_source" 'taplo 0.10.0' fail
+      gzip -c "$failure_taplo_source" >"$failure_taplo_path"
+      ;;
+    *) return 1 ;;
+  esac
+
+  failure_taplo_sha256=$(file_sha256_for_test "$failure_taplo_path")
+  set_failure_case_direct_asset taplo \
+    "https://fixtures.invalid/$failure_taplo_asset" \
+    "$failure_taplo_sha256"
 }
 
 mutate_failure_npm_manifest() {
@@ -2799,6 +2994,46 @@ set_failure_case_direct_asset lua-language-server \
   '0000000000000000000000000000000000000000000000000000000000000000'
 run_managed_failure_case 'checksum mismatch for https://fixtures.invalid/lua-language-server-3.19.1-linux-x64.tar.gz'
 
+prepare_managed_failure_case taplo-missing-record
+remove_failure_case_taplo_record
+run_managed_failure_case 'missing direct asset for taplo/linux/x86_64'
+
+prepare_managed_failure_case taplo-duplicate-record
+duplicate_failure_case_taplo_record
+run_managed_failure_case 'malformed direct asset entry: taplo'
+
+prepare_managed_failure_case taplo-wrong-manifest-version
+set_failure_case_taplo_field 4 0.9.9
+run_managed_failure_case 'unexpected managed Taplo version'
+
+prepare_managed_failure_case taplo-wrong-manifest-format
+set_failure_case_taplo_field 5 binary
+run_managed_failure_case 'unexpected managed Taplo archive format'
+
+prepare_managed_failure_case taplo-non-https-asset
+set_failure_case_direct_asset taplo \
+  'http://fixtures.invalid/taplo-linux-x86_64.gz' \
+  "$fake_taplo_x86_sha"
+run_managed_failure_case 'direct asset URL must use HTTPS: taplo'
+
+prepare_managed_failure_case taplo-checksum-mismatch
+set_failure_case_direct_asset taplo \
+  'https://fixtures.invalid/taplo-linux-x86_64.gz' \
+  '0000000000000000000000000000000000000000000000000000000000000000'
+run_managed_failure_case \
+  'checksum mismatch for https://fixtures.invalid/taplo-linux-x86_64.gz'
+
+while IFS='|' read -r failure_case_name failure_case_variant failure_case_diagnostic; do
+  prepare_managed_failure_case "$failure_case_name"
+  create_failure_taplo_asset "$failure_case_variant"
+  run_managed_failure_case "$failure_case_diagnostic"
+done <<'TAPLO_FAILURE_CASES'
+taplo-malformed-gzip|malformed-gzip|verified Taplo asset is not valid gzip
+taplo-empty-output|empty|verified Taplo asset did not produce one regular executable
+taplo-wrong-staged-version|wrong-version|staged Taplo version does not match taplo 0.10.0
+taplo-missing-lsp|missing-lsp|staged Taplo does not expose lsp stdio
+TAPLO_FAILURE_CASES
+
 while IFS='|' read -r failure_case_name failure_case_variant failure_case_diagnostic; do
   prepare_managed_failure_case "$failure_case_name"
   create_failure_node_archive "$failure_case_variant"
@@ -2860,10 +3095,16 @@ while IFS='|' read -r collision_name collision_relative collision_type; do
 done <<COLLISION_CASES
 node-version-directory|.local/opt/node-24.19.0-x86_64|directory
 lua-version-directory|.local/opt/lua-language-server-3.19.1-x86_64|directory
+taplo-version-directory|.local/opt/taplo-0.10.0-x86_64|directory
+taplo-version-file|.local/opt/taplo-0.10.0-x86_64|file
+taplo-version-symlink|.local/opt/taplo-0.10.0-x86_64|symlink
 npm-bundle-directory|.local/opt/dotfiles-lsp-node-$actual_npm_lock_sha256|directory
 node-command-link|.local/bin/node|file
 npm-command-link|.local/bin/npm|file
 lua-wrapper-target|.local/bin/lua-language-server|file
+taplo-command-directory|.local/bin/taplo|directory
+taplo-command-file|.local/bin/taplo|file
+taplo-command-symlink|.local/bin/taplo|symlink
 bash-command-target|.local/bin/bash-language-server|file
 json-command-target|.local/bin/vscode-json-language-server|file
 pyright-command-target|.local/bin/pyright-langserver|file
@@ -2915,7 +3156,14 @@ else
   fail 'standalone Debian collision fails before Git bootstrap apt commands'
 fi
 
-for publication_token in node-directory lua-directory npm-directory command-links; do
+for publication_token in \
+  node-directory \
+  lua-directory \
+  taplo-directory \
+  taplo-link \
+  npm-directory \
+  command-links
+do
   prepare_managed_failure_case "publish-$publication_token"
   publication_parent_one=
   publication_parent_two=
@@ -2927,6 +3175,17 @@ for publication_token in node-directory lua-directory npm-directory command-link
     lua-directory)
       mkdir -p "$managed_failure_home/.local/bin"
       publication_parent_one=$managed_failure_home/.local/bin
+      ;;
+    taplo-directory)
+      mkdir -p "$managed_failure_home/.local/bin"
+      publication_parent_one=$managed_failure_home/.local/bin
+      ;;
+    taplo-link)
+      mkdir -p \
+        "$managed_failure_home/.local/bin" \
+        "$managed_failure_home/.local/opt"
+      publication_parent_one=$managed_failure_home/.local/bin
+      publication_parent_two=$managed_failure_home/.local/opt
       ;;
     npm-directory)
       mkdir -p "$managed_failure_home/.local/opt"
@@ -2961,14 +3220,21 @@ for publication_token in node-directory lua-directory npm-directory command-link
   fi
 done
 
-for signal_token in parent-directory managed-directory managed-link lua-wrapper; do
+for signal_token in \
+  parent-directory \
+  managed-directory \
+  managed-link \
+  lua-wrapper \
+  taplo-directory \
+  taplo-link
+do
   prepare_managed_failure_case "signal-before-journal-$signal_token"
   signal_parent_one=
   signal_parent_two=
   case "$signal_token" in
     parent-directory)
       ;;
-    managed-directory|managed-link|lua-wrapper)
+    managed-directory|managed-link|lua-wrapper|taplo-directory|taplo-link)
       mkdir -p \
         "$managed_failure_home/.local/bin" \
         "$managed_failure_home/.local/opt"
@@ -3004,6 +3270,9 @@ for signal_token in parent-directory managed-directory managed-link lua-wrapper;
     fail "$signal_token interruption removes only invocation-created managed state"
   fi
 done
+
+run_managed_type_mutation_case taplo-directory directory-to-file
+run_managed_type_mutation_case taplo-link file-to-directory
 
 while IFS='|' read -r selective_name selective_tools selective_links selective_kind; do
   run_selective_managed_case \

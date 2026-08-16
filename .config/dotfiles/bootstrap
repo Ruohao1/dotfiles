@@ -1554,6 +1554,7 @@ publish_debian_language_servers() {
   if [ "$managed_taplo_required" = true ]; then
     publish_managed_link \
       "$managed_taplo_target/taplo" "$HOME/.local/bin/taplo"
+    maybe_fail_managed_publication taplo-link
   fi
   if [ "$managed_bash_required" = true ]; then
     publish_managed_link \
