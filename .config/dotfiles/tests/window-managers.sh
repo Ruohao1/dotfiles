@@ -104,6 +104,7 @@ for required_file in \
   "$workspace_root/.config/aerospace/aerospace.toml" \
   "$workspace_root/.config/aerospace/dwindle" \
   "$workspace_root/.config/karabiner/karabiner.json" \
+  "$workspace_root/.config/macos/window-drag-gesture" \
   "$dotfiles_dir/manifests/window-manager-bindings.tsv" \
   "$dotfiles_dir/manifests/window-manager-pointer-bindings.tsv" \
   "$dotfiles_dir/manifests/config-linux-hypr.paths" \
@@ -123,7 +124,8 @@ done
 
 for required_helper in \
   "$workspace_root/.config/i3/dwindle" \
-  "$workspace_root/.config/aerospace/dwindle"
+  "$workspace_root/.config/aerospace/dwindle" \
+  "$workspace_root/.config/macos/window-drag-gesture"
 do
   if [ -x "$required_helper" ]; then
     pass "helper is executable: ${required_helper#"$workspace_root/"}"
@@ -152,19 +154,22 @@ else
 fi
 
 if command -v git >/dev/null 2>&1; then
-  local_root=$test_tmp/local-root
+  local_root=$test_tmp/'local root\probe'
   mkdir -p \
     "$local_root/.config/aerospace" \
     "$local_root/.config/dotfiles/manifests" \
     "$local_root/.config/hypr" \
     "$local_root/.config/i3" \
-    "$local_root/.config/karabiner"
+    "$local_root/.config/karabiner" \
+    "$local_root/.config/macos"
   cp "$workspace_root/.config/aerospace/aerospace.toml" \
     "$local_root/.config/aerospace/aerospace.toml"
   cp "$workspace_root/.config/aerospace/dwindle" \
     "$local_root/.config/aerospace/dwindle"
   cp "$workspace_root/.config/karabiner/karabiner.json" \
     "$local_root/.config/karabiner/karabiner.json"
+  cp -p "$workspace_root/.config/macos/window-drag-gesture" \
+    "$local_root/.config/macos/window-drag-gesture"
   cp "$workspace_root/.config/dotfiles/manifests/window-manager-bindings.tsv" \
     "$local_root/.config/dotfiles/manifests/window-manager-bindings.tsv"
   cp "$workspace_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv" \
@@ -188,6 +193,96 @@ if command -v git >/dev/null 2>&1; then
   else
     fail 'contract checker preserves an untracked local legacy config'
   fi
+
+  sed \
+    's/^preference_key=NSWindowShouldDragOnGesture$/preference_key=NSWindowShouldDragOnGestureChanged/' \
+    "$workspace_root/.config/macos/window-drag-gesture" \
+    >"$local_root/.config/macos/window-drag-gesture"
+  chmod 0700 "$local_root/.config/macos/window-drag-gesture"
+  run_capture "$test_tmp/checker-window-drag-key.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects a changed window-drag preference key'
+  else
+    fail 'contract checker rejects a changed window-drag preference key'
+  fi
+  cp -p "$workspace_root/.config/macos/window-drag-gesture" \
+    "$local_root/.config/macos/window-drag-gesture"
+
+  awk '
+    { print }
+    $0 == "preference_key=NSWindowShouldDragOnGesture" {
+      print "export preference_key=NSWindowShouldDragOnGestureChanged"
+    }
+  ' "$workspace_root/.config/macos/window-drag-gesture" \
+    >"$local_root/.config/macos/window-drag-gesture"
+  chmod 0700 "$local_root/.config/macos/window-drag-gesture"
+  run_capture "$test_tmp/checker-window-drag-shadow-key.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects a shadow window-drag preference key'
+  else
+    fail 'contract checker rejects a shadow window-drag preference key'
+  fi
+  cp -p "$workspace_root/.config/macos/window-drag-gesture" \
+    "$local_root/.config/macos/window-drag-gesture"
+
+  window_drag_sentinel=$test_tmp/window-drag-helper-executed
+  awk '
+    { print }
+    $0 == "preference_key=NSWindowShouldDragOnGesture" {
+      print ": >\"$DOTFILES_BOOTSTRAP_TEST_WINDOW_DRAG_SENTINEL\""
+      print "export preference_key\"=NSWindowShouldDragOnGestureChanged\""
+    }
+  ' "$workspace_root/.config/macos/window-drag-gesture" \
+    >"$local_root/.config/macos/window-drag-gesture"
+  chmod 0700 "$local_root/.config/macos/window-drag-gesture"
+  run_capture "$test_tmp/checker-window-drag-quoted-shadow-key.output" \
+    env DOTFILES_BOOTSTRAP_TEST_WINDOW_DRAG_SENTINEL="$window_drag_sentinel" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ] && [ ! -e "$window_drag_sentinel" ]; then
+    pass 'contract checker rejects quoted key reassignment without executing helper code'
+  else
+    fail 'contract checker rejects quoted key reassignment without executing helper code'
+  fi
+  cp -p "$workspace_root/.config/macos/window-drag-gesture" \
+    "$local_root/.config/macos/window-drag-gesture"
+
+  awk '
+    { print }
+    $0 == "preference_key=NSWindowShouldDragOnGesture" {
+      print "eval '\''preference_'\''key'\''=NSWindowShouldDragOnGestureChanged'\''"
+    }
+  ' "$workspace_root/.config/macos/window-drag-gesture" \
+    >"$local_root/.config/macos/window-drag-gesture"
+  chmod 0700 "$local_root/.config/macos/window-drag-gesture"
+  run_capture "$test_tmp/checker-window-drag-split-token-key.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects a split-token window-drag key reassignment'
+  else
+    fail 'contract checker rejects a split-token window-drag key reassignment'
+  fi
+  cp -p "$workspace_root/.config/macos/window-drag-gesture" \
+    "$local_root/.config/macos/window-drag-gesture"
+
+  awk '
+    { print }
+    $0 == "preference_key=NSWindowShouldDragOnGesture" {
+      print "# reviewed helper comments are part of the immutable byte contract"
+    }
+  ' "$workspace_root/.config/macos/window-drag-gesture" \
+    >"$local_root/.config/macos/window-drag-gesture"
+  chmod 0700 "$local_root/.config/macos/window-drag-gesture"
+  run_capture "$test_tmp/checker-window-drag-comment.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects an unreviewed comment-only helper change'
+  else
+    fail 'contract checker rejects an unreviewed comment-only helper change'
+  fi
+  cp -p "$workspace_root/.config/macos/window-drag-gesture" \
+    "$local_root/.config/macos/window-drag-gesture"
 
   tab=$(printf '\t')
   sed "s/${tab}SUPER${tab}OPTION${tab}/${tab}ALT${tab}OPTION${tab}/" \
@@ -702,6 +797,8 @@ require_contains "$aerospace_output" \
   'Aerospace profile selects the official Homebrew cask'
 require_contains "$aerospace_output" '.config/karabiner/karabiner.json' \
   'AeroSpace profile selects its Karabiner bridge'
+require_contains "$aerospace_output" '.config/macos/window-drag-gesture' \
+  'AeroSpace profile selects its transactional window-drag helper'
 require_contains "$aerospace_output" \
   'install homebrew-cask karabiner-elements' \
   'AeroSpace profile selects Karabiner Elements'
@@ -744,6 +841,8 @@ mac_none_output=$(
 )
 require_excludes "$mac_none_output" '.config/karabiner/karabiner.json' \
   'macOS none profile excludes the Karabiner bridge'
+require_excludes "$mac_none_output" '.config/macos/window-drag-gesture' \
+  'macOS none profile excludes the window-drag helper'
 require_excludes "$mac_none_output" 'karabiner-elements' \
   'macOS none profile excludes Karabiner Elements'
 
