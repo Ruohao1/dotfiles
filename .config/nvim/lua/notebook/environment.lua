@@ -658,7 +658,7 @@ local function new(deps)
 
     local document = {
       argv = {
-        resolved_interpreter,
+        interpreter,
         "-m",
         "ipykernel_launcher",
         "-f",

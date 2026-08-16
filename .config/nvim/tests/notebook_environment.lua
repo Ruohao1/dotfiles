@@ -682,6 +682,29 @@ expect(
   "each new or stale kernelspec must use one atomic replacement"
 )
 
+local linked_kernel_resolver = new_fixture({})
+make_directory("/work/linked/.venv/bin")
+write_file("/base/python", "#!/bin/sh\nexit 0\n", 493)
+assert(vim.uv.fs_symlink(physical("/base/python"), physical("/work/linked/.venv/bin/python")))
+local linked_digest = vim.fn.sha256("/work/linked\0/base/python"):sub(1, 12)
+local linked_name, linked_error = linked_kernel_resolver.ensure_kernel({
+  kind = "interpreter",
+  source = "uv",
+  root = "/work/linked",
+  interpreter = "/work/linked/.venv/bin/python",
+  label = "uv: linked",
+})
+expect(
+  linked_error == nil and linked_name == "dotfiles-linked-" .. linked_digest,
+  "symlinked interpreter did not retain its canonical kernel identity"
+)
+local linked_document =
+  vim.json.decode(read_file("/cache/jupyter/kernels/" .. linked_name .. "/kernel.json"))
+expect(
+  linked_document.argv[1] == "/work/linked/.venv/bin/python",
+  "private kernelspec discarded the virtual-environment interpreter path"
+)
+
 local registered_name, registered_error = resolver.ensure_kernel({
   kind = "registered",
   kernel = "already-installed",
