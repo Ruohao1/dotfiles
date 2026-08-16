@@ -21,4 +21,5 @@ bash-language-server
 vscode-json-languageserver
 lua-language-server
 pyright
+taplo-cli
 yaml-language-server

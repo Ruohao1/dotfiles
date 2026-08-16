@@ -398,6 +398,7 @@ emit_package_plan() {
         '  ensure upstream uv >=0.11.6 (fallback uv 0.12.5)' \
         '  ensure upstream node >=22.0.0 with npm >=10.0.0 (fallback node 24.19.0)' \
         '  ensure upstream lua-language-server >=3.19.1' \
+        '  ensure upstream taplo >=0.10.0 (fallback taplo 0.10.0)' \
         '  ensure npm bash-language-server@5.6.0' \
         '  ensure npm vscode-langservers-extracted@4.10.0' \
         '  ensure npm pyright@1.1.411' \

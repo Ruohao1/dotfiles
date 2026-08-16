@@ -1619,6 +1619,21 @@ else
   fail 'embedded npm lock SHA-256 matches the committed lockfile exactly once'
 fi
 
+actual_taplo_records=$(
+  awk -F '\t' '
+    $1 == "taplo" {
+      print $2 "|" $3 "|" $4 "|" $5 "|" $6 "|" $7
+    }
+  ' "$dotfiles_dir/manifests/packages-direct.tsv"
+)
+expected_taplo_records='linux|x86_64|0.10.0|gzip|https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-x86_64.gz|8fe196b894ccf9072f98d4e1013a180306e17d244830b03986ee5e8eabeb6156
+linux|arm64|0.10.0|gzip|https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-aarch64.gz|033681d01eec8376c3fd38fa3703c79316f5e14bb013d859943b60a07bccdcc3'
+if [ "$actual_taplo_records" = "$expected_taplo_records" ]; then
+  pass 'direct manifest locks the exact two Taplo 0.10.0 artifacts'
+else
+  fail 'direct manifest locks the exact two Taplo 0.10.0 artifacts'
+fi
+
 linux_output=$(
   HOME="$test_tmp/linux-home" \
     XDG_STATE_HOME="$test_tmp/linux-state" \
@@ -1663,6 +1678,7 @@ for provider in \
   vscode-json-languageserver \
   lua-language-server \
   pyright \
+  taplo-cli \
   yaml-language-server
 do
   require_contains "$linux_output" "install pacman $provider" \
@@ -1695,6 +1711,7 @@ require_contains "$apt_output" 'blocked community ghostty' 'apt plan blocks comm
 apt_lsp_plan=$(printf '%s\n' "$apt_output" | sed -n '/ensure upstream node >=22.0.0/,/ensure npm yaml-language-server@1.24.0/p')
 expected_apt_lsp_plan='  ensure upstream node >=22.0.0 with npm >=10.0.0 (fallback node 24.19.0)
   ensure upstream lua-language-server >=3.19.1
+  ensure upstream taplo >=0.10.0 (fallback taplo 0.10.0)
   ensure npm bash-language-server@5.6.0
   ensure npm vscode-langservers-extracted@4.10.0
   ensure npm pyright@1.1.411
@@ -1760,6 +1777,7 @@ for provider in \
   vscode-langservers-extracted \
   lua-language-server \
   pyright \
+  taplo \
   yaml-language-server
 do
   require_contains "$macos_output" "install homebrew-formula $provider" \
@@ -2938,10 +2956,11 @@ if printf '%s\n' "$brew_apply_commands" | grep -Fqx 'brew install bash-language-
   && printf '%s\n' "$brew_apply_commands" | grep -Fqx 'brew install vscode-langservers-extracted' \
   && printf '%s\n' "$brew_apply_commands" | grep -Fqx 'brew install lua-language-server' \
   && printf '%s\n' "$brew_apply_commands" | grep -Fqx 'brew install pyright' \
+  && printf '%s\n' "$brew_apply_commands" | grep -Fqx 'brew install taplo' \
   && printf '%s\n' "$brew_apply_commands" | grep -Fqx 'brew install yaml-language-server'; then
-  pass 'Homebrew apply installs all five exact language-server formulae'
+  pass 'Homebrew apply installs all six exact language-server formulae'
 else
-  fail 'Homebrew apply installs all five exact language-server formulae'
+  fail 'Homebrew apply installs all six exact language-server formulae'
 fi
 
 i3_apt_apply_log=$test_tmp/i3-apt-apply.commands
