@@ -12,3 +12,5 @@ node	linux	x86_64	24.19.0	tar.xz	https://nodejs.org/dist/v24.19.0/node-v24.19.0-
 node	linux	arm64	24.19.0	tar.xz	https://nodejs.org/dist/v24.19.0/node-v24.19.0-linux-arm64.tar.xz	01443c1e1a29e531ccad5a46fefa6df490d2189c49f7955904aecdbb0fe86fdc
 lua-language-server	linux	x86_64	3.19.1	tar.gz	https://github.com/LuaLS/lua-language-server/releases/download/3.19.1/lua-language-server-3.19.1-linux-x64.tar.gz	e9235d2d72ef55bc41cf8c99cda2ed64777682024b4bb81f5dea425060c5cbb8
 lua-language-server	linux	arm64	3.19.1	tar.gz	https://github.com/LuaLS/lua-language-server/releases/download/3.19.1/lua-language-server-3.19.1-linux-arm64.tar.gz	abd2572e8fc929dc838a81ffb8473c5bce0bf39bfe8edb4b120b3b623176ce83
+uv	linux	x86_64	0.12.5	tar.gz	https://releases.astral.sh/github/uv/releases/download/0.12.5/uv-x86_64-unknown-linux-gnu.tar.gz	68a509da24b06b4223a1c0175fb5eb5bc79342b76cbeff0cfe51ac3f5b17b6b2
+uv	linux	arm64	0.12.5	tar.gz	https://releases.astral.sh/github/uv/releases/download/0.12.5/uv-aarch64-unknown-linux-gnu.tar.gz	9bf43b4d1a07665bf64d4c4e710930b382321a785e0eb10aac07f46471f86a31

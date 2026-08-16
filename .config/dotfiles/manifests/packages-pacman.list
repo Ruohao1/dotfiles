@@ -10,6 +10,8 @@ shellcheck
 stylua
 tree-sitter-cli
 ghostty
+imagemagick
+uv
 base-devel
 wl-clipboard
 ttf-space-mono-nerd

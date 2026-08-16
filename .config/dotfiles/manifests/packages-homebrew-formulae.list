@@ -8,6 +8,8 @@ shellcheck
 stylua
 tree-sitter
 herdr
+imagemagick
+uv
 bash-language-server
 vscode-langservers-extracted
 lua-language-server

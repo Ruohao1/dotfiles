@@ -227,6 +227,7 @@ prepare_satisfaction_commands() {
   satisfaction_pyright_behavior=$7
   satisfaction_pyright_version=$8
   satisfaction_yaml_version=$9
+  satisfaction_uv_version=${10}
 
   mkdir -p "$satisfaction_bin"
   make_version_command "$satisfaction_bin/node" "$satisfaction_node_version"
@@ -239,6 +240,7 @@ prepare_satisfaction_commands() {
     "$satisfaction_pyright_behavior"
   make_version_command "$satisfaction_bin/pyright" "$satisfaction_pyright_version"
   make_version_command "$satisfaction_bin/yaml-language-server" "$satisfaction_yaml_version"
+  make_version_command "$satisfaction_bin/uv" "$satisfaction_uv_version"
   make_version_command "$satisfaction_bin/nvim" '0.12.4'
   make_version_command "$satisfaction_bin/stylua" '2.5.2'
   make_version_command "$satisfaction_bin/tree-sitter" '0.26.9'
@@ -1079,6 +1081,10 @@ require_excludes "$linux_output" 'Library/Application Support/com.mitchellh.ghos
 require_contains "$linux_output" 'install pacman neovim' 'pacman plan includes Neovim'
 require_contains "$linux_output" 'install pacman ghostty' 'pacman plan includes Ghostty'
 require_contains "$linux_output" 'install pacman ttf-space-mono-nerd' 'pacman plan includes the configured font'
+require_contains "$linux_output" 'install pacman imagemagick' \
+  'pacman plan includes ImageMagick'
+require_contains "$linux_output" 'install pacman uv' \
+  'pacman plan includes uv'
 require_contains "$linux_output" 'manual sudo pacman -Syu --needed' 'pacman plan requires an explicit full upgrade'
 require_contains "$linux_output" 'install upstream herdr' 'pacman plan uses the official Herdr installer'
 for provider in \
@@ -1102,8 +1108,13 @@ apt_output=$(
     "$bootstrap"
 )
 require_contains "$apt_output" 'install apt git' 'apt plan includes Git'
+require_contains "$apt_output" 'install apt imagemagick' \
+  'apt plan includes ImageMagick'
 require_contains "$apt_output" 'install upstream neovim >=0.12.0' 'apt plan preserves the Neovim version floor'
 require_contains "$apt_output" 'install upstream herdr' 'apt plan uses the official Herdr installer'
+require_contains "$apt_output" \
+  'ensure upstream uv >=0.11.6 (fallback uv 0.12.5)' \
+  'apt plan preserves the uv version floor and pinned fallback'
 require_contains "$apt_output" 'blocked community ghostty' 'apt plan blocks community Ghostty without consent'
 apt_lsp_plan=$(printf '%s\n' "$apt_output" | sed -n '/ensure upstream node >=22.0.0/,/ensure npm yaml-language-server@1.24.0/p')
 expected_apt_lsp_plan='  ensure upstream node >=22.0.0 with npm >=10.0.0 (fallback node 24.19.0)
@@ -1243,6 +1254,8 @@ apt_apply_commands=$(cat "$apt_apply_log" 2>/dev/null || true)
 require_contains "$apt_apply_commands" 'sudo apt-get update' 'apt package phase refreshes indexes only during apply'
 require_contains "$apt_apply_commands" 'sudo apt-get install -y --no-install-recommends --no-remove' 'apt package install refuses removals'
 require_contains "$apt_apply_commands" 'direct-install neovim' 'apt package phase installs supported Neovim upstream'
+require_contains "$apt_apply_commands" 'direct-install uv' \
+  'apt package phase installs the supported uv fallback'
 require_contains "$apt_apply_commands" 'community-installer ghostty' 'apt package phase records the consented Ghostty installer'
 apt_update_line=$(printf '%s\n' "$apt_apply_commands" | grep -nF 'sudo apt-get update' | head -n 1 | cut -d: -f1)
 apt_install_line=$(printf '%s\n' "$apt_apply_commands" | grep -nF 'sudo apt-get install ' | head -n 1 | cut -d: -f1)
@@ -1260,7 +1273,7 @@ else
 fi
 
 run_satisfaction_case exact \
-  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0 0.11.6
 if [ "$satisfaction_case_status" -eq 0 ] \
   && ! printf '%s\n' "$satisfaction_case_commands" \
     | grep -Eq '^(direct-install (node|lua-language-server)|npm-ci )'; then
@@ -1271,26 +1284,30 @@ fi
 
 satisfaction_lower_versions_pass=true
 run_satisfaction_case node-low \
-  21.99.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0
+  21.99.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0 0.11.6
 printf '%s\n' "$satisfaction_case_commands" | grep -Fqx 'direct-install node' \
   || satisfaction_lower_versions_pass=false
 run_satisfaction_case npm-low \
-  22.0.0 9.99.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0
+  22.0.0 9.99.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0 0.11.6
 printf '%s\n' "$satisfaction_case_commands" | grep -Fqx 'direct-install node' \
   || satisfaction_lower_versions_pass=false
 run_satisfaction_case bash-low \
-  22.0.0 10.0.0 5.5.9 wait 3.19.1 wait 1.1.411 1.24.0
+  22.0.0 10.0.0 5.5.9 wait 3.19.1 wait 1.1.411 1.24.0 0.11.6
 printf '%s\n' "$satisfaction_case_commands" \
   | grep -Fqx 'npm-ci --ignore-scripts --omit=dev --no-audit --no-fund' \
   || satisfaction_lower_versions_pass=false
 run_satisfaction_case lua-low \
-  22.0.0 10.0.0 5.6.0 wait 3.19.0 wait 1.1.411 1.24.0
+  22.0.0 10.0.0 5.6.0 wait 3.19.0 wait 1.1.411 1.24.0 0.11.6
 printf '%s\n' "$satisfaction_case_commands" | grep -Fqx 'direct-install lua-language-server' \
   || satisfaction_lower_versions_pass=false
 run_satisfaction_case yaml-low \
-  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.23.9
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.23.9 0.11.6
 printf '%s\n' "$satisfaction_case_commands" \
   | grep -Fqx 'npm-ci --ignore-scripts --omit=dev --no-audit --no-fund' \
+  || satisfaction_lower_versions_pass=false
+run_satisfaction_case uv-low \
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0 0.11.5
+printf '%s\n' "$satisfaction_case_commands" | grep -Fqx 'direct-install uv' \
   || satisfaction_lower_versions_pass=false
 if [ "$satisfaction_lower_versions_pass" = true ]; then
   pass 'each immediately lower version selects its exact managed fallback'
@@ -1300,17 +1317,17 @@ fi
 
 satisfaction_stdio_pass=true
 run_satisfaction_case json-fail \
-  22.0.0 10.0.0 5.6.0 fail 3.19.1 wait 1.1.411 1.24.0
+  22.0.0 10.0.0 5.6.0 fail 3.19.1 wait 1.1.411 1.24.0 0.11.6
 printf '%s\n' "$satisfaction_case_commands" \
   | grep -Fqx 'npm-ci --ignore-scripts --omit=dev --no-audit --no-fund' \
   || satisfaction_stdio_pass=false
 run_satisfaction_case pyright-fail \
-  22.0.0 10.0.0 5.6.0 wait 3.19.1 fail 1.1.411 1.24.0
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 fail 1.1.411 1.24.0 0.11.6
 printf '%s\n' "$satisfaction_case_commands" \
   | grep -Fqx 'npm-ci --ignore-scripts --omit=dev --no-audit --no-fund' \
   || satisfaction_stdio_pass=false
 run_satisfaction_case pyright-companion-low \
-  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.410 1.24.0
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.410 1.24.0 0.11.6
 printf '%s\n' "$satisfaction_case_commands" \
   | grep -Fqx 'npm-ci --ignore-scripts --omit=dev --no-audit --no-fund' \
   || satisfaction_stdio_pass=false
@@ -1333,7 +1350,7 @@ mkdir -p \
   "$probe_signal_state" \
   "$probe_signal_tmp"
 prepare_satisfaction_commands "$probe_signal_bin" \
-  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0 0.11.6
 make_term_ignoring_stdio_command \
   "$probe_signal_bin/vscode-json-language-server" \
   "$probe_signal_pid_file" \
@@ -1461,7 +1478,7 @@ mkdir -p \
 cp -R "$dotfiles_dir/manifests" "$probe_race_harness/manifests"
 make_probe_spawn_signal_bootstrap "$bootstrap" "$probe_race_bootstrap"
 prepare_satisfaction_commands "$probe_race_bin" \
-  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0 0.11.6
 set +e
 env \
   PATH="$probe_race_bin:/usr/bin:/bin" \
@@ -1564,7 +1581,7 @@ mkdir -p \
 cp -R "$dotfiles_dir/manifests" "$probe_temp_harness/manifests"
 make_probe_temp_signal_bootstrap "$bootstrap" "$probe_temp_bootstrap"
 prepare_satisfaction_commands "$probe_temp_bin" \
-  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0 0.11.6
 run_capture "$probe_temp_root/output" env \
   PATH="$probe_temp_bin:/usr/bin:/bin" \
   TMPDIR="$probe_temp_tmp" \
@@ -1623,7 +1640,7 @@ mkdir -p \
 cp -R "$dotfiles_dir/manifests" "$probe_repeat_harness/manifests"
 make_exit_repeat_signal_bootstrap "$bootstrap" "$probe_repeat_bootstrap"
 prepare_satisfaction_commands "$probe_repeat_bin" \
-  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0
+  22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0 0.11.6
 make_term_ignoring_stdio_command \
   "$probe_repeat_bin/vscode-json-language-server" \
   "$probe_repeat_pid_file" \
@@ -2238,7 +2255,7 @@ run_capture "$idempotent_root/output" env \
   DOTFILES_BOOTSTRAP_TESTING=1 \
   DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
   DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
-  DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS='node,npm,bash-language-server,vscode-json-language-server,lua-language-server,pyright-langserver,yaml-language-server,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd' \
+  DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS='node,npm,bash-language-server,vscode-json-language-server,lua-language-server,pyright-langserver,yaml-language-server,uv,neovim,stylua,tree-sitter,herdr,font-space-mono-nerd' \
   DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
   DOTFILES_BOOTSTRAP_TEST_REAL_MANAGED_INSTALL=1 \
   DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT="$managed_fixture_download" \

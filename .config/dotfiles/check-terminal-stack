@@ -8231,6 +8231,8 @@ if [ "$tmux_started" = true ]; then
     "tmux monitors window bells" || true
   require_tmux_option_value "$check_socket" session visual-activity off \
     "tmux activity overlays stay off" || true
+  require_tmux_option_value "$check_socket" server allow-passthrough on \
+    "tmux permits graphics passthrough" || true
   require_tmux_option_value "$check_socket" session visual-bell off \
     "tmux bell overlays stay off" || true
   require_tmux_option_value "$check_socket" session window-status-separator '' \
@@ -9795,6 +9797,8 @@ TASK6_APPLICATION_CASES
   fi
   require_tmux_option_value "$check_socket" server set-clipboard external "tmux reload preserves set-clipboard" || true
   require_tmux_option_value "$check_socket" server focus-events on "tmux reload preserves focus-events" || true
+  require_tmux_option_value "$check_socket" server allow-passthrough on \
+    "tmux reload preserves graphics passthrough" || true
   require_tmux_option_value "$check_socket" session base-index 1 "tmux reload preserves base-index" || true
   require_tmux_option_value "$check_socket" window pane-base-index 1 "tmux reload preserves pane-base-index" || true
   require_tmux_option_value "$check_socket" session renumber-windows on "tmux reload preserves renumber-windows" || true

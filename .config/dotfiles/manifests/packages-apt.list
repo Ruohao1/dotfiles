@@ -6,6 +6,7 @@ fzf
 ripgrep
 jq
 shellcheck
+imagemagick
 build-essential
 wl-clipboard
 fontconfig

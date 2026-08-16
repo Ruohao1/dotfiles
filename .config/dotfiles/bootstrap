@@ -395,6 +395,7 @@ emit_package_plan() {
         '  install upstream tree-sitter-cli >=0.26.1' \
         '  install upstream herdr' \
         '  install upstream font-space-mono-nerd' \
+        '  ensure upstream uv >=0.11.6 (fallback uv 0.12.5)' \
         '  ensure upstream node >=22.0.0 with npm >=10.0.0 (fallback node 24.19.0)' \
         '  ensure upstream lua-language-server >=3.19.1' \
         '  ensure npm bash-language-server@5.6.0' \
@@ -1617,6 +1618,31 @@ install_direct_tool() {
         fc-cache -f "$target_dir" >/dev/null 2>&1 || true
       fi
       ;;
+    uv:tar.gz)
+      target_dir=$local_opt/uv-$asset_version-$selected_arch
+      uv_link=$local_bin/uv
+      uvx_link=$local_bin/uvx
+      [ ! -e "$uv_link" ] && [ ! -L "$uv_link" ] \
+        || die "refusing to replace existing direct-tool target: $uv_link"
+      [ ! -e "$uvx_link" ] && [ ! -L "$uvx_link" ] \
+        || die "refusing to replace existing direct-tool target: $uvx_link"
+      if [ ! -d "$target_dir" ]; then
+        mkdir "$install_tmp/extract"
+        tar -xzf "$asset_path" -C "$install_tmp/extract" \
+          || die 'could not extract the verified uv archive'
+        case "$selected_arch" in
+          x86_64) uv_archive_arch=x86_64 ;;
+          arm64) uv_archive_arch=aarch64 ;;
+          *) die "unsupported architecture: $selected_arch" ;;
+        esac
+        extracted_dir=$install_tmp/extract/uv-$uv_archive_arch-unknown-linux-gnu
+        [ -x "$extracted_dir/uv" ] && [ -x "$extracted_dir/uvx" ] \
+          || die 'verified uv archive has an unexpected layout'
+        mv "$extracted_dir" "$target_dir"
+      fi
+      ln -s "$target_dir/uv" "$uv_link"
+      ln -s "$target_dir/uvx" "$uvx_link"
+      ;;
     *)
       remove_temporary_directory "$install_tmp"
       die "unsupported direct asset: $tool_name/$asset_format"
@@ -1743,6 +1769,7 @@ install_apt_packages() {
 
   install_debian_language_servers "$manifest_root"
 
+  install_direct_tool uv 0.11.6 "$manifest_root"
   install_direct_tool neovim 0.12.0 "$manifest_root"
   install_direct_tool stylua 2.5.0 "$manifest_root"
   install_direct_tool tree-sitter 0.26.1 "$manifest_root"
