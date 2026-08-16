@@ -2115,12 +2115,12 @@ nvim_log_has_error() {
   grep -Eq 'Error detected|Error in command line:|Failed to source|E[0-9][0-9][0-9]:' "$1"
 }
 
-run_nvim_notebook_focused_test() {
+run_nvim_focused_test() {
   [ "$#" -eq 3 ] || return 2
   nvim_focused_name=$1
   nvim_focused_script=$2
   nvim_focused_expected=$3
-  nvim_focused_root="$check_tmp/nvim-notebook-focused"
+  nvim_focused_root="$check_tmp/nvim-focused"
   nvim_focused_output="$nvim_focused_root/$nvim_focused_name.out"
   nvim_focused_log="$nvim_focused_root/$nvim_focused_name.log"
 
@@ -2132,7 +2132,7 @@ run_nvim_notebook_focused_test() {
       "$nvim_focused_root/state" \
       "$nvim_focused_root/cache" \
       "$nvim_focused_root/runtime"); then
-    fail "could not create checker-owned notebook focused-test directories"
+    fail "could not create checker-owned focused Neovim test directories"
     return 1
   fi
 
@@ -2163,7 +2163,7 @@ run_nvim_notebook_focused_test() {
     || sed 's/^/      /' "$nvim_focused_output" >&2
   [ ! -s "$nvim_focused_log" ] \
     || sed 's/^/      /' "$nvim_focused_log" >&2
-  fail "focused notebook test failed: $nvim_focused_expected"
+  fail "focused Neovim test failed: $nvim_focused_expected"
   return 1
 }
 
@@ -2187,6 +2187,20 @@ nvim_editor_python_versions_are_exact() {
   PYTHONDONTWRITEBYTECODE=1 "$nvim_editor_probe_python" -c \
     'import importlib.metadata as m,sys; expected={"pynvim":sys.argv[1],"jupyter_client":"8.9.1","nbformat":"5.11.0","jupytext":"1.19.5","ipykernel":"7.3.0"}; actual={name:m.version(name) for name in expected}; assert actual == expected, (actual, expected)' \
     "$nvim_editor_probe_pynvim"
+}
+
+nvim_parquet_versions_are_exact() {
+  [ "$#" -eq 1 ] || return 2
+  PYTHONDONTWRITEBYTECODE=1 "$1" -I -B -c \
+    'import importlib.metadata as m,pyarrow; expected_specs=("visidata==3.4","pyarrow==25.0.0"); expected=dict(spec.split("==",1) for spec in expected_specs); actual={name:m.version(name) for name in expected}; assert actual == expected, (actual, expected)'
+}
+
+parquet_file_fingerprint() {
+  [ "$#" -eq 1 ] || return 2
+  [ -x "$parquet_tool_python" ] || return 1
+  PYTHONDONTWRITEBYTECODE=1 "$parquet_tool_python" -I -B -c \
+    'import hashlib,pathlib,stat,sys; path=pathlib.Path(sys.argv[1]); metadata=path.stat(); print("{}:{}:{}:{:o}".format(hashlib.sha256(path.read_bytes()).hexdigest(),metadata.st_size,metadata.st_mtime_ns,stat.S_IMODE(metadata.st_mode)))' \
+    "$1"
 }
 
 run_nvim_notebook_roundtrip() {
@@ -5771,6 +5785,44 @@ if command -v uv >/dev/null 2>&1; then
   fi
 fi
 
+parquet_runtime_ready=$uv_ready
+parquet_tool_root=""
+parquet_tool_python=""
+parquet_tool_viewer=""
+if [ "$uv_ready" = true ]; then
+  parquet_tool_root=$(UV_OFFLINE=1 uv tool dir --no-config 2>/dev/null || true)
+  case "$parquet_tool_root" in
+    /*)
+      if [ "$parquet_tool_root" != / ] \
+        && ! printf '%s' "$parquet_tool_root" | LC_ALL=C grep -q '[[:cntrl:]]' \
+        && [ -d "$parquet_tool_root" ]; then
+        parquet_tool_root=$(CDPATH='' cd -- "$parquet_tool_root" 2>/dev/null && pwd -P || true)
+      else
+        parquet_tool_root=""
+      fi
+      if [ -n "$parquet_tool_root" ] && [ "$parquet_tool_root" != / ]; then
+        parquet_tool_python=$parquet_tool_root/visidata/bin/python
+        parquet_tool_viewer=$parquet_tool_root/visidata/bin/vd
+      fi
+      ;;
+    *)
+      parquet_tool_root=""
+      ;;
+  esac
+fi
+
+parquet_probe_output="$check_tmp/parquet-tool.txt"
+if [ -x "$parquet_tool_python" ] \
+  && [ -x "$parquet_tool_viewer" ] \
+  && nvim_parquet_versions_are_exact "$parquet_tool_python" \
+    > "$parquet_probe_output" 2>&1; then
+  pass "Neovim Parquet viewer has exact VisiData 3.4 and PyArrow 25.0.0"
+else
+  [ ! -s "$parquet_probe_output" ] || sed 's/^/      /' "$parquet_probe_output" >&2
+  fail "Neovim Parquet viewer is missing or mismatched; run the dotfiles bootstrap"
+  parquet_runtime_ready=false
+fi
+
 tree_sitter_version=""
 if command -v tree-sitter >/dev/null 2>&1; then
   tree_sitter_version=$(tree-sitter --version 2>/dev/null \
@@ -5848,6 +5900,9 @@ for static_lint_file in \
   "$nvim_root/lua/notebook/python.lua" \
   "$nvim_root/lua/notebook/save.lua" \
   "$nvim_root/lua/notebook/workflow.lua" \
+  "$nvim_root/lua/parquet/health.lua" \
+  "$nvim_root/lua/parquet/tool.lua" \
+  "$nvim_root/lua/parquet/viewer.lua" \
   "$nvim_root/lua/plugins/editing.lua" \
   "$nvim_root/lua/plugins/navigation.lua" \
   "$nvim_root/lua/plugins/notebook.lua" \
@@ -5873,6 +5928,10 @@ for static_lint_file in \
   "$nvim_root/tests/notebook_roundtrip.lua" \
   "$nvim_root/tests/notebook_save.lua" \
   "$nvim_root/tests/notebook_workflow.lua" \
+  "$nvim_root/tests/parquet_health.lua" \
+  "$nvim_root/tests/parquet_integration.lua" \
+  "$nvim_root/tests/parquet_tool.lua" \
+  "$nvim_root/tests/parquet_viewer.lua" \
   "$nvim_root/tests/fixtures/notebook/stored-output.ipynb" \
   "$nvim_root/tests/oil_trash.lua" \
   "$nvim_root/tests/plugin_source.lua" \
@@ -5950,24 +6009,33 @@ fi
 
 if command -v nvim >/dev/null 2>&1 \
   && [ "$static_lint_files_ready" = true ]; then
-  run_nvim_notebook_focused_test \
+  run_nvim_focused_test \
     notebook-python "$nvim_root/tests/notebook_python.lua" \
     'notebook Python assertions: ok' || true
-  run_nvim_notebook_focused_test \
+  run_nvim_focused_test \
     notebook-plugins "$nvim_root/tests/notebook_plugins.lua" \
     'notebook plugin assertions: ok' || true
-  run_nvim_notebook_focused_test \
+  run_nvim_focused_test \
     notebook-environment "$nvim_root/tests/notebook_environment.lua" \
     'notebook environment assertions: ok' || true
-  run_nvim_notebook_focused_test \
+  run_nvim_focused_test \
     notebook-workflow "$nvim_root/tests/notebook_workflow.lua" \
     'notebook workflow assertions: ok' || true
-  run_nvim_notebook_focused_test \
+  run_nvim_focused_test \
     notebook-save "$nvim_root/tests/notebook_save.lua" \
     'notebook save assertions: ok' || true
-  run_nvim_notebook_focused_test \
+  run_nvim_focused_test \
     notebook-health "$nvim_root/tests/notebook_health.lua" \
     'notebook health assertions: ok' || true
+  run_nvim_focused_test \
+    parquet-tool "$nvim_root/tests/parquet_tool.lua" \
+    'parquet tool assertions: ok' || true
+  run_nvim_focused_test \
+    parquet-viewer "$nvim_root/tests/parquet_viewer.lua" \
+    'parquet viewer assertions: ok' || true
+  run_nvim_focused_test \
+    parquet-health "$nvim_root/tests/parquet_health.lua" \
+    'parquet health assertions: ok' || true
 fi
 
 if [ "$static_shellcheck_ready" = true ] \
@@ -10251,6 +10319,9 @@ for nvim_file in \
   "$nvim_root/lua/notebook/python.lua" \
   "$nvim_root/lua/notebook/save.lua" \
   "$nvim_root/lua/notebook/workflow.lua" \
+  "$nvim_root/lua/parquet/health.lua" \
+  "$nvim_root/lua/parquet/tool.lua" \
+  "$nvim_root/lua/parquet/viewer.lua" \
   "$nvim_root/lua/navigation/root.lua" \
   "$nvim_root/lua/navigation/pickers.lua" \
   "$nvim_root/lua/plugins/editing.lua" \
@@ -10280,6 +10351,10 @@ for nvim_file in \
   "$nvim_root/tests/notebook_roundtrip.lua" \
   "$nvim_root/tests/notebook_save.lua" \
   "$nvim_root/tests/notebook_workflow.lua" \
+  "$nvim_root/tests/parquet_health.lua" \
+  "$nvim_root/tests/parquet_integration.lua" \
+  "$nvim_root/tests/parquet_tool.lua" \
+  "$nvim_root/tests/parquet_viewer.lua" \
   "$nvim_root/tests/fixtures/notebook/stored-output.ipynb" \
   "$nvim_root/tests/oil_trash.lua" \
   "$nvim_root/tests/plugin_source.lua" \
@@ -10752,6 +10827,59 @@ if [ "$nvim_config_ready" = true ] \
 else
   printf '%s\n' \
     'SKIP  configured notebook scope and trusted notebook round-trip assertions'
+fi
+
+parquet_integration_root="$check_tmp/nvim-parquet-integration"
+parquet_fixture="$parquet_integration_root/read-only.parquet"
+parquet_return="$parquet_integration_root/return.md"
+parquet_output="$check_tmp/nvim-parquet-integration.out"
+parquet_log="$check_tmp/nvim-parquet-integration.log"
+
+if [ "$nvim_config_ready" = true ] \
+  && [ "$parquet_runtime_ready" = true ] \
+  && command -v nvim >/dev/null 2>&1 \
+  && (umask 077 && mkdir -p \
+    "$parquet_integration_root" \
+    "$check_tmp/nvim-parquet-home") \
+  && printf '%s\n' '# Return buffer' > "$parquet_return" \
+  && PYTHONDONTWRITEBYTECODE=1 "$parquet_tool_python" -I -B -c \
+    'import pyarrow as pa,pyarrow.parquet as pq,sys; pq.write_table(pa.table({"id":[1,2],"label":["one","two"]}),sys.argv[1])' \
+    "$parquet_fixture"; then
+  parquet_before=$(parquet_file_fingerprint "$parquet_fixture" 2>/dev/null || true)
+  : > "$parquet_log"
+  if [ -n "$parquet_before" ] \
+    && env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
+    HOME="$check_tmp/nvim-parquet-home" \
+    TMPDIR="$check_tmp" \
+    XDG_CONFIG_HOME="$config_root" \
+    XDG_DATA_HOME="$data_home" \
+    XDG_STATE_HOME="$XDG_STATE_HOME" \
+    XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+    XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+    NVIM_LOG_FILE="$parquet_log" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_OFFLINE=1 \
+    TERM=xterm-256color \
+    TERM_PROGRAM=ghostty \
+    DOTFILES_NVIM_SKIP_PARSER_INSTALL=1 \
+    DOTFILES_PARQUET_FIXTURE="$parquet_fixture" \
+    DOTFILES_PARQUET_RETURN="$parquet_return" \
+    nvim --headless -i NONE \
+    -c 'lua vim.defer_fn(function() vim.api.nvim_err_writeln("parquet integration exceeded 30 seconds"); vim.cmd("cquit 124") end, 30000)' \
+    -c "luafile $nvim_root/tests/parquet_integration.lua" \
+    -c qa > "$parquet_output" 2>&1 \
+    && ! nvim_log_has_error "$parquet_output" \
+    && grep -Fqx 'parquet integration assertions: ok' "$parquet_output" \
+    && [ ! -s "$parquet_log" ] \
+    && [ "$(parquet_file_fingerprint "$parquet_fixture")" = "$parquet_before" ]; then
+    pass "Neovim Parquet viewer loads and exits without changing its source"
+  else
+    [ ! -s "$parquet_output" ] || sed 's/^/      /' "$parquet_output" >&2
+    [ ! -s "$parquet_log" ] || sed 's/^/      /' "$parquet_log" >&2
+    fail "Neovim Parquet viewer integration failed or changed its source"
+  fi
+else
+  fail "could not prepare the checker-owned Parquet integration fixture"
 fi
 
 task9_ready=false
