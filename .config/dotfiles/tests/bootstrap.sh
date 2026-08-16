@@ -98,6 +98,54 @@ else
   fail 'unknown options use the usage exit status'
 fi
 
+remote_manifest_block=$(sed -n '/load_remote_manifests() {/,/^}/p' "$bootstrap")
+for manifest_name in \
+  packages-npm-language-servers.json \
+  packages-npm-language-servers-lock.json
+do
+  if [ "$(printf '%s\n' "$remote_manifest_block" | grep -Fxc "    $manifest_name \\")" -eq 1 ]; then
+    pass "standalone allowlist includes $manifest_name exactly once"
+  else
+    fail "standalone allowlist includes $manifest_name exactly once"
+  fi
+done
+
+if node -e '
+const fs = require("fs");
+const root = process.argv[1];
+const manifest = JSON.parse(fs.readFileSync(root + "/packages-npm-language-servers.json", "utf8"));
+const lock = JSON.parse(fs.readFileSync(root + "/packages-npm-language-servers-lock.json", "utf8"));
+const expected = {"bash-language-server":"5.6.0","pyright":"1.1.411","vscode-langservers-extracted":"4.10.0","yaml-language-server":"1.24.0"};
+if (!manifest.private || JSON.stringify(manifest.dependencies) !== JSON.stringify(expected)) process.exit(1);
+if (lock.lockfileVersion !== 3 || JSON.stringify(lock.packages[""].dependencies) !== JSON.stringify(expected)) process.exit(1);
+' "$dotfiles_dir/manifests"; then
+  pass 'npm language-server manifests contain the exact private locked dependency root'
+else
+  fail 'npm language-server manifests contain the exact private locked dependency root'
+fi
+
+embedded_npm_lock_sha256=$(
+  sed -n 's/^npm_language_servers_lock_sha256=\([0-9a-f][0-9a-f]*\)$/\1/p' "$bootstrap"
+)
+if command -v sha256sum >/dev/null 2>&1; then
+  actual_npm_lock_sha256=$(
+    sha256sum "$dotfiles_dir/manifests/packages-npm-language-servers-lock.json" \
+      | awk '{ print $1 }'
+  )
+else
+  actual_npm_lock_sha256=$(
+    shasum -a 256 "$dotfiles_dir/manifests/packages-npm-language-servers-lock.json" \
+      | awk '{ print $1 }'
+  )
+fi
+if [ "${#embedded_npm_lock_sha256}" -eq 64 ] \
+  && [ "$embedded_npm_lock_sha256" = "$actual_npm_lock_sha256" ] \
+  && [ "$(grep -Ec '^npm_language_servers_lock_sha256=[0-9a-f]{64}$' "$bootstrap")" -eq 1 ]; then
+  pass 'embedded npm lock SHA-256 matches the committed lockfile exactly once'
+else
+  fail 'embedded npm lock SHA-256 matches the committed lockfile exactly once'
+fi
+
 linux_output=$(
   HOME="$test_tmp/linux-home" \
     XDG_STATE_HOME="$test_tmp/linux-state" \

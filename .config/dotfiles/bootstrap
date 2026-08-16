@@ -46,6 +46,8 @@ mode=dry-run
 allow_community_packages=false
 repo_url=https://github.com/Ruohao1/dotfiles.git
 repo_ref=main
+# shellcheck disable=SC2034 # Used by the Debian managed-install path added next.
+npm_language_servers_lock_sha256=f01618d246ff8f53ad57e8d6a1cfe4d278f06a68d80eddbb254d910218aba4b8
 rollback_id=
 window_manager=
 
@@ -1141,6 +1143,8 @@ load_remote_manifests() {
     packages-homebrew-aerospace-casks.list \
     packages-homebrew-casks.list \
     packages-homebrew-formulae.list \
+    packages-npm-language-servers.json \
+    packages-npm-language-servers-lock.json \
     packages-pacman-hypr.list \
     packages-pacman-i3.list \
     packages-pacman.list \
