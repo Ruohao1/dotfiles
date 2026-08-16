@@ -103,6 +103,7 @@ for required_file in \
   "$workspace_root/.config/i3/dwindle" \
   "$workspace_root/.config/aerospace/aerospace.toml" \
   "$workspace_root/.config/aerospace/dwindle" \
+  "$workspace_root/.config/karabiner/karabiner.json" \
   "$dotfiles_dir/manifests/window-manager-bindings.tsv" \
   "$dotfiles_dir/manifests/window-manager-pointer-bindings.tsv" \
   "$dotfiles_dir/manifests/config-linux-hypr.paths" \
@@ -156,15 +157,22 @@ if command -v git >/dev/null 2>&1; then
     "$local_root/.config/aerospace" \
     "$local_root/.config/dotfiles/manifests" \
     "$local_root/.config/hypr" \
-    "$local_root/.config/i3"
+    "$local_root/.config/i3" \
+    "$local_root/.config/karabiner"
   cp "$workspace_root/.config/aerospace/aerospace.toml" \
     "$local_root/.config/aerospace/aerospace.toml"
   cp "$workspace_root/.config/aerospace/dwindle" \
     "$local_root/.config/aerospace/dwindle"
+  cp "$workspace_root/.config/karabiner/karabiner.json" \
+    "$local_root/.config/karabiner/karabiner.json"
   cp "$workspace_root/.config/dotfiles/manifests/window-manager-bindings.tsv" \
     "$local_root/.config/dotfiles/manifests/window-manager-bindings.tsv"
   cp "$workspace_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv" \
     "$local_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv"
+  cp "$dotfiles_dir/manifests/config-macos-aerospace.paths" \
+    "$local_root/.config/dotfiles/manifests/config-macos-aerospace.paths"
+  cp "$dotfiles_dir/manifests/packages-homebrew-aerospace-casks.list" \
+    "$local_root/.config/dotfiles/manifests/packages-homebrew-aerospace-casks.list"
   cp "$workspace_root/.config/hypr/hyprland.lua" \
     "$local_root/.config/hypr/hyprland.lua"
   cp "$workspace_root/.config/i3/config" "$local_root/.config/i3/config"
@@ -286,6 +294,69 @@ if command -v git >/dev/null 2>&1; then
   fi
   cp "$workspace_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv" \
     "$local_root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv"
+
+  printf '%s\n' '{' >"$local_root/.config/karabiner/karabiner.json"
+  run_capture "$test_tmp/checker-karabiner-malformed.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects malformed Karabiner JSON'
+  else
+    fail 'contract checker rejects malformed Karabiner JSON'
+  fi
+  cp "$workspace_root/.config/karabiner/karabiner.json" \
+    "$local_root/.config/karabiner/karabiner.json"
+
+  sed 's/"option"/"command"/' \
+    "$workspace_root/.config/karabiner/karabiner.json" \
+    >"$local_root/.config/karabiner/karabiner.json"
+  run_capture "$test_tmp/checker-karabiner-input-modifier.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects a changed Karabiner input modifier'
+  else
+    fail 'contract checker rejects a changed Karabiner input modifier'
+  fi
+  cp "$workspace_root/.config/karabiner/karabiner.json" \
+    "$local_root/.config/karabiner/karabiner.json"
+
+  jq '.profiles[0].complex_modifications.rules[0].manipulators[0].from.modifiers.optional = ["any"]' \
+    "$workspace_root/.config/karabiner/karabiner.json" \
+    >"$local_root/.config/karabiner/karabiner.json"
+  run_capture "$test_tmp/checker-karabiner-extra-modifiers.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects broad Karabiner modifier interception'
+  else
+    fail 'contract checker rejects broad Karabiner modifier interception'
+  fi
+  cp "$workspace_root/.config/karabiner/karabiner.json" \
+    "$local_root/.config/karabiner/karabiner.json"
+
+  jq '.profiles[0].complex_modifications.rules[0].manipulators[0].to[0].pointing_button = "button2"' \
+    "$workspace_root/.config/karabiner/karabiner.json" \
+    >"$local_root/.config/karabiner/karabiner.json"
+  run_capture "$test_tmp/checker-karabiner-output-button.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects a changed Karabiner output button'
+  else
+    fail 'contract checker rejects a changed Karabiner output button'
+  fi
+  cp "$workspace_root/.config/karabiner/karabiner.json" \
+    "$local_root/.config/karabiner/karabiner.json"
+
+  jq '.profiles[0].complex_modifications.rules[0].manipulators += [.profiles[0].complex_modifications.rules[0].manipulators[0]]' \
+    "$workspace_root/.config/karabiner/karabiner.json" \
+    >"$local_root/.config/karabiner/karabiner.json"
+  run_capture "$test_tmp/checker-karabiner-extra-manipulator.output" \
+    "$checker" --root "$local_root"
+  if [ "$run_status" -ne 0 ]; then
+    pass 'contract checker rejects an extra Karabiner pointer manipulator'
+  else
+    fail 'contract checker rejects an extra Karabiner pointer manipulator'
+  fi
+  cp "$workspace_root/.config/karabiner/karabiner.json" \
+    "$local_root/.config/karabiner/karabiner.json"
 
   sed 's/            natural_scroll = true,/            natural_scroll = false,/' \
     "$workspace_root/.config/hypr/hyprland.lua" \
@@ -629,6 +700,11 @@ require_contains "$aerospace_output" '.config/aerospace/dwindle' \
 require_contains "$aerospace_output" \
   'install homebrew-cask nikitabobko/tap/aerospace' \
   'Aerospace profile selects the official Homebrew cask'
+require_contains "$aerospace_output" '.config/karabiner/karabiner.json' \
+  'AeroSpace profile selects its Karabiner bridge'
+require_contains "$aerospace_output" \
+  'install homebrew-cask karabiner-elements' \
+  'AeroSpace profile selects Karabiner Elements'
 require_excludes "$aerospace_output" '.config/hypr/hyprland.lua' \
   'Aerospace profile excludes Hyprland config'
 require_excludes "$aerospace_output" '.config/i3/config' \
@@ -657,6 +733,19 @@ require_excludes "$none_output" '.config/aerospace/aerospace.toml' \
   'none profile excludes Aerospace config'
 require_excludes "$none_output" '.config/aerospace/dwindle' \
   'none profile excludes the AeroSpace Dwindle helper'
+
+mac_none_output=$(
+  HOME="$test_tmp/mac-none-home" \
+    XDG_STATE_HOME="$test_tmp/mac-none-state" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_PLATFORM=macos \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=homebrew \
+    "$bootstrap" --window-manager none
+)
+require_excludes "$mac_none_output" '.config/karabiner/karabiner.json' \
+  'macOS none profile excludes the Karabiner bridge'
+require_excludes "$mac_none_output" 'karabiner-elements' \
+  'macOS none profile excludes Karabiner Elements'
 
 run_capture "$test_tmp/apt-hypr.output" env \
   HOME="$test_tmp/apt-hypr-home" \

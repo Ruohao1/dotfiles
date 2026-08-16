@@ -45,6 +45,9 @@ esac
 
 keyboard_manifest=$root/.config/dotfiles/manifests/window-manager-bindings.tsv
 pointer_manifest=$root/.config/dotfiles/manifests/window-manager-pointer-bindings.tsv
+karabiner_config=$root/.config/karabiner/karabiner.json
+aerospace_config_manifest=$root/.config/dotfiles/manifests/config-macos-aerospace.paths
+aerospace_cask_manifest=$root/.config/dotfiles/manifests/packages-homebrew-aerospace-casks.list
 hypr_config=$root/.config/hypr/hyprland.lua
 i3_config=$root/.config/i3/config
 i3_dwindle=$root/.config/i3/dwindle
@@ -89,6 +92,9 @@ repository_tracks_path() {
 for required_file in \
   "$keyboard_manifest" \
   "$pointer_manifest" \
+  "$karabiner_config" \
+  "$aerospace_config_manifest" \
+  "$aerospace_cask_manifest" \
   "$hypr_config" \
   "$i3_config" \
   "$i3_dwindle" \
@@ -273,6 +279,55 @@ if [ "$pointer_rows" -eq 1 ]; then
   pass 'pointer contract contains exactly one shared action'
 else
   fail "pointer contract contains exactly one shared action (found $pointer_rows)"
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  fail 'jq is available for Karabiner contract validation'
+elif jq -e '
+  (.profiles | type) == "array" and
+  (.profiles | length) == 1 and
+  .profiles[0].name == "Default profile" and
+  .profiles[0].selected == true and
+  .profiles[0].complex_modifications.rules == [
+    {
+      "description": "Option plus left-drag rearranges tiled windows",
+      "manipulators": [
+        {
+          "from": {
+            "modifiers": {
+              "mandatory": ["option"]
+            },
+            "pointing_button": "button1"
+          },
+          "to": [
+            {
+              "modifiers": ["left_control", "left_command"],
+              "pointing_button": "button1"
+            }
+          ],
+          "type": "basic"
+        }
+      ]
+    }
+  ]
+' "$karabiner_config" >/dev/null 2>&1; then
+  pass 'Karabiner implements exact Option to Control-Command primary drag'
+else
+  fail 'Karabiner implements exact Option to Control-Command primary drag'
+fi
+
+if [ "$(grep -Fxc '.config/karabiner/karabiner.json' \
+    "$aerospace_config_manifest" || true)" -eq 1 ]; then
+  pass 'AeroSpace profile deploys the Karabiner bridge exactly once'
+else
+  fail 'AeroSpace profile deploys the Karabiner bridge exactly once'
+fi
+
+if [ "$(grep -Fxc 'karabiner-elements' \
+    "$aerospace_cask_manifest" || true)" -eq 1 ]; then
+  pass 'AeroSpace profile installs Karabiner Elements exactly once'
+else
+  fail 'AeroSpace profile installs Karabiner Elements exactly once'
 fi
 
 if ! grep -Fqx 'hl.bind("SUPER + SHIFT + C", hl.dsp.exec_cmd("hyprctl reload"))' \

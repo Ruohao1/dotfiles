@@ -74,8 +74,6 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-printf '1..143\n'
-
 if [ -x "$bootstrap" ]; then
   pass 'bootstrap is executable'
 else
@@ -361,6 +359,9 @@ aerospace_brew_apply_commands=$(cat "$aerospace_brew_apply_log" 2>/dev/null || t
 require_contains "$aerospace_brew_apply_commands" \
   'brew install --cask nikitabobko/tap/aerospace' \
   'Aerospace profile installs the official tap cask'
+require_contains "$aerospace_brew_apply_commands" \
+  'brew install --cask karabiner-elements' \
+  'AeroSpace profile installs Karabiner Elements'
 
 fixture_work=$test_tmp/fixture-work
 fixture_repo=$test_tmp/fixture.git
@@ -380,6 +381,7 @@ cp -R \
   "$workspace_root/.config/herdr" \
   "$workspace_root/.config/hypr" \
   "$workspace_root/.config/i3" \
+  "$workspace_root/.config/karabiner" \
   "$workspace_root/.config/launcher" \
   "$workspace_root/.config/macos" \
   "$workspace_root/.config/nvim" \
@@ -1315,8 +1317,10 @@ else
 fi
 
 if [ "$failures" -ne 0 ]; then
+  printf '1..%d\n' "$tests"
   printf '# %d test(s) failed\n' "$failures" >&2
   exit 1
 fi
 
+printf '1..%d\n' "$tests"
 printf '# all %d tests passed\n' "$tests"

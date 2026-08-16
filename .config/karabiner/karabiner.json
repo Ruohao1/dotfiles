@@ -1,0 +1,37 @@
+{
+  "profiles": [
+    {
+      "complex_modifications": {
+        "rules": [
+          {
+            "description": "Option plus left-drag rearranges tiled windows",
+            "manipulators": [
+              {
+                "from": {
+                  "modifiers": {
+                    "mandatory": [
+                      "option"
+                    ]
+                  },
+                  "pointing_button": "button1"
+                },
+                "to": [
+                  {
+                    "modifiers": [
+                      "left_control",
+                      "left_command"
+                    ],
+                    "pointing_button": "button1"
+                  }
+                ],
+                "type": "basic"
+              }
+            ]
+          }
+        ]
+      },
+      "name": "Default profile",
+      "selected": true
+    }
+  ]
+}
