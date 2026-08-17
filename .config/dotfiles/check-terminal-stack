@@ -2213,7 +2213,14 @@ nvim_parquet_with_path_entry() {
     *) return 2 ;;
   esac
   [ -d "$nvim_parquet_path_entry" ] || return 1
-  PATH="$nvim_parquet_path_entry${PATH:+:$PATH}" "$@"
+  nvim_parquet_command=$1
+  shift
+  case "$nvim_parquet_command" in
+    /*) [ -f "$nvim_parquet_command" ] && [ -x "$nvim_parquet_command" ] || return 1 ;;
+    *) return 2 ;;
+  esac
+  PATH="$nvim_parquet_path_entry${PATH:+:$PATH}" \
+    "$nvim_parquet_command" "$@"
 }
 
 run_nvim_parquet_path_entry_test() {
@@ -2222,8 +2229,15 @@ run_nvim_parquet_path_entry_test() {
   parquet_path_test_colon="$parquet_path_test_split:relative"
   parquet_path_test_safe="$parquet_path_test_root/safe"
   parquet_path_test_marker="$parquet_path_test_root/split-executed"
+  parquet_path_test_launcher_marker="$parquet_path_test_root/launcher-executed"
   parquet_path_test_output="$parquet_path_test_root/output.txt"
+  parquet_path_test_launcher_output="$parquet_path_test_root/launcher-output.txt"
   parquet_path_test_empty_output="$parquet_path_test_root/empty-path.txt"
+  parquet_path_test_env=$(command -p -v env 2>/dev/null || true)
+  case "$parquet_path_test_env" in
+    /*) [ -x "$parquet_path_test_env" ] || return 1 ;;
+    *) return 1 ;;
+  esac
   if ! (umask 077 && mkdir -p \
     "$parquet_path_test_split" \
     "$parquet_path_test_colon" \
@@ -2236,8 +2250,11 @@ run_nvim_parquet_path_entry_test() {
   # shellcheck disable=SC2016  # Preserve parameters for the generated fixtures.
   printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$PATH" > "$1"' \
     > "$parquet_path_test_safe/path-probe"
+  # shellcheck disable=SC2016  # Preserve parameters for the generated fixtures.
+  printf '%s\n' '#!/bin/sh' ': > "$1"' > "$parquet_path_test_safe/env"
   chmod 700 \
     "$parquet_path_test_split/uv" \
+    "$parquet_path_test_safe/env" \
     "$parquet_path_test_safe/path-probe"
 
   if nvim_parquet_with_path_entry \
@@ -2252,14 +2269,28 @@ run_nvim_parquet_path_entry_test() {
     && [ ! -s "$parquet_path_test_output" ] \
     || return 1
 
+  if nvim_parquet_with_path_entry \
+    "$parquet_path_test_safe" env "$parquet_path_test_launcher_marker" \
+    > "$parquet_path_test_launcher_output" 2>&1; then
+    return 1
+  else
+    parquet_path_test_status=$?
+  fi
+  [ "$parquet_path_test_status" -eq 2 ] \
+    && [ ! -e "$parquet_path_test_launcher_marker" ] \
+    && [ ! -s "$parquet_path_test_launcher_output" ] \
+    || return 1
+
   (
     unset PATH
     nvim_parquet_with_path_entry \
       "$parquet_path_test_safe" \
+      "$parquet_path_test_env" \
       "$parquet_path_test_safe/path-probe" \
       "$parquet_path_test_empty_output"
   ) || return 1
-  grep -Fqx "$parquet_path_test_safe" "$parquet_path_test_empty_output"
+  grep -Fqx "$parquet_path_test_safe" "$parquet_path_test_empty_output" \
+    && [ ! -e "$parquet_path_test_launcher_marker" ]
 }
 
 run_nvim_parquet_resolver_selection_test() {
@@ -2272,11 +2303,17 @@ run_nvim_parquet_resolver_selection_test() {
   parquet_selection_python="$parquet_selection_environment/bin/python"
   parquet_selection_viewer="$parquet_selection_environment/bin/vd"
   parquet_selection_pyarrow="$parquet_selection_environment/lib/python3.13/site-packages/pyarrow/__init__.py"
+  parquet_selection_env_marker="$parquet_selection_path_bin/env-executed"
   parquet_selection_output="$parquet_selection_root/output.txt"
   parquet_selection_log="$parquet_selection_root/nvim.log"
+  parquet_selection_env=$(command -p -v env 2>/dev/null || true)
   parquet_selection_nvim=$(command -v nvim 2>/dev/null || true)
   parquet_selection_jq=$(command -v jq 2>/dev/null || true)
 
+  case "$parquet_selection_env" in
+    /*) [ -f "$parquet_selection_env" ] && [ -x "$parquet_selection_env" ] || return 1 ;;
+    *) return 1 ;;
+  esac
   case "$parquet_selection_nvim" in
     /*) ;;
     *) return 1 ;;
@@ -2307,6 +2344,13 @@ run_nvim_parquet_resolver_selection_test() {
     'fi' \
     'exit 91' \
     > "$parquet_selection_path_bin/uv"
+  # shellcheck disable=SC2016  # Preserve fixture variables literally.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'marker=${0%/*}/env-executed' \
+    ': > "$marker"' \
+    'exit 93' \
+    > "$parquet_selection_path_bin/env"
   # shellcheck disable=SC2016  # Preserve parameters for the generated fixture.
   printf '%s\n' \
     '#!/bin/sh' \
@@ -2332,13 +2376,15 @@ run_nvim_parquet_resolver_selection_test() {
   printf '%s\n' '#!/bin/sh' 'exit 0' > "$parquet_selection_viewer"
   : > "$parquet_selection_pyarrow"
   chmod 700 \
+    "$parquet_selection_path_bin/env" \
     "$parquet_selection_path_bin/uv" \
     "$parquet_selection_managed_bin/uv" \
     "$parquet_selection_python" \
     "$parquet_selection_viewer"
   : > "$parquet_selection_log"
 
-  if nvim_parquet_with_path_entry "$parquet_selection_path_bin" env \
+  if nvim_parquet_with_path_entry \
+    "$parquet_selection_path_bin" "$parquet_selection_env" \
     HOME="$parquet_selection_home" \
     XDG_CONFIG_HOME="$parquet_selection_root/config" \
     XDG_DATA_HOME="$parquet_selection_root/data" \
@@ -2365,6 +2411,7 @@ run_nvim_parquet_resolver_selection_test() {
     && ! nvim_log_has_error "$parquet_selection_output" \
     && grep -Fqx 'parquet resolver selection assertions: ok' \
       "$parquet_selection_output" \
+    && [ ! -e "$parquet_selection_env_marker" ] \
     && [ ! -s "$parquet_selection_log" ]; then
     return 0
   fi
@@ -2493,7 +2540,12 @@ run_nvim_parquet_integration_test() {
       *) return 2 ;;
     esac
   done
+  parquet_integration_env=$(command -p -v env 2>/dev/null || true)
   parquet_integration_nvim=$(command -v nvim 2>/dev/null || true)
+  case "$parquet_integration_env" in
+    /*) [ -f "$parquet_integration_env" ] && [ -x "$parquet_integration_env" ] || return 1 ;;
+    *) return 1 ;;
+  esac
   case "$parquet_integration_nvim" in
     /*) [ -x "$parquet_integration_nvim" ] || return 1 ;;
     *) return 1 ;;
@@ -2502,7 +2554,7 @@ run_nvim_parquet_integration_test() {
   : > "$parquet_integration_log"
 
   nvim_parquet_with_path_entry "$parquet_tool_uv_directory" \
-    env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
+    "$parquet_integration_env" -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
     HOME="$check_tmp/nvim-parquet-home" \
     TMPDIR="$check_tmp" \
     XDG_CONFIG_HOME="$config_root" \
