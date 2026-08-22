@@ -60,6 +60,10 @@ stdout_file=$test_root/stdout
 stderr_file=$test_root/stderr
 run_status=0
 run_tmux_value=
+reuse_session_name=
+reuse_session_id=
+reuse_replacement_root=
+reuse_done_file=$test_root/session-reuse.done
 
 cleanup() {
   "$real_tmux" -S "$socket_path" kill-server >/dev/null 2>&1 || :
@@ -90,6 +94,21 @@ if [ "$#" -eq 0 ]; then
   }
   printf '%s\n' native >>"$T_TEST_NATIVE_LOG"
   exit 0
+fi
+
+if [ "${1-}" = display-message ] \
+  && [ -n "${T_TEST_REUSE_SESSION_NAME-}" ] \
+  && [ ! -e "$T_TEST_REUSE_DONE_FILE" ]; then
+  case ${4-} in
+    "=$T_TEST_REUSE_SESSION_NAME:"|"$T_TEST_REUSE_SESSION_ID:")
+      reuse_result=$("$T_TEST_REAL_TMUX" -f /dev/null -S "$T_TEST_SOCKET" "$@")
+      "$T_TEST_REAL_TMUX" -f /dev/null -S "$T_TEST_SOCKET" kill-session -t "$T_TEST_REUSE_SESSION_ID"
+      "$T_TEST_REAL_TMUX" -f /dev/null -S "$T_TEST_SOCKET" new-session -d -s "$T_TEST_REUSE_SESSION_NAME" -c "$T_TEST_REUSE_REPLACEMENT_ROOT"
+      : >"$T_TEST_REUSE_DONE_FILE"
+      printf '%s\n' "$reuse_result"
+      exit 0
+      ;;
+  esac
 fi
 
 if [ "${1-}" = attach-session ]; then
@@ -138,6 +157,10 @@ run_t() {
       T_TEST_ATTACH_LOG="$attach_log" \
       T_TEST_NATIVE_LOG="$native_log" \
       T_TEST_READY_FILE="$ready_file" \
+      T_TEST_REUSE_SESSION_NAME="$reuse_session_name" \
+      T_TEST_REUSE_SESSION_ID="$reuse_session_id" \
+      T_TEST_REUSE_REPLACEMENT_ROOT="$reuse_replacement_root" \
+      T_TEST_REUSE_DONE_FILE="$reuse_done_file" \
       XDG_STATE_HOME="$state_root" \
       XDG_RUNTIME_DIR="$runtime_root" \
       TMUX_WORKSPACE_TESTING=1 \
@@ -164,6 +187,7 @@ assert_equal 0 "$run_status" "nested launch"
 assert_equal "$space_root" "$(private_tmux display-message -p -t '=project_alpha:' '#{session_path}')" "space path session root"
 assert_equal 1 "$(private_tmux list-windows -t '=project_alpha' -F '#{window_id}' | wc -l | tr -d '[:space:]')" "single window"
 assert_equal 1 "$(private_tmux list-panes -t '=project_alpha' -F '#{pane_id}' | wc -l | tr -d '[:space:]')" "single pane"
+space_session_id=$(private_tmux display-message -p -t '=project_alpha:' '#{session_id}')
 expected_attach=$(printf 'attach\n<-c>\n<%s>\n<-t>\n<=project_alpha>' "$space_root")
 assert_equal "$expected_attach" "$(cat "$attach_log")" "exact attach arguments"
 assert_empty "$native_log" "Git launch native fallback"
@@ -171,15 +195,16 @@ assert_empty "$native_log" "Git launch native fallback"
 run_t "$space_root"
 assert_equal 0 "$run_status" "repeat launch"
 assert_equal 1 "$(private_tmux list-sessions -F '#{session_name}' | wc -l | tr -d '[:space:]')" "repeat session count"
-assert_contains '<=project_alpha>' "$attach_log" "repeat exact target"
+assert_contains "<$space_session_id>" "$attach_log" "repeat stable session target"
 
 exact_root=$(init_repository "$test_root/exact/exact match")
 private_tmux new-session -d -s manual_exact -c "$exact_root"
+manual_exact_id=$(private_tmux display-message -p -t '=manual_exact:' '#{session_id}')
 exact_session_count=$(private_tmux list-sessions -F '#{session_name}' | wc -l | tr -d '[:space:]')
 
 run_t "$exact_root"
 assert_equal 0 "$run_status" "exact-directory launch"
-expected_exact_attach=$(printf 'attach\n<-c>\n<%s>\n<-t>\n<=manual_exact>' "$exact_root")
+expected_exact_attach=$(printf 'attach\n<-c>\n<%s>\n<-t>\n<%s>' "$exact_root" "$manual_exact_id")
 assert_equal "$expected_exact_attach" "$(cat "$attach_log")" "exact-directory attach arguments"
 assert_equal "$exact_session_count" "$(private_tmux list-sessions -F '#{session_name}' | wc -l | tr -d '[:space:]')" "exact-directory session count"
 assert_empty "$native_log" "exact-directory native fallback"
@@ -188,25 +213,63 @@ if private_tmux has-session -t '=exact_match' 2>/dev/null; then
   fail "exact-directory launch created generated-name duplicate"
 fi
 
+reuse_root=$(init_repository "$test_root/reuse/original")
+reuse_replacement_root=$test_root/reuse/replacement
+mkdir -p "$reuse_replacement_root"
+reuse_session_name=replaceable
+private_tmux new-session -d -s "$reuse_session_name" -c "$reuse_root"
+reuse_session_id=$(private_tmux display-message -p -t "=$reuse_session_name:" '#{session_id}')
+
+run_t "$reuse_root"
+assert_equal 0 "$run_status" "reused-name exact-directory launch"
+[ -f "$reuse_done_file" ] || fail "reused-name fixture did not replace the session"
+expected_reuse_attach=$(printf 'attach\n<-c>\n<%s>\n<-t>\n<%s>' "$reuse_root" "$reuse_session_id")
+assert_equal "$expected_reuse_attach" "$(cat "$attach_log")" "reused-name stable session target"
+assert_equal "$reuse_replacement_root" "$(private_tmux display-message -p -t "=$reuse_session_name:" '#{session_path}')" "reused-name replacement root"
+if private_tmux has-session -t "$reuse_session_id" 2>/dev/null; then
+  fail "reused-name fixture retained the original session ID"
+fi
+assert_empty "$native_log" "reused-name native fallback"
+assert_empty "$stderr_file" "reused-name diagnostics"
+reuse_session_name=
+reuse_session_id=
+reuse_replacement_root=
+
+newline_suffix=$(printf '\n.')
+newline_suffix=${newline_suffix%.}
+newline_directory=$test_root/trailing-newline/directory$newline_suffix
+mkdir -p "$newline_directory"
+private_tmux new-session -d -s trailing_newline -c "$newline_directory"
+trailing_newline_id=$(private_tmux display-message -p -t '=trailing_newline:' '#{session_id}')
+
+run_t "$newline_directory"
+assert_equal 0 "$run_status" "trailing-newline exact-directory launch"
+expected_newline_attach=$(printf 'attach\n<-c>\n<%s>\n<-t>\n<%s>' "$newline_directory" "$trailing_newline_id")
+assert_equal "$expected_newline_attach" "$(cat "$attach_log")" "trailing-newline exact-directory attach"
+assert_empty "$native_log" "trailing-newline exact-directory native fallback"
+assert_empty "$stderr_file" "trailing-newline exact-directory diagnostics"
+
 precedence_root=$(init_repository "$test_root/precedence/repository")
 precedence_nested=$precedence_root/src/special
 mkdir -p "$precedence_nested"
 private_tmux new-session -d -s precedence_root -c "$precedence_root"
 private_tmux new-session -d -s precedence_nested -c "$precedence_nested"
+precedence_nested_id=$(private_tmux display-message -p -t '=precedence_nested:' '#{session_id}')
 
 run_t "$precedence_nested"
 assert_equal 0 "$run_status" "nested exact-directory launch"
-expected_precedence_attach=$(printf 'attach\n<-c>\n<%s>\n<-t>\n<=precedence_nested>' "$precedence_nested")
+expected_precedence_attach=$(printf 'attach\n<-c>\n<%s>\n<-t>\n<%s>' "$precedence_nested" "$precedence_nested_id")
 assert_equal "$expected_precedence_attach" "$(cat "$attach_log")" "nested exact-directory precedence"
 assert_empty "$native_log" "nested exact-directory native fallback"
 
 outside_exact_directory=$test_root/outside-exact
 mkdir -p "$outside_exact_directory"
 private_tmux new-session -d -s outside_exact -c "$outside_exact_directory"
+outside_exact_id=$(private_tmux display-message -p -t '=outside_exact:' '#{session_id}')
 
 run_t "$outside_exact_directory"
 assert_equal 0 "$run_status" "outside-Git exact-directory launch"
-expected_outside_exact_attach=$(printf 'attach\n<-c>\n<%s>\n<-t>\n<=outside_exact>' "$outside_exact_directory")
+expected_outside_exact_attach=$(printf 'attach\n<-c>\n<%s>\n<-t>\n<%s>' "$outside_exact_directory" "$outside_exact_id")
 assert_equal "$expected_outside_exact_attach" "$(cat "$attach_log")" "outside-Git exact-directory attach"
 assert_empty "$native_log" "outside-Git exact-directory native fallback"
 
@@ -215,10 +278,11 @@ symbolic_directory=$test_root/symbolic-target
 mkdir -p "$physical_directory"
 ln -s "$physical_directory" "$symbolic_directory"
 private_tmux new-session -d -s symbolic_exact -c "$physical_directory"
+symbolic_exact_id=$(private_tmux display-message -p -t '=symbolic_exact:' '#{session_id}')
 
 run_t "$symbolic_directory"
 assert_equal 0 "$run_status" "symbolic exact-directory launch"
-expected_symbolic_attach=$(printf 'attach\n<-c>\n<%s>\n<-t>\n<=symbolic_exact>' "$physical_directory")
+expected_symbolic_attach=$(printf 'attach\n<-c>\n<%s>\n<-t>\n<%s>' "$physical_directory" "$symbolic_exact_id")
 assert_equal "$expected_symbolic_attach" "$(cat "$attach_log")" "symbolic exact-directory normalization"
 assert_empty "$native_log" "symbolic exact-directory native fallback"
 

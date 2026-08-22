@@ -11,43 +11,55 @@ usage() {
 }
 
 normalize_directory() {
-  CDPATH='' cd -P "$1" 2>/dev/null && pwd -P
+  CDPATH='' cd -P "$1" 2>/dev/null || return 1
+  printf '%s.' "$PWD"
 }
 
 attach_session() {
   exec tmux attach-session -c "$2" -t "=$1"
 }
 
+attach_session_id() {
+  exec tmux attach-session -c "$2" -t "$1"
+}
+
 session_root() {
-  tmux display-message -p -t "=$1:" '#{session_path}' 2>/dev/null
+  tmux display-message -p -t "$1:" '#{session_path}.' 2>/dev/null
+}
+
+session_name() {
+  tmux display-message -p -t "$1:" '#{session_name}.' 2>/dev/null
 }
 
 attach_current_directory_session() {
   exact_directory=$1
 
-  if ! exact_session_names=$(tmux list-sessions -F '#{session_name}' 2>/dev/null); then
+  if ! exact_session_ids=$(tmux list-sessions -F '#{session_id}' 2>/dev/null); then
     return 0
   fi
 
   exact_match_count=0
-  exact_match=
-  exact_match_list=
+  exact_match_id=
+  exact_match_ids=
 
-  while IFS= read -r exact_candidate; do
-    [ -n "$exact_candidate" ] || continue
-    exact_root=$(session_root "$exact_candidate") || continue
-    exact_normalized_root=$(normalize_directory "$exact_root") || continue
+  while IFS= read -r exact_candidate_id; do
+    [ -n "$exact_candidate_id" ] || continue
+    exact_root_with_sentinel=$(session_root "$exact_candidate_id") || continue
+    exact_root=${exact_root_with_sentinel%.}
+    exact_normalized_root_with_sentinel=$(normalize_directory "$exact_root") || continue
+    exact_normalized_root=${exact_normalized_root_with_sentinel%.}
     [ "$exact_normalized_root" = "$exact_directory" ] || continue
 
     exact_match_count=$((exact_match_count + 1))
-    exact_match=$exact_candidate
-    if [ -z "$exact_match_list" ]; then
-      exact_match_list="'$exact_candidate'"
+    exact_match_id=$exact_candidate_id
+    if [ -z "$exact_match_ids" ]; then
+      exact_match_ids=$exact_candidate_id
     else
-      exact_match_list="$exact_match_list, '$exact_candidate'"
+      exact_match_ids="$exact_match_ids
+$exact_candidate_id"
     fi
   done <<EOF
-$exact_session_names
+$exact_session_ids
 EOF
 
   case $exact_match_count in
@@ -55,9 +67,25 @@ EOF
       return 0
       ;;
     1)
-      attach_session "$exact_match" "$exact_directory"
+      attach_session_id "$exact_match_id" "$exact_directory"
       ;;
     *)
+      exact_match_list=
+      while IFS= read -r exact_duplicate_id; do
+        [ -n "$exact_duplicate_id" ] || continue
+        if exact_duplicate_name_with_sentinel=$(session_name "$exact_duplicate_id"); then
+          exact_duplicate_name=${exact_duplicate_name_with_sentinel%.}
+        else
+          exact_duplicate_name=$exact_duplicate_id
+        fi
+        if [ -z "$exact_match_list" ]; then
+          exact_match_list="'$exact_duplicate_name'"
+        else
+          exact_match_list="$exact_match_list, '$exact_duplicate_name'"
+        fi
+      done <<EOF
+$exact_match_ids
+EOF
       die "multiple sessions use directory '$exact_directory': $exact_match_list"
       ;;
   esac
@@ -67,7 +95,8 @@ claim_or_attach() {
   candidate=$1
 
   if tmux has-session -t "=$candidate" 2>/dev/null; then
-    existing_root=$(session_root "$candidate") || die "could not inspect session '$candidate'"
+    existing_root_with_sentinel=$(session_root "=$candidate") || die "could not inspect session '$candidate'"
+    existing_root=${existing_root_with_sentinel%.}
     if [ "$existing_root" = "$project_root" ]; then
       attach_session "$candidate" "$project_root"
     fi
@@ -79,7 +108,8 @@ claim_or_attach() {
   fi
 
   if tmux has-session -t "=$candidate" 2>/dev/null; then
-    existing_root=$(session_root "$candidate") || die "could not inspect session '$candidate' after a create race"
+    existing_root_with_sentinel=$(session_root "=$candidate") || die "could not inspect session '$candidate' after a create race"
+    existing_root=${existing_root_with_sentinel%.}
     if [ "$existing_root" = "$project_root" ]; then
       attach_session "$candidate" "$project_root"
     fi
@@ -109,9 +139,10 @@ workspace_helper=$HOME/.config/tmux/scripts/workspace
 "$workspace_helper" ensure \
   || die "workspace restoration did not become ready"
 
-if ! current_directory=$(normalize_directory .); then
+if ! current_directory_with_sentinel=$(normalize_directory .); then
   die "could not normalize current directory"
 fi
+current_directory=${current_directory_with_sentinel%.}
 attach_current_directory_session "$current_directory"
 
 if ! command -v git >/dev/null 2>&1; then
@@ -123,9 +154,10 @@ if ! git_root=$(git rev-parse --show-toplevel 2>/dev/null); then
   exec tmux
 fi
 
-if ! project_root=$(normalize_directory "$git_root"); then
+if ! project_root_with_sentinel=$(normalize_directory "$git_root"); then
   die "could not normalize Git root '$git_root'"
 fi
+project_root=${project_root_with_sentinel%.}
 
 project_name=${project_root##*/}
 session_base=$(printf '%s' "$project_name" | LC_ALL=C sed 's/[^A-Za-z0-9_-][^A-Za-z0-9_-]*/_/g')
