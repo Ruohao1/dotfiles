@@ -10,12 +10,57 @@ usage() {
   printf '%s\n' 'usage: t' >&2
 }
 
+normalize_directory() {
+  CDPATH='' cd -P "$1" 2>/dev/null && pwd -P
+}
+
 attach_session() {
-  exec tmux attach-session -c "$project_root" -t "=$1"
+  exec tmux attach-session -c "$2" -t "=$1"
 }
 
 session_root() {
   tmux display-message -p -t "=$1:" '#{session_path}' 2>/dev/null
+}
+
+attach_current_directory_session() {
+  exact_directory=$1
+
+  if ! exact_session_names=$(tmux list-sessions -F '#{session_name}' 2>/dev/null); then
+    return 0
+  fi
+
+  exact_match_count=0
+  exact_match=
+  exact_match_list=
+
+  while IFS= read -r exact_candidate; do
+    [ -n "$exact_candidate" ] || continue
+    exact_root=$(session_root "$exact_candidate") || continue
+    exact_normalized_root=$(normalize_directory "$exact_root") || continue
+    [ "$exact_normalized_root" = "$exact_directory" ] || continue
+
+    exact_match_count=$((exact_match_count + 1))
+    exact_match=$exact_candidate
+    if [ -z "$exact_match_list" ]; then
+      exact_match_list="'$exact_candidate'"
+    else
+      exact_match_list="$exact_match_list, '$exact_candidate'"
+    fi
+  done <<EOF
+$exact_session_names
+EOF
+
+  case $exact_match_count in
+    0)
+      return 0
+      ;;
+    1)
+      attach_session "$exact_match" "$exact_directory"
+      ;;
+    *)
+      die "multiple sessions use directory '$exact_directory': $exact_match_list"
+      ;;
+  esac
 }
 
 claim_or_attach() {
@@ -24,19 +69,19 @@ claim_or_attach() {
   if tmux has-session -t "=$candidate" 2>/dev/null; then
     existing_root=$(session_root "$candidate") || die "could not inspect session '$candidate'"
     if [ "$existing_root" = "$project_root" ]; then
-      attach_session "$candidate"
+      attach_session "$candidate" "$project_root"
     fi
     return 1
   fi
 
   if tmux new-session -d -s "$candidate" -c "$project_root" 2>/dev/null; then
-    attach_session "$candidate"
+    attach_session "$candidate" "$project_root"
   fi
 
   if tmux has-session -t "=$candidate" 2>/dev/null; then
     existing_root=$(session_root "$candidate") || die "could not inspect session '$candidate' after a create race"
     if [ "$existing_root" = "$project_root" ]; then
-      attach_session "$candidate"
+      attach_session "$candidate" "$project_root"
     fi
     return 1
   fi
@@ -64,6 +109,11 @@ workspace_helper=$HOME/.config/tmux/scripts/workspace
 "$workspace_helper" ensure \
   || die "workspace restoration did not become ready"
 
+if ! current_directory=$(normalize_directory .); then
+  die "could not normalize current directory"
+fi
+attach_current_directory_session "$current_directory"
+
 if ! command -v git >/dev/null 2>&1; then
   printf '%s\n' 't: git is not installed or not in PATH' >&2
   exit 127
@@ -73,7 +123,7 @@ if ! git_root=$(git rev-parse --show-toplevel 2>/dev/null); then
   exec tmux
 fi
 
-if ! project_root=$(CDPATH='' cd -P "$git_root" 2>/dev/null && pwd -P); then
+if ! project_root=$(normalize_directory "$git_root"); then
   die "could not normalize Git root '$git_root'"
 fi
 

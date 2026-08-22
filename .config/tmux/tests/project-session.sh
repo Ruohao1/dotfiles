@@ -173,6 +173,72 @@ assert_equal 0 "$run_status" "repeat launch"
 assert_equal 1 "$(private_tmux list-sessions -F '#{session_name}' | wc -l | tr -d '[:space:]')" "repeat session count"
 assert_contains '<=project_alpha>' "$attach_log" "repeat exact target"
 
+exact_root=$(init_repository "$test_root/exact/exact match")
+private_tmux new-session -d -s manual_exact -c "$exact_root"
+exact_session_count=$(private_tmux list-sessions -F '#{session_name}' | wc -l | tr -d '[:space:]')
+
+run_t "$exact_root"
+assert_equal 0 "$run_status" "exact-directory launch"
+expected_exact_attach=$(printf 'attach\n<-c>\n<%s>\n<-t>\n<=manual_exact>' "$exact_root")
+assert_equal "$expected_exact_attach" "$(cat "$attach_log")" "exact-directory attach arguments"
+assert_equal "$exact_session_count" "$(private_tmux list-sessions -F '#{session_name}' | wc -l | tr -d '[:space:]')" "exact-directory session count"
+assert_empty "$native_log" "exact-directory native fallback"
+assert_empty "$stderr_file" "exact-directory diagnostics"
+if private_tmux has-session -t '=exact_match' 2>/dev/null; then
+  fail "exact-directory launch created generated-name duplicate"
+fi
+
+precedence_root=$(init_repository "$test_root/precedence/repository")
+precedence_nested=$precedence_root/src/special
+mkdir -p "$precedence_nested"
+private_tmux new-session -d -s precedence_root -c "$precedence_root"
+private_tmux new-session -d -s precedence_nested -c "$precedence_nested"
+
+run_t "$precedence_nested"
+assert_equal 0 "$run_status" "nested exact-directory launch"
+expected_precedence_attach=$(printf 'attach\n<-c>\n<%s>\n<-t>\n<=precedence_nested>' "$precedence_nested")
+assert_equal "$expected_precedence_attach" "$(cat "$attach_log")" "nested exact-directory precedence"
+assert_empty "$native_log" "nested exact-directory native fallback"
+
+outside_exact_directory=$test_root/outside-exact
+mkdir -p "$outside_exact_directory"
+private_tmux new-session -d -s outside_exact -c "$outside_exact_directory"
+
+run_t "$outside_exact_directory"
+assert_equal 0 "$run_status" "outside-Git exact-directory launch"
+expected_outside_exact_attach=$(printf 'attach\n<-c>\n<%s>\n<-t>\n<=outside_exact>' "$outside_exact_directory")
+assert_equal "$expected_outside_exact_attach" "$(cat "$attach_log")" "outside-Git exact-directory attach"
+assert_empty "$native_log" "outside-Git exact-directory native fallback"
+
+physical_directory=$test_root/physical-target
+symbolic_directory=$test_root/symbolic-target
+mkdir -p "$physical_directory"
+ln -s "$physical_directory" "$symbolic_directory"
+private_tmux new-session -d -s symbolic_exact -c "$physical_directory"
+
+run_t "$symbolic_directory"
+assert_equal 0 "$run_status" "symbolic exact-directory launch"
+expected_symbolic_attach=$(printf 'attach\n<-c>\n<%s>\n<-t>\n<=symbolic_exact>' "$physical_directory")
+assert_equal "$expected_symbolic_attach" "$(cat "$attach_log")" "symbolic exact-directory normalization"
+assert_empty "$native_log" "symbolic exact-directory native fallback"
+
+duplicate_root=$(init_repository "$test_root/duplicates/duplicate project")
+private_tmux new-session -d -s duplicate_one -c "$duplicate_root"
+private_tmux new-session -d -s duplicate_two -c "$duplicate_root"
+duplicate_session_count=$(private_tmux list-sessions -F '#{session_name}' | wc -l | tr -d '[:space:]')
+
+run_t "$duplicate_root"
+assert_equal 1 "$run_status" "duplicate exact-directory launch"
+assert_contains "t: multiple sessions use directory '$duplicate_root':" "$stderr_file" "duplicate exact-directory diagnostic"
+assert_contains "'duplicate_one'" "$stderr_file" "first duplicate session name"
+assert_contains "'duplicate_two'" "$stderr_file" "second duplicate session name"
+assert_empty "$attach_log" "duplicate exact-directory attach"
+assert_empty "$native_log" "duplicate exact-directory native fallback"
+assert_equal "$duplicate_session_count" "$(private_tmux list-sessions -F '#{session_name}' | wc -l | tr -d '[:space:]')" "duplicate exact-directory session count"
+if private_tmux has-session -t '=duplicate_project' 2>/dev/null; then
+  fail "duplicate exact-directory launch created another session"
+fi
+
 shared_one_root=$(init_repository "$test_root/one/shared")
 shared_two_root=$(init_repository "$test_root/two/shared")
 
