@@ -6076,6 +6076,7 @@ tmux_persistence_source='$HOME/.config/tmux/conf/persistence.conf'
 tmux_persistence_helper_source='$HOME/.config/tmux/scripts/workspace'
 tmux_persistence_prompt='Save tmux workspace now? (y/n)'
 tmux_persistence_helper="$tmux_root/scripts/workspace"
+tmux_fresh_start_test="$tmux_root/tests/fresh-start.sh"
 # shellcheck disable=SC2034  # Consumed by the effective-key contract in the next slice.
 tmux_persistence_save_command="confirm-before -p \"$tmux_persistence_prompt\" \"run-shell '$tmux_persistence_helper save'\""
 nvim_root="$config_root/nvim"
@@ -8162,6 +8163,7 @@ require_file "$tmux_root/conf/persistence.conf" || true
 require_file "$tmux_root/conf/status.conf" || true
 require_file "$tmux_root/conf/platform/linux.conf" || true
 require_file "$tmux_root/conf/platform/macos.conf" || true
+require_file "$tmux_fresh_start_test" || true
 
 tmux_entry="$tmux_root/tmux.conf"
 tmux_options="$tmux_root/conf/options.conf"
@@ -8170,6 +8172,18 @@ tmux_persistence="$tmux_root/conf/persistence.conf"
 tmux_status="$tmux_root/conf/status.conf"
 tmux_linux="$tmux_root/conf/platform/linux.conf"
 tmux_macos="$tmux_root/conf/platform/macos.conf"
+
+if [ -x "$tmux_fresh_start_test" ]; then
+  if "$tmux_fresh_start_test" \
+    > "$check_tmp/tmux-fresh-start.txt" 2>&1; then
+    pass "live tmux entry passes a fresh private-server startup"
+  else
+    sed 's/^/      /' "$check_tmp/tmux-fresh-start.txt" >&2
+    fail "live tmux entry failed a fresh private-server startup"
+  fi
+else
+  fail "tmux fresh-start test is missing or not executable: $tmux_fresh_start_test"
+fi
 
 if command -v tmux >/dev/null 2>&1 && [ -r "$tmux_root/tmux.conf" ]; then
   if env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
@@ -8996,7 +9010,7 @@ if [ "$tmux_started" = true ]; then
     "tmux monitors window bells" || true
   require_tmux_option_value "$check_socket" session visual-activity off \
     "tmux activity overlays stay off" || true
-  require_tmux_option_value "$check_socket" server allow-passthrough on \
+  require_tmux_option_value "$check_socket" window allow-passthrough on \
     "tmux permits graphics passthrough" || true
   require_tmux_option_value "$check_socket" session visual-bell off \
     "tmux bell overlays stay off" || true
@@ -10562,7 +10576,7 @@ TASK6_APPLICATION_CASES
   fi
   require_tmux_option_value "$check_socket" server set-clipboard external "tmux reload preserves set-clipboard" || true
   require_tmux_option_value "$check_socket" server focus-events on "tmux reload preserves focus-events" || true
-  require_tmux_option_value "$check_socket" server allow-passthrough on \
+  require_tmux_option_value "$check_socket" window allow-passthrough on \
     "tmux reload preserves graphics passthrough" || true
   require_tmux_option_value "$check_socket" session base-index 1 "tmux reload preserves base-index" || true
   require_tmux_option_value "$check_socket" window pane-base-index 1 "tmux reload preserves pane-base-index" || true
