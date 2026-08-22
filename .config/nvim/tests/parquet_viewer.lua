@@ -23,6 +23,7 @@ local function fixture(overrides)
     job_pids = {},
     killed_pids = {},
     metadata = {},
+    metadata_ready = {},
     next_buffer = 20,
     notifications = {},
     shutdown_callbacks = {},
@@ -107,6 +108,9 @@ local function fixture(overrides)
     end,
     set_metadata = function(bufnr, value)
       state.metadata[bufnr] = vim.deepcopy(value)
+    end,
+    metadata_ready = function(bufnr)
+      state.metadata_ready[#state.metadata_ready + 1] = bufnr
     end,
     set_window_buffer = function(winid, bufnr)
       state.windows[winid] = bufnr
@@ -221,6 +225,7 @@ do
     readonly = true,
     return_buffer = 1,
   }, "terminal metadata")
+  eq(state.metadata_ready, { terminal }, "terminal metadata-ready notification")
   expect(state.buffers[2] == nil, "Parquet placeholder survived")
   expect(state.windows[10] == terminal, "terminal did not replace current window")
   expect(state.insert_window == 10, "terminal did not enter insert mode")
@@ -259,6 +264,44 @@ for _, case in ipairs({
   expect(state.windows[10] == 1, case.name .. " did not restore")
   expect(state.buffers[2] == nil, case.name .. " placeholder survived")
   expect(state.notifications[#state.notifications].message:find(case.needle, 1, true), case.name)
+  expect(#state.metadata_ready == 0, case.name .. " emitted metadata-ready")
+end
+
+do
+  local ready = {}
+  local runtime, state = fixture(function(current)
+    return {
+      metadata_ready = function(bufnr)
+        expect(current.metadata[bufnr] ~= nil, "metadata-ready ran before metadata setup")
+        expect(current.wipes[bufnr] ~= nil, "metadata-ready ran before wipe-hook setup")
+        expect(current.buffers[2] == nil, "metadata-ready ran before placeholder cleanup")
+        expect(current.insert_window == 10, "metadata-ready ran before insert-mode setup")
+        expect(current.windows[10] == bufnr, "metadata-ready ran without terminal ownership")
+        ready[#ready + 1] = bufnr
+      end,
+    }
+  end)
+  local opened, terminal = runtime.open(2, "/work/data.parquet")
+  expect(opened, "ordered metadata-ready fixture failed")
+  eq(ready, { terminal }, "ordered metadata-ready calls")
+  state.started[1].on_exit(0)
+end
+
+do
+  local ready_calls = 0
+  local runtime, state = fixture({
+    metadata_ready = function()
+      ready_calls = ready_calls + 1
+      error("metadata-ready exploded")
+    end,
+  })
+  local called, opened, terminal = pcall(runtime.open, 2, "/work/data.parquet")
+  expect(called, "metadata-ready exception escaped open()")
+  expect(opened, "metadata-ready exception changed a successful open")
+  expect(terminal == state.started[1].bufnr, "metadata-ready exception lost the terminal")
+  expect(ready_calls == 1, "throwing metadata-ready dependency was not called exactly once")
+  expect(#state.notifications == 0, "metadata-ready exception notified")
+  state.started[1].on_exit(0)
 end
 
 do
@@ -482,6 +525,7 @@ do
   expect(terminal == 21, "synchronous programmatic exit lost its terminal")
   expect(completion_calls == 1, "synchronous programmatic exit completed more than once")
   expect(#state.stopped == 0, "synchronous programmatic exit stopped an exited job")
+  expect(#state.metadata_ready == 0, "synchronous exit emitted incomplete metadata-ready")
 end
 
 do
@@ -600,6 +644,7 @@ for _, case in ipairs({
   expect(called, case.name .. " escaped programmatic open()")
   expect(not opened, case.name .. " returned success")
   eq(completions, { { reason = "startup-failure" } }, case.name .. " completion")
+  expect(#state.metadata_ready == 0, case.name .. " emitted metadata-ready")
   if state.started[1] and state.started[1].on_exit then
     expect(pcall(state.started[1].on_exit, 143), case.name .. " late exit escaped")
     expect(#completions == 1, case.name .. " late exit completed twice")
@@ -1943,6 +1988,7 @@ do
   local executable_path = temp_base .. "-viewer"
   local group
   local notifications = {}
+  local ready_events = {}
 
   local function cleanup()
     if group then
@@ -2014,8 +2060,19 @@ do
         vim.api.nvim_win_set_buf(winid, replacement)
       end,
     })
+    vim.api.nvim_create_autocmd("User", {
+      group = group,
+      pattern = "DotfilesParquetViewerReady",
+      callback = function(args)
+        ready_events[#ready_events + 1] = {
+          buffer = args.data and args.data.buffer,
+          match = args.match,
+        }
+      end,
+    })
 
     expect(not real_viewer.open(placeholder, parquet_path), "real adapter race returned success")
+    expect(#ready_events == 0, "failed real adapter startup emitted metadata-ready")
     expect(entered == 1, "real adapter race did not trigger exactly one BufEnter")
     expect(
       entered_buffer ~= placeholder and entered_buffer ~= replacement,
@@ -2039,6 +2096,19 @@ do
       notifications[1].message:find("Parquet viewer failed", 1, true),
       "real adapter race reported the wrong notification"
     )
+
+    local success_placeholder = vim.api.nvim_create_buf(true, false)
+    vim.api.nvim_win_set_buf(winid, success_placeholder)
+    local opened, terminal = real_viewer.open(success_placeholder, parquet_path, {
+      return_buffer = replacement,
+    })
+    expect(opened, "real adapter metadata-ready fixture failed")
+    eq(ready_events, {
+      {
+        buffer = terminal,
+        match = "DotfilesParquetViewerReady",
+      },
+    }, "real adapter metadata-ready event")
   end, debug.traceback)
 
   cleanup()

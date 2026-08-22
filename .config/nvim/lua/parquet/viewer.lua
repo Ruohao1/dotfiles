@@ -587,6 +587,7 @@ local function new(deps)
     end
 
     session.starting = false
+    pcall(deps.metadata_ready, terminal)
     return true, terminal
   end
 
@@ -677,6 +678,12 @@ local runtime = new({
   levels = vim.log.levels,
   normalize = vim.fs.normalize,
   notify = vim.notify,
+  metadata_ready = function(bufnr)
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = "DotfilesParquetViewerReady",
+      data = { buffer = bufnr },
+    })
+  end,
   on_wipe = function(bufnr, callback)
     vim.api.nvim_create_autocmd("BufWipeout", {
       buffer = bufnr,
