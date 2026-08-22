@@ -76,6 +76,16 @@ run_capture_in_directory() {
   set -e
 }
 
+resolve_test_executable() {
+  resolved_test_name=$1
+  resolved_test_path=$(command -v "$resolved_test_name" 2>/dev/null || true)
+  case $resolved_test_path in
+    /*) [ -x "$resolved_test_path" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' "$resolved_test_path"
+}
+
 make_version_command() {
   command_path=$1
   version_text=$2
@@ -191,7 +201,59 @@ make_direct_probe_bootstrap() {
   direct_probe_target=$2
   awk '
     $0 == "platform=$(detect_platform)" {
+      print "if ! command -v require_debian_probe_runtime >/dev/null 2>&1; then"
+      print "  require_debian_probe_runtime() {"
+      print "    direct_probe_setsid_candidate=$(command -v setsid 2>/dev/null || true)"
+      print "    case $direct_probe_setsid_candidate in"
+      print "      /*) [ -x \"$direct_probe_setsid_candidate\" ] ;;"
+      print "      *) false ;;"
+      print "    esac || {"
+      print "      printf \"%s\\n\" \"bootstrap: util-linux setsid -f -w is required for Debian language-server probes\" >&2"
+      print "      return 1"
+      print "    }"
+      print "    direct_probe_env_candidate=$(command -v env 2>/dev/null || true)"
+      print "    case $direct_probe_env_candidate in"
+      print "      /*) [ -x \"$direct_probe_env_candidate\" ] ;;"
+      print "      *) false ;;"
+      print "    esac || {"
+      print "      printf \"%s\\n\" \"bootstrap: GNU env --default-signal=HUP,INT,TERM is required for Debian language-server probes\" >&2"
+      print "      return 1"
+      print "    }"
+      print "    if ! \"$direct_probe_setsid_candidate\" -f -w /bin/sh -c \"exit 0\"; then"
+      print "      printf \"%s\\n\" \"bootstrap: util-linux setsid -f -w is required for Debian language-server probes\" >&2"
+      print "      return 1"
+      print "    fi"
+      print "    if ! \"$direct_probe_env_candidate\" --default-signal=HUP,INT,TERM /bin/sh -c \"exit 0\"; then"
+      print "      printf \"%s\\n\" \"bootstrap: GNU env --default-signal=HUP,INT,TERM is required for Debian language-server probes\" >&2"
+      print "      return 1"
+      print "    fi"
+      print "    debian_probe_setsid_command=$direct_probe_setsid_candidate"
+      print "    debian_probe_env_command=$direct_probe_env_candidate"
+      print "  }"
+      print "fi"
       print "if [ \"${DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE:-0}\" = 1 ]; then"
+      print "  require_debian_probe_runtime || exit 42"
+      print "  case ${debian_probe_setsid_command:-} in"
+      print "    /*) [ -x \"$debian_probe_setsid_command\" ] || exit 42 ;;"
+      print "    *) exit 42 ;;"
+      print "  esac"
+      print "  case ${debian_probe_env_command:-} in"
+      print "    /*) [ -x \"$debian_probe_env_command\" ] || exit 42 ;;"
+      print "    *) exit 42 ;;"
+      print "  esac"
+      print "  if [ -n \"${DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_RUNTIME_AUDIT:-}\" ]; then"
+      print "    printf \"setsid|%s\\nenv|%s\\n\" \"$debian_probe_setsid_command\" \"$debian_probe_env_command\" >\"$DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_RUNTIME_AUDIT\" || exit 42"
+      print "  fi"
+      print "  if [ -n \"${DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_EXPECTED_SETSID:-}\" ]; then"
+      print "    [ \"$debian_probe_setsid_command\" = \"$DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_EXPECTED_SETSID\" ] || exit 42"
+      print "  fi"
+      print "  if [ -n \"${DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_EXPECTED_ENV:-}\" ]; then"
+      print "    [ \"$debian_probe_env_command\" = \"$DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_EXPECTED_ENV\" ] || exit 42"
+      print "  fi"
+      print "  if [ -n \"${DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_POST_GATE_PATH:-}\" ]; then"
+      print "    PATH=$DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_POST_GATE_PATH"
+      print "    export PATH"
+      print "  fi"
       print "  if bounded_command_succeeds \"$DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_COMMAND\"; then"
       print "    exit 0"
       print "  fi"
@@ -272,7 +334,7 @@ run_direct_probe_case() {
   direct_probe_state=$direct_probe_root/state
   direct_probe_output=$direct_probe_root/output
   mkdir -p "$direct_probe_tmp" "$direct_probe_home" "$direct_probe_state"
-  run_capture "$direct_probe_output" env \
+  run_capture "$direct_probe_output" "$test_real_env" \
     TMPDIR="$direct_probe_tmp" \
     HOME="$direct_probe_home" \
     XDG_STATE_HOME="$direct_probe_state" \
@@ -697,6 +759,870 @@ run_parquet_trailing_slash_target_case() {
     pass "Parquet installation accepts $parquet_trailing_name"
   else
     fail "Parquet installation accepts $parquet_trailing_name"
+  fi
+}
+
+make_probe_parent_hold_bootstrap() {
+  probe_hold_source=$1
+  probe_hold_target=$2
+  awk '
+    $0 == "bounded_command_succeeds() {" { in_bounded_probe = 1 }
+    { print }
+    in_bounded_probe && $0 == "  sleep 1" {
+      print "  if [ \"${DOTFILES_BOOTSTRAP_TEST_PROBE_PARENT_HOLD:-0}\" = 1 ]; then"
+      print "    : >\"$DOTFILES_BOOTSTRAP_TEST_PROBE_PARENT_HOLD_READY\""
+      print "    probe_parent_hold_attempt=0"
+      print "    while [ \"$probe_parent_hold_attempt\" -lt 80 ] && [ ! -e \"$DOTFILES_BOOTSTRAP_TEST_PROBE_PARENT_HOLD_RELEASE\" ]; do"
+      print "      sleep 0.05"
+      print "      probe_parent_hold_attempt=$((probe_parent_hold_attempt + 1))"
+      print "    done"
+      print "    if [ ! -e \"$DOTFILES_BOOTSTRAP_TEST_PROBE_PARENT_HOLD_RELEASE\" ]; then"
+      print "      : >\"$DOTFILES_BOOTSTRAP_TEST_PROBE_PARENT_HOLD_FAILED\""
+      print "      return 1"
+      print "    fi"
+      print "  fi"
+      injected += 1
+    }
+    in_bounded_probe && $0 == "}" { in_bounded_probe = 0 }
+    END {
+      if (injected != 1) exit 1
+    }
+  ' "$probe_hold_source" >"$probe_hold_target"
+  chmod 0755 "$probe_hold_target"
+}
+
+make_package_tracking_audit_bootstrap() {
+  package_tracking_source=$1
+  package_tracking_target=$2
+  awk '
+    $0 == "start_package_tracking() {" {
+      print
+      print "  if [ \"${DOTFILES_BOOTSTRAP_TESTING:-0}\" = 1 ] && [ -n \"${DOTFILES_BOOTSTRAP_TEST_PACKAGE_TRACKING_MARKER:-}\" ]; then"
+      print "    : >\"$DOTFILES_BOOTSTRAP_TEST_PACKAGE_TRACKING_MARKER\" || exit 97"
+      print "  fi"
+      injected += 1
+      next
+    }
+    { print }
+    END {
+      if (injected != 1) exit 1
+    }
+  ' "$package_tracking_source" >"$package_tracking_target"
+  chmod 0755 "$package_tracking_target"
+}
+
+make_failing_runtime_capability_command() {
+  runtime_capability_kind=$1
+  runtime_capability_path=$2
+  runtime_capability_log=$3
+  runtime_capability_real_command=$4
+  mkdir -p "$(dirname "$runtime_capability_path")"
+  # shellcheck disable=SC2016 # The generated fixture expands its test environment.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    "runtime_capability_kind='$runtime_capability_kind'" \
+    "runtime_capability_log='$runtime_capability_log'" \
+    "runtime_capability_real_command='$runtime_capability_real_command'" \
+    'runtime_capability_match=false' \
+    'case "$runtime_capability_kind:$#" in' \
+    '  setsid:5)' \
+    '    [ "$1" = -f ] && [ "$2" = -w ] && [ "$3" = /bin/sh ] && [ "$4" = -c ] && [ "$5" = "exit 0" ] && runtime_capability_match=true' \
+    '    ;;' \
+    '  env:4)' \
+    '    [ "$1" = --default-signal=HUP,INT,TERM ] && [ "$2" = /bin/sh ] && [ "$3" = -c ] && [ "$4" = "exit 0" ] && runtime_capability_match=true' \
+    '    ;;' \
+    'esac' \
+    'if [ "$runtime_capability_match" = true ]; then' \
+    '  for runtime_capability_argument do' \
+    '    printf "%s\n" "$runtime_capability_argument" >>"$runtime_capability_log"' \
+    '  done' \
+    '  exit 64' \
+    'fi' \
+    'exec "$runtime_capability_real_command" "$@"' \
+    >"$runtime_capability_path"
+  chmod 0755 "$runtime_capability_path"
+}
+
+make_direct_runtime_command() {
+  direct_runtime_kind=$1
+  direct_runtime_path=$2
+  direct_runtime_log=$3
+  direct_runtime_real_command=$4
+  direct_runtime_mode=$5
+  mkdir -p "$(dirname "$direct_runtime_path")"
+  # shellcheck disable=SC2016 # The generated fixture expands its arguments.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    "direct_runtime_kind='$direct_runtime_kind'" \
+    "direct_runtime_log='$direct_runtime_log'" \
+    "direct_runtime_real_command='$direct_runtime_real_command'" \
+    "direct_runtime_mode='$direct_runtime_mode'" \
+    'direct_runtime_capability=false' \
+    'case "$direct_runtime_kind:$#" in' \
+    '  setsid:5)' \
+    '    [ "$1" = -f ] && [ "$2" = -w ] && [ "$3" = /bin/sh ] && [ "$4" = -c ] && [ "$5" = "exit 0" ] && direct_runtime_capability=true' \
+    '    ;;' \
+    '  env:4)' \
+    '    [ "$1" = --default-signal=HUP,INT,TERM ] && [ "$2" = /bin/sh ] && [ "$3" = -c ] && [ "$4" = "exit 0" ] && direct_runtime_capability=true' \
+    '    ;;' \
+    'esac' \
+    'if [ "$direct_runtime_capability" = true ]; then' \
+    '  printf "%s|%s|%s" capability "$direct_runtime_kind" "$0" >>"$direct_runtime_log"' \
+    'else' \
+    '  printf "%s|%s|%s" launch "$direct_runtime_kind" "$0" >>"$direct_runtime_log"' \
+    'fi' \
+    'for direct_runtime_argument do' \
+    '  printf "|%s" "$direct_runtime_argument" >>"$direct_runtime_log"' \
+    'done' \
+    'printf "\n" >>"$direct_runtime_log"' \
+    'if [ "$direct_runtime_capability" = true ]; then' \
+    '  exec "$direct_runtime_real_command" "$@"' \
+    'fi' \
+    'case "$direct_runtime_mode" in' \
+    '  delegate) exec "$direct_runtime_real_command" "$@" ;;' \
+    '  reject-launch) exit 64 ;;' \
+    '  *) exit 2 ;;' \
+    'esac' \
+    >"$direct_runtime_path"
+  chmod 0755 "$direct_runtime_path"
+}
+
+make_post_gate_poison_command() {
+  post_gate_poison_path=$1
+  post_gate_poison_log=$2
+  mkdir -p "$(dirname "$post_gate_poison_path")"
+  # shellcheck disable=SC2016 # The generated fixture expands its arguments.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    "post_gate_poison_log='$post_gate_poison_log'" \
+    'printf "%s" "${0##*/}" >>"$post_gate_poison_log"' \
+    'for post_gate_poison_argument do' \
+    '  printf "|%s" "$post_gate_poison_argument" >>"$post_gate_poison_log"' \
+    'done' \
+    'printf "\n" >>"$post_gate_poison_log"' \
+    'exit 65' \
+    >"$post_gate_poison_path"
+  chmod 0755 "$post_gate_poison_path"
+}
+
+expected_runtime_capability_args() {
+  runtime_capability_kind=$1
+  printf '%s\n' runtime-capability-baseline
+  case "$runtime_capability_kind" in
+    setsid)
+      printf '%s\n' -f -w /bin/sh -c 'exit 0'
+      ;;
+    env)
+      printf '%s\n' \
+        '--default-signal=HUP,INT,TERM' \
+        /bin/sh \
+        -c \
+        'exit 0'
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+runtime_capability_diagnostic() {
+  case "$1" in
+    setsid)
+      printf '%s\n' \
+        'bootstrap: util-linux setsid -f -w is required for Debian language-server probes'
+      ;;
+    env)
+      printf '%s\n' \
+        'bootstrap: GNU env --default-signal=HUP,INT,TERM is required for Debian language-server probes'
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+make_runtime_git_command() {
+  runtime_git_path=$1
+  runtime_git_log=$2
+  runtime_git_mutation_marker=$3
+  runtime_git_mode=$4
+  runtime_real_git=$5
+  mkdir -p "$(dirname "$runtime_git_path")"
+  # shellcheck disable=SC2016 # The generated fixture expands its arguments.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    "runtime_git_log='$runtime_git_log'" \
+    "runtime_git_mutation_marker='$runtime_git_mutation_marker'" \
+    "runtime_git_mode='$runtime_git_mode'" \
+    "runtime_real_git='$runtime_real_git'" \
+    'printf "%s" git >>"$runtime_git_log"' \
+    'for runtime_git_argument do' \
+    '  printf "|%s" "$runtime_git_argument" >>"$runtime_git_log"' \
+    'done' \
+    'printf "\n" >>"$runtime_git_log"' \
+    'case "$runtime_git_mode" in' \
+    '  missing)' \
+    '    if [ "$#" -eq 1 ] && [ "$1" = --version ]; then exit 1; fi' \
+    '    exit 64' \
+    '    ;;' \
+    '  present)' \
+    '    if [ "$#" -eq 1 ] && [ "$1" = --version ]; then' \
+    '      exec "$runtime_real_git" "$@"' \
+    '    fi' \
+    '    case "${1:-}" in' \
+    '      rev-parse|show|show-ref|cat-file|status|version)' \
+    '        exec "$runtime_real_git" "$@"' \
+    '        ;;' \
+    '      config)' \
+    '        case "${2:-}" in' \
+    '          --get|--get-all|--get-regexp|--list)' \
+    '            exec "$runtime_real_git" "$@"' \
+    '            ;;' \
+    '        esac' \
+    '        ;;' \
+    '    esac' \
+    '    printf "%s\n" "git-mutation|$*" >"$runtime_git_mutation_marker"' \
+    '    exit 64' \
+    '    ;;' \
+    '  *) exit 2 ;;' \
+    'esac' \
+    >"$runtime_git_path"
+  chmod 0755 "$runtime_git_path"
+}
+
+seed_runtime_bytes() {
+  runtime_seed_root=$1
+  runtime_seed_home=$2
+  runtime_seed_state=$3
+  printf '%s\n' 'seeded HOME bytes' >"$runtime_seed_home/sentinel"
+  printf '%s\n' 'seeded state bytes' >"$runtime_seed_state/sentinel"
+  cp "$runtime_seed_home/sentinel" "$runtime_seed_root/home.expected"
+  cp "$runtime_seed_state/sentinel" "$runtime_seed_root/state.expected"
+}
+
+runtime_seed_bytes_are_preserved() {
+  runtime_seed_root=$1
+  runtime_seed_home=$2
+  runtime_seed_state=$3
+  cmp -s "$runtime_seed_root/home.expected" "$runtime_seed_home/sentinel" \
+    && cmp -s "$runtime_seed_root/state.expected" "$runtime_seed_state/sentinel"
+}
+
+runtime_probe_residue_is_absent() {
+  runtime_probe_tmp=$1
+  ! find "$runtime_probe_tmp" -mindepth 1 -maxdepth 1 \
+    -name 'dotfiles-bootstrap.*' -print -quit | grep -q .
+}
+
+run_debian_runtime_apply_case() {
+  runtime_apply_name=$1
+  runtime_apply_kind=$2
+  runtime_apply_root=$test_tmp/runtime-apply-$runtime_apply_name
+  runtime_apply_bin=$runtime_apply_root/bin
+  runtime_apply_home=$runtime_apply_root/home
+  runtime_apply_state=$runtime_apply_root/state
+  runtime_apply_tmp=$runtime_apply_root/tmp
+  runtime_apply_output_path=$runtime_apply_root/output
+  runtime_apply_command_log=$runtime_apply_root/commands
+  runtime_apply_capability_log=$runtime_apply_root/capability.args
+  runtime_apply_tracking_marker=$runtime_apply_root/package-tracking.started
+  runtime_apply_harness=$runtime_apply_root/harness
+  runtime_apply_bootstrap=$runtime_apply_harness/bootstrap
+  mkdir -p \
+    "$runtime_apply_bin" \
+    "$runtime_apply_home" \
+    "$runtime_apply_state" \
+    "$runtime_apply_tmp" \
+    "$runtime_apply_harness"
+  cp -R "$dotfiles_dir/manifests" "$runtime_apply_harness/manifests"
+  make_package_tracking_audit_bootstrap \
+    "$bootstrap" "$runtime_apply_bootstrap"
+  seed_runtime_bytes \
+    "$runtime_apply_root" "$runtime_apply_home" "$runtime_apply_state"
+  printf '%s\n' runtime-command-baseline >"$runtime_apply_command_log"
+  printf '%s\n' runtime-capability-baseline \
+    >"$runtime_apply_capability_log"
+  make_failing_runtime_capability_command \
+    "$runtime_apply_kind" \
+    "$runtime_apply_bin/$runtime_apply_kind" \
+    "$runtime_apply_capability_log" \
+    "$(case "$runtime_apply_kind" in
+      setsid) printf '%s\n' "$test_real_setsid" ;;
+      env) printf '%s\n' "$test_real_env" ;;
+    esac)"
+
+  run_capture "$runtime_apply_output_path" "$test_real_env" \
+    PATH="$runtime_apply_bin:/usr/bin:/bin" \
+    TMPDIR="$runtime_apply_tmp" \
+    HOME="$runtime_apply_home" \
+    XDG_STATE_HOME="$runtime_apply_state" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+    DOTFILES_BOOTSTRAP_TEST_ARCH=x86_64 \
+    DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+    DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS= \
+    DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+    DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+    DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$runtime_apply_command_log" \
+    DOTFILES_BOOTSTRAP_TEST_PACKAGE_TRACKING_MARKER="$runtime_apply_tracking_marker" \
+    "$runtime_apply_bootstrap" --apply
+  runtime_apply_status=$run_status
+  runtime_apply_output=$(cat "$runtime_apply_output_path" 2>/dev/null || true)
+  runtime_apply_commands=$(cat "$runtime_apply_command_log" 2>/dev/null || true)
+  runtime_apply_capability_args=$(
+    cat "$runtime_apply_capability_log" 2>/dev/null || true
+  )
+  runtime_apply_residue=false
+  runtime_probe_residue_is_absent "$runtime_apply_tmp" \
+    && runtime_apply_residue=true
+  runtime_apply_tracking_started=false
+  [ ! -e "$runtime_apply_tracking_marker" ] \
+    || runtime_apply_tracking_started=true
+  runtime_apply_seed_preserved=false
+  runtime_seed_bytes_are_preserved \
+    "$runtime_apply_root" "$runtime_apply_home" "$runtime_apply_state" \
+    && runtime_apply_seed_preserved=true
+}
+
+run_debian_runtime_boundary_case() {
+  runtime_boundary_name=$1
+  runtime_boundary_kind=$2
+  runtime_boundary=$3
+  runtime_boundary_root=$test_tmp/runtime-boundary-$runtime_boundary_name
+  runtime_boundary_bin=$runtime_boundary_root/bin
+  runtime_boundary_home=$runtime_boundary_root/home
+  runtime_boundary_state=$runtime_boundary_root/state
+  runtime_boundary_tmp=$runtime_boundary_root/tmp
+  runtime_boundary_output_path=$runtime_boundary_root/output
+  runtime_boundary_command_log=$runtime_boundary_root/commands
+  runtime_boundary_git_log=$runtime_boundary_root/git.args
+  runtime_boundary_git_mutation_marker=$runtime_boundary_root/git.mutation
+  runtime_boundary_capability_log=$runtime_boundary_root/capability.args
+  runtime_boundary_tracking_marker=$runtime_boundary_root/package-tracking.started
+  runtime_boundary_bootstrap=$runtime_boundary_root/bootstrap
+  mkdir -p \
+    "$runtime_boundary_bin" \
+    "$runtime_boundary_home" \
+    "$runtime_boundary_state" \
+    "$runtime_boundary_tmp"
+  make_package_tracking_audit_bootstrap \
+    "$bootstrap" "$runtime_boundary_bootstrap"
+  seed_runtime_bytes \
+    "$runtime_boundary_root" "$runtime_boundary_home" "$runtime_boundary_state"
+  printf '%s\n' runtime-command-baseline >"$runtime_boundary_command_log"
+  printf '%s\n' runtime-git-baseline >"$runtime_boundary_git_log"
+  printf '%s\n' runtime-capability-baseline \
+    >"$runtime_boundary_capability_log"
+  make_failing_runtime_capability_command \
+    "$runtime_boundary_kind" \
+    "$runtime_boundary_bin/$runtime_boundary_kind" \
+    "$runtime_boundary_capability_log" \
+    "$(case "$runtime_boundary_kind" in
+      setsid) printf '%s\n' "$test_real_setsid" ;;
+      env) printf '%s\n' "$test_real_env" ;;
+    esac)"
+  case "$runtime_boundary" in
+    standalone) runtime_boundary_git_mode=missing ;;
+    remote) runtime_boundary_git_mode=present ;;
+    *) return 1 ;;
+  esac
+  make_runtime_git_command \
+    "$runtime_boundary_bin/git" \
+    "$runtime_boundary_git_log" \
+    "$runtime_boundary_git_mutation_marker" \
+    "$runtime_boundary_git_mode" \
+    "$test_real_git"
+
+  case "$runtime_boundary" in
+    standalone)
+      run_capture "$runtime_boundary_output_path" "$test_real_env" \
+        PATH="$runtime_boundary_bin:/usr/bin:/bin" \
+        TMPDIR="$runtime_boundary_tmp" \
+        HOME="$runtime_boundary_home" \
+        XDG_STATE_HOME="$runtime_boundary_state" \
+        DOTFILES_BOOTSTRAP_TESTING=1 \
+        DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+        DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+        DOTFILES_BOOTSTRAP_TEST_ARCH=x86_64 \
+        DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+        DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS= \
+        DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+        DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$runtime_boundary_command_log" \
+        DOTFILES_BOOTSTRAP_TEST_PACKAGE_TRACKING_MARKER="$runtime_boundary_tracking_marker" \
+        /bin/sh "$runtime_boundary_bootstrap" --apply
+      ;;
+    remote)
+      run_capture "$runtime_boundary_output_path" "$test_real_env" \
+        PATH="$runtime_boundary_bin:/usr/bin:/bin" \
+        TMPDIR="$runtime_boundary_tmp" \
+        HOME="$runtime_boundary_home" \
+        XDG_STATE_HOME="$runtime_boundary_state" \
+        DOTFILES_BOOTSTRAP_TESTING=1 \
+        DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+        DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
+        DOTFILES_BOOTSTRAP_TEST_ARCH=x86_64 \
+        DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+        DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS= \
+        DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=1 \
+        DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$runtime_boundary_command_log" \
+        DOTFILES_BOOTSTRAP_TEST_PACKAGE_TRACKING_MARKER="$runtime_boundary_tracking_marker" \
+        /bin/sh "$runtime_boundary_bootstrap" \
+        --repo https://example.invalid/dotfiles.git --ref main
+      ;;
+  esac
+  runtime_boundary_status=$run_status
+  runtime_boundary_output=$(
+    cat "$runtime_boundary_output_path" 2>/dev/null || true
+  )
+  runtime_boundary_commands=$(
+    cat "$runtime_boundary_command_log" 2>/dev/null || true
+  )
+  runtime_boundary_capability_args=$(
+    cat "$runtime_boundary_capability_log" 2>/dev/null || true
+  )
+  runtime_boundary_git_mutated=false
+  [ ! -e "$runtime_boundary_git_mutation_marker" ] \
+    || runtime_boundary_git_mutated=true
+  runtime_boundary_residue=false
+  runtime_probe_residue_is_absent "$runtime_boundary_tmp" \
+    && runtime_boundary_residue=true
+  runtime_boundary_tracking_started=false
+  [ ! -e "$runtime_boundary_tracking_marker" ] \
+    || runtime_boundary_tracking_started=true
+  runtime_boundary_seed_preserved=false
+  runtime_seed_bytes_are_preserved \
+    "$runtime_boundary_root" "$runtime_boundary_home" "$runtime_boundary_state" \
+    && runtime_boundary_seed_preserved=true
+}
+
+wait_for_probe_record() {
+  probe_record_tmp=$1
+  probe_record_name=$2
+  probe_record_owner=${3:-}
+  probe_record_attempt=0
+  observed_probe_record=
+  while [ "$probe_record_attempt" -lt 80 ]; do
+    observed_probe_record=$(
+      find "$probe_record_tmp" -mindepth 2 -maxdepth 2 \
+        -path "*/dotfiles-bootstrap.*/$probe_record_name" \
+        -print -quit 2>/dev/null || true
+    )
+    [ -z "$observed_probe_record" ] || return 0
+    if [ -n "$probe_record_owner" ]; then
+      probe_record_owner_state=$(
+        ps -p "$probe_record_owner" -o state= 2>/dev/null \
+          | awk 'NR == 1 { print $1 }'
+      )
+      case "$probe_record_owner_state" in
+        ''|Z) return 1 ;;
+      esac
+    fi
+    sleep 0.05
+    probe_record_attempt=$((probe_record_attempt + 1))
+  done
+  return 1
+}
+
+probe_process_state_and_ticks() {
+  observed_probe_pid=$1
+  [ -r "/proc/$observed_probe_pid/stat" ] || return 1
+  awk '{ print $3 "|" ($14 + $15) }' "/proc/$observed_probe_pid/stat"
+}
+
+probe_group_member_count() {
+  observed_probe_group=$1
+  ps -e -o pid= -o pgid= 2>/dev/null | awk \
+    -v group_id="$observed_probe_group" '
+      $1 ~ /^[0-9]+$/ && $2 == group_id { members += 1 }
+      END { print members + 0 }
+    '
+}
+
+probe_group_identity_snapshot() {
+  observed_probe_group=$1
+  ps -e \
+    -o pid= \
+    -o ppid= \
+    -o pgid= \
+    -o sid= \
+    -o state= \
+    2>/dev/null | awk -v group_id="$observed_probe_group" '
+      $1 ~ /^[0-9]+$/ && $3 == group_id {
+        print $1 "|" $2 "|" $3 "|" $4 "|" $5
+      }
+    '
+}
+
+probe_child_count() {
+  observed_probe_parent=$1
+  ps -e -o pid= -o ppid= 2>/dev/null | awk \
+    -v parent_id="$observed_probe_parent" '
+      $1 ~ /^[0-9]+$/ && $2 == parent_id { children += 1 }
+      END { print children + 0 }
+    '
+}
+
+test_pid_is_safe() {
+  case $1 in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$1" -gt 1 ]
+}
+
+test_process_id_field_is_valid() {
+  case $1 in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$1" -ge 1 ]
+}
+
+capture_test_process() {
+  captured_process_pid=$1
+  captured_process_match=$2
+  captured_process_expected_parent=${3:-}
+  test_pid_is_safe "$captured_process_pid" || return 1
+  captured_process_line=$(
+    ps -p "$captured_process_pid" \
+      -o pid= -o ppid= -o pgid= -o sid= -o command= 2>/dev/null \
+      | awk 'NR == 1 { print; exit }'
+  )
+  [ -n "$captured_process_line" ] || return 1
+  captured_process_command=
+  IFS=' ' read -r \
+    captured_process_observed_pid \
+    captured_process_parent \
+    captured_process_group \
+    captured_process_session \
+    captured_process_command <<CAPTURED_PROCESS
+$captured_process_line
+CAPTURED_PROCESS
+  test_pid_is_safe "$captured_process_observed_pid" || return 1
+  test_pid_is_safe "$captured_process_parent" || return 1
+  test_process_id_field_is_valid "$captured_process_group" || return 1
+  test_process_id_field_is_valid "$captured_process_session" || return 1
+  [ "$captured_process_observed_pid" = "$captured_process_pid" ] \
+    || return 1
+  if [ -n "$captured_process_expected_parent" ]; then
+    [ "$captured_process_parent" = "$captured_process_expected_parent" ] \
+      || return 1
+  fi
+  case $captured_process_command in
+    *"$captured_process_match"*) ;;
+    *) return 1 ;;
+  esac
+  captured_process_identity=$captured_process_observed_pid\|$captured_process_parent\|$captured_process_group\|$captured_process_session
+}
+
+capture_test_process_bounded() {
+  bounded_capture_pid=$1
+  bounded_capture_match=$2
+  bounded_capture_parent=${3:-}
+  bounded_capture_attempt=0
+  while [ "$bounded_capture_attempt" -lt 80 ]; do
+    if capture_test_process \
+      "$bounded_capture_pid" "$bounded_capture_match" "$bounded_capture_parent"; then
+      bounded_capture_identity=$captured_process_identity
+      bounded_capture_command=$captured_process_command
+      sleep 0.05
+      if capture_test_process \
+        "$bounded_capture_pid" "$bounded_capture_match" "$bounded_capture_parent" \
+        && [ "$captured_process_identity" = "$bounded_capture_identity" ] \
+        && [ "$captured_process_command" = "$bounded_capture_command" ]; then
+        return 0
+      fi
+    fi
+    sleep 0.05
+    bounded_capture_attempt=$((bounded_capture_attempt + 1))
+  done
+  return 1
+}
+
+test_process_identity_matches() {
+  matching_identity_pid=$1
+  matching_identity_expected=$2
+  matching_identity_command=$3
+  test_pid_is_safe "$matching_identity_pid" || return 1
+  [ -n "$matching_identity_expected" ] || return 1
+  matching_identity_line=$(
+    ps -p "$matching_identity_pid" \
+      -o pid= -o ppid= -o pgid= -o sid= -o command= 2>/dev/null \
+      | awk 'NR == 1 { print; exit }'
+  )
+  [ -n "$matching_identity_line" ] || return 1
+  matching_identity_observed_command=
+  IFS=' ' read -r \
+    matching_identity_observed_pid \
+    matching_identity_parent \
+    matching_identity_group \
+    matching_identity_session \
+    matching_identity_observed_command <<MATCHING_IDENTITY
+$matching_identity_line
+MATCHING_IDENTITY
+  matching_identity_observed=$matching_identity_observed_pid\|$matching_identity_parent\|$matching_identity_group\|$matching_identity_session
+  [ "$matching_identity_observed" = "$matching_identity_expected" ] \
+    && [ "$matching_identity_observed_command" = "$matching_identity_command" ]
+}
+
+signal_verified_test_process() {
+  verified_signal_name=$1
+  verified_signal_pid=$2
+  verified_signal_identity=$3
+  verified_signal_command=$4
+  case $verified_signal_name in
+    CONT|TERM|KILL) ;;
+    *) return 1 ;;
+  esac
+  test_pid_is_safe "$verified_signal_pid" || return 1
+  test_process_identity_matches \
+    "$verified_signal_pid" \
+    "$verified_signal_identity" \
+    "$verified_signal_command" \
+    || return 1
+  kill -"$verified_signal_name" "$verified_signal_pid"
+}
+
+test_process_identity_has_state() {
+  identity_state_pid=$1
+  identity_state_expected=$2
+  identity_state_value=$3
+  test_pid_is_safe "$identity_state_pid" || return 1
+  identity_state_line=$(
+    ps -p "$identity_state_pid" \
+      -o pid= -o ppid= -o pgid= -o sid= -o state= 2>/dev/null \
+      | awk 'NR == 1 { print; exit }'
+  )
+  [ -n "$identity_state_line" ] || return 1
+  identity_state_observed_state=
+  IFS=' ' read -r \
+    identity_state_observed_pid \
+    identity_state_parent \
+    identity_state_group \
+    identity_state_session \
+    identity_state_observed_state <<IDENTITY_STATE
+$identity_state_line
+IDENTITY_STATE
+  identity_state_observed=$identity_state_observed_pid\|$identity_state_parent\|$identity_state_group\|$identity_state_session
+  [ "$identity_state_observed" = "$identity_state_expected" ] \
+    && [ "$identity_state_observed_state" = "$identity_state_value" ]
+}
+
+wait_for_test_process_exit() {
+  observed_process_pid=$1
+  observed_process_identity=$2
+  observed_process_command=$3
+  observed_process_attempt=0
+  while [ "$observed_process_attempt" -lt 80 ]; do
+    observed_process_state=$(ps -p "$observed_process_pid" -o state= 2>/dev/null \
+      | awk 'NR == 1 { print $1 }')
+    case "$observed_process_state" in
+      ''|Z) return 0 ;;
+    esac
+    if [ -n "$observed_process_identity" ] \
+      && [ -n "$observed_process_command" ] \
+      && ! test_process_identity_matches \
+        "$observed_process_pid" \
+        "$observed_process_identity" \
+        "$observed_process_command"; then
+      return 0
+    fi
+    sleep 0.05
+    observed_process_attempt=$((observed_process_attempt + 1))
+  done
+  return 1
+}
+
+wait_for_test_process_state() {
+  observed_process_pid=$1
+  observed_process_identity=$2
+  expected_process_state=$3
+  observed_process_attempt=0
+  while [ "$observed_process_attempt" -lt 80 ]; do
+    test_process_identity_has_state \
+      "$observed_process_pid" \
+      "$observed_process_identity" \
+      "$expected_process_state" \
+      && return 0
+    sleep 0.05
+    observed_process_attempt=$((observed_process_attempt + 1))
+  done
+  return 1
+}
+
+probe_fd_access_mode() {
+  probe_fd_pid=$1
+  probe_fd_number=$2
+  test_pid_is_safe "$probe_fd_pid" || return 1
+  case $probe_fd_number in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  awk '
+    $1 == "flags:" && $2 ~ /^[0-7]+$/ {
+      print substr($2, length($2), 1)
+      found = 1
+      exit
+    }
+    END { if (!found) exit 1 }
+  ' "/proc/$probe_fd_pid/fdinfo/$probe_fd_number"
+}
+
+private_probe_process_ids() {
+  private_probe_path=$1
+  ps -e -o pid= -o command= 2>/dev/null \
+    | while IFS=' ' read -r private_probe_list_pid private_probe_list_command; do
+        case $private_probe_list_command in
+          *"$private_probe_path"*)
+            printf '%s\n' "$private_probe_list_pid"
+            ;;
+        esac
+      done
+}
+
+private_probe_processes_are_absent() {
+  [ -z "$(private_probe_process_ids "$1")" ]
+}
+
+kill_private_probe_processes() {
+  private_probe_path=$1
+  private_probe_cleanup_attempt=0
+  while [ "$private_probe_cleanup_attempt" -lt 40 ]; do
+    private_probe_pids=$(private_probe_process_ids "$private_probe_path")
+    [ -n "$private_probe_pids" ] || return 0
+    for private_probe_pid in $private_probe_pids; do
+      if test_pid_is_safe "$private_probe_pid" \
+        && capture_test_process "$private_probe_pid" "$private_probe_path"; then
+        private_probe_identity=$captured_process_identity
+        private_probe_command=$captured_process_command
+        signal_verified_test_process \
+          CONT "$private_probe_pid" \
+          "$private_probe_identity" "$private_probe_command" \
+          >/dev/null 2>&1 || true
+        signal_verified_test_process \
+          KILL "$private_probe_pid" \
+          "$private_probe_identity" "$private_probe_command" \
+          >/dev/null 2>&1 || true
+      fi
+    done
+    sleep 0.05
+    private_probe_cleanup_attempt=$((private_probe_cleanup_attempt + 1))
+  done
+  private_probe_processes_are_absent "$private_probe_path"
+}
+
+finish_async_probe_case() {
+  async_probe_owner=$1
+  async_probe_owner_identity=$2
+  async_probe_owner_command=$3
+  async_probe_anchor=$4
+  async_probe_anchor_identity=$5
+  async_probe_anchor_command=$6
+  async_probe_waiter=$7
+  async_probe_waiter_identity=$8
+  async_probe_waiter_command=$9
+  async_probe_private_root=${10}
+  async_probe_owner_match=${11}
+  async_probe_was_forced=false
+  async_probe_reaped=false
+  async_probe_status=125
+  if { [ -z "$async_probe_owner_identity" ] \
+    || [ -z "$async_probe_owner_command" ]; } \
+    && capture_test_process_bounded \
+      "$async_probe_owner" "$async_probe_owner_match" "$$"; then
+    async_probe_owner_identity=$captured_process_identity
+    async_probe_owner_command=$captured_process_command
+  fi
+  if ! wait_for_test_process_exit \
+    "$async_probe_owner" \
+    "$async_probe_owner_identity" \
+    "$async_probe_owner_command"; then
+    async_probe_was_forced=true
+    signal_verified_test_process \
+      CONT "$async_probe_anchor" \
+      "$async_probe_anchor_identity" "$async_probe_anchor_command" \
+      >/dev/null 2>&1 || true
+    signal_verified_test_process \
+      CONT "$async_probe_owner" \
+      "$async_probe_owner_identity" "$async_probe_owner_command" \
+      >/dev/null 2>&1 || true
+    signal_verified_test_process \
+      TERM "$async_probe_owner" \
+      "$async_probe_owner_identity" "$async_probe_owner_command" \
+      >/dev/null 2>&1 || true
+  fi
+  if ! wait_for_test_process_exit \
+    "$async_probe_owner" \
+    "$async_probe_owner_identity" \
+    "$async_probe_owner_command"; then
+    async_probe_was_forced=true
+    signal_verified_test_process \
+      CONT "$async_probe_anchor" \
+      "$async_probe_anchor_identity" "$async_probe_anchor_command" \
+      >/dev/null 2>&1 || true
+    signal_verified_test_process \
+      KILL "$async_probe_anchor" \
+      "$async_probe_anchor_identity" "$async_probe_anchor_command" \
+      >/dev/null 2>&1 || true
+    signal_verified_test_process \
+      CONT "$async_probe_waiter" \
+      "$async_probe_waiter_identity" "$async_probe_waiter_command" \
+      >/dev/null 2>&1 || true
+    signal_verified_test_process \
+      KILL "$async_probe_waiter" \
+      "$async_probe_waiter_identity" "$async_probe_waiter_command" \
+      >/dev/null 2>&1 || true
+    signal_verified_test_process \
+      KILL "$async_probe_owner" \
+      "$async_probe_owner_identity" "$async_probe_owner_command" \
+      >/dev/null 2>&1 || true
+    kill_private_probe_processes "$async_probe_private_root"
+  fi
+  if wait_for_test_process_exit \
+    "$async_probe_owner" \
+    "$async_probe_owner_identity" \
+    "$async_probe_owner_command" \
+    && {
+      async_probe_terminal_state=$(
+        ps -p "$async_probe_owner" -o state= 2>/dev/null \
+          | awk 'NR == 1 { print $1 }'
+      )
+      case $async_probe_terminal_state in
+        ''|Z) true ;;
+        *) false ;;
+      esac
+    }; then
+    set +e
+    wait "$async_probe_owner" >/dev/null 2>&1
+    async_probe_status=$?
+    set -e
+    async_probe_reaped=true
+  fi
+  if test_process_identity_matches \
+    "$async_probe_anchor" \
+    "$async_probe_anchor_identity" \
+    "$async_probe_anchor_command"; then
+    async_probe_was_forced=true
+    signal_verified_test_process \
+      CONT "$async_probe_anchor" \
+      "$async_probe_anchor_identity" "$async_probe_anchor_command" \
+      >/dev/null 2>&1 || true
+    signal_verified_test_process \
+      KILL "$async_probe_anchor" \
+      "$async_probe_anchor_identity" "$async_probe_anchor_command" \
+      >/dev/null 2>&1 || true
+  fi
+  if test_process_identity_matches \
+    "$async_probe_waiter" \
+    "$async_probe_waiter_identity" \
+    "$async_probe_waiter_command"; then
+    async_probe_was_forced=true
+    signal_verified_test_process \
+      CONT "$async_probe_waiter" \
+      "$async_probe_waiter_identity" "$async_probe_waiter_command" \
+      >/dev/null 2>&1 || true
+    signal_verified_test_process \
+      KILL "$async_probe_waiter" \
+      "$async_probe_waiter_identity" "$async_probe_waiter_command" \
+      >/dev/null 2>&1 || true
+  fi
+  if ! private_probe_processes_are_absent "$async_probe_private_root"; then
+    async_probe_was_forced=true
+    kill_private_probe_processes "$async_probe_private_root"
   fi
 }
 
@@ -1795,7 +2721,16 @@ retained_language_server_actions_are_present() {
   done
 }
 
-test_tmp=$(mktemp -d "${TMPDIR:-/tmp}/dotfiles-bootstrap-test.XXXXXX")
+test_real_env=$(resolve_test_executable env) \
+  || { printf '%s\n' 'test harness requires an absolute executable env' >&2; exit 1; }
+test_real_setsid=$(resolve_test_executable setsid) \
+  || { printf '%s\n' 'test harness requires an absolute executable setsid' >&2; exit 1; }
+test_real_git=$(resolve_test_executable git) \
+  || { printf '%s\n' 'test harness requires an absolute executable git' >&2; exit 1; }
+test_real_mktemp=$(resolve_test_executable mktemp) \
+  || { printf '%s\n' 'test harness requires an absolute executable mktemp' >&2; exit 1; }
+
+test_tmp=$("$test_real_mktemp" -d "${TMPDIR:-/tmp}/dotfiles-bootstrap-test.XXXXXX")
 cleanup() {
   case "$test_tmp" in
     "${TMPDIR:-/tmp}"/dotfiles-bootstrap-test.*) rm -rf "$test_tmp" ;;
@@ -2581,37 +3516,721 @@ else
   fail 'Taplo requires a stable version floor and bounded LSP capability'
 fi
 
-setsid_contract_root=$test_tmp/setsid-contract
-setsid_contract_bin=$setsid_contract_root/bin
-setsid_contract_log=$setsid_contract_root/setsid.args
-setsid_contract_marker=$setsid_contract_root/target-started
-setsid_contract_command=$setsid_contract_bin/probe-target
-mkdir -p "$setsid_contract_bin"
-make_probe_tree_command \
-  "$setsid_contract_command" marker-success \
-  "$setsid_contract_root/target.pid" \
-  "$setsid_contract_root/child.pid" \
-  "$setsid_contract_marker"
-# shellcheck disable=SC2016 # The generated fixture expands its arguments at runtime.
-printf '%s\n' \
-  '#!/bin/sh' \
-  'printf "%s|%s\n" "${1:-}" "${2:-}" >"$DOTFILES_BOOTSTRAP_TEST_SETSID_LOG"' \
-  'exit 64' \
-  >"$setsid_contract_bin/setsid"
-chmod 0755 "$setsid_contract_bin/setsid"
-run_direct_probe_case setsid-contract "$setsid_contract_command" \
-  "$direct_probe_bootstrap" \
-  PATH="$setsid_contract_bin:/usr/bin:/bin" \
-  DOTFILES_BOOTSTRAP_TEST_SETSID_LOG="$setsid_contract_log"
-setsid_contract_pass=true
-[ "$run_status" -eq 42 ] || setsid_contract_pass=false
-[ "$(cat "$setsid_contract_log" 2>/dev/null || true)" = '-f|-w' ] \
-  || setsid_contract_pass=false
-[ ! -e "$setsid_contract_marker" ] || setsid_contract_pass=false
-if [ "$setsid_contract_pass" = true ]; then
-  pass 'Debian managed probes require util-linux setsid -f -w'
+for runtime_apply_kind in setsid env; do
+  run_debian_runtime_apply_case "$runtime_apply_kind" "$runtime_apply_kind"
+  runtime_apply_pass=true
+  runtime_apply_expected_args=$(
+    expected_runtime_capability_args "$runtime_apply_kind"
+  )
+  runtime_apply_expected_diagnostic=$(
+    runtime_capability_diagnostic "$runtime_apply_kind"
+  )
+  [ "$runtime_apply_status" -ne 0 ] || runtime_apply_pass=false
+  [ "$(printf '%s\n' "$runtime_apply_output" \
+    | grep -Fxc "$runtime_apply_expected_diagnostic" || true)" -eq 1 ] \
+    || runtime_apply_pass=false
+  [ "$runtime_apply_capability_args" = "$runtime_apply_expected_args" ] \
+    || runtime_apply_pass=false
+  [ "$runtime_apply_commands" = runtime-command-baseline ] \
+    || runtime_apply_pass=false
+  [ "$runtime_apply_tracking_started" = false ] \
+    || runtime_apply_pass=false
+  [ "$runtime_apply_seed_preserved" = true ] \
+    || runtime_apply_pass=false
+  [ ! -e "$runtime_apply_home/.local" ] || runtime_apply_pass=false
+  [ "$runtime_apply_residue" = true ] || runtime_apply_pass=false
+  case "$runtime_apply_kind" in
+    setsid)
+      setsid_contract_root=$test_tmp/setsid-contract
+      setsid_contract_bin=$setsid_contract_root/bin
+      setsid_contract_log=$setsid_contract_root/setsid.args
+      setsid_contract_marker=$setsid_contract_root/target-started
+      setsid_contract_command=$setsid_contract_root/probe-target
+      mkdir -p "$setsid_contract_bin"
+      : >"$setsid_contract_log"
+      make_probe_tree_command \
+        "$setsid_contract_command" marker-success \
+        "$setsid_contract_root/target.pid" \
+        "$setsid_contract_root/child.pid" \
+        "$setsid_contract_marker"
+      make_direct_runtime_command \
+        setsid "$setsid_contract_bin/setsid" \
+        "$setsid_contract_log" "$test_real_setsid" reject-launch
+      make_direct_runtime_command \
+        env "$setsid_contract_bin/env" \
+        "$setsid_contract_root/env.args" "$test_real_env" delegate
+      run_direct_probe_case \
+        setsid-contract "$setsid_contract_command" \
+        "$direct_probe_bootstrap" \
+        PATH="$setsid_contract_bin:/usr/bin:/bin"
+      [ "$run_status" -eq 42 ] || runtime_apply_pass=false
+      grep -Fqx "capability|setsid|$setsid_contract_bin/setsid|-f|-w|/bin/sh|-c|exit 0" \
+        "$setsid_contract_log" 2>/dev/null \
+        || runtime_apply_pass=false
+      grep -Fq "launch|setsid|$setsid_contract_bin/setsid|-f|-w|" \
+        "$setsid_contract_log" 2>/dev/null \
+        || runtime_apply_pass=false
+      [ ! -e "$setsid_contract_marker" ] || runtime_apply_pass=false
+
+      stored_runtime_root=$test_tmp/stored-runtime-reuse
+      stored_runtime_bin=$stored_runtime_root/bin
+      stored_runtime_poison_bin=$stored_runtime_root/post-gate-bin
+      stored_runtime_log=$stored_runtime_root/runtime.args
+      stored_runtime_poison_log=$stored_runtime_root/post-gate.args
+      stored_runtime_audit=$stored_runtime_root/stored.paths
+      stored_runtime_marker=$stored_runtime_root/target-started
+      stored_runtime_command=$stored_runtime_root/probe-target
+      mkdir -p "$stored_runtime_bin" "$stored_runtime_poison_bin"
+      : >"$stored_runtime_log"
+      : >"$stored_runtime_poison_log"
+      make_probe_tree_command \
+        "$stored_runtime_command" marker-success \
+        "$stored_runtime_root/target.pid" \
+        "$stored_runtime_root/child.pid" \
+        "$stored_runtime_marker"
+      make_direct_runtime_command \
+        setsid "$stored_runtime_bin/setsid" \
+        "$stored_runtime_log" "$test_real_setsid" delegate
+      make_direct_runtime_command \
+        env "$stored_runtime_bin/env" \
+        "$stored_runtime_log" "$test_real_env" delegate
+      make_post_gate_poison_command \
+        "$stored_runtime_poison_bin/setsid" "$stored_runtime_poison_log"
+      make_post_gate_poison_command \
+        "$stored_runtime_poison_bin/env" "$stored_runtime_poison_log"
+      run_direct_probe_case \
+        stored-runtime-reuse "$stored_runtime_command" \
+        "$direct_probe_bootstrap" \
+        PATH="$stored_runtime_bin:/usr/bin:/bin" \
+        DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_RUNTIME_AUDIT="$stored_runtime_audit" \
+        DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_EXPECTED_SETSID="$stored_runtime_bin/setsid" \
+        DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_EXPECTED_ENV="$stored_runtime_bin/env" \
+        DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_POST_GATE_PATH="$stored_runtime_poison_bin:/usr/bin:/bin"
+      stored_runtime_expected_paths=$(printf '%s\n' \
+        "setsid|$stored_runtime_bin/setsid" \
+        "env|$stored_runtime_bin/env")
+      [ "$run_status" -eq 0 ] || runtime_apply_pass=false
+      [ "$(cat "$stored_runtime_audit" 2>/dev/null || true)" \
+        = "$stored_runtime_expected_paths" ] \
+        || runtime_apply_pass=false
+      stored_runtime_selected_setsid=$(
+        sed -n 's/^setsid|//p' "$stored_runtime_audit" 2>/dev/null
+      )
+      stored_runtime_selected_env=$(
+        sed -n 's/^env|//p' "$stored_runtime_audit" 2>/dev/null
+      )
+      case $stored_runtime_selected_setsid in
+        /*) [ -x "$stored_runtime_selected_setsid" ] \
+          || runtime_apply_pass=false ;;
+        *) runtime_apply_pass=false ;;
+      esac
+      case $stored_runtime_selected_env in
+        /*) [ -x "$stored_runtime_selected_env" ] \
+          || runtime_apply_pass=false ;;
+        *) runtime_apply_pass=false ;;
+      esac
+      stored_runtime_setsid_launch=launch\|setsid\|$stored_runtime_selected_setsid\|-f\|-w\|
+      stored_runtime_env_launch=launch\|env\|$stored_runtime_selected_env\|--default-signal=HUP,INT,TERM\|
+      [ "$(grep -Fc "$stored_runtime_setsid_launch" \
+        "$stored_runtime_log" 2>/dev/null || true)" -eq 1 ] \
+        || runtime_apply_pass=false
+      [ "$(grep -Fc "$stored_runtime_env_launch" \
+        "$stored_runtime_log" 2>/dev/null || true)" -eq 1 ] \
+        || runtime_apply_pass=false
+      [ -e "$stored_runtime_marker" ] || runtime_apply_pass=false
+      [ ! -s "$stored_runtime_poison_log" ] || runtime_apply_pass=false
+      runtime_probe_residue_is_absent "$direct_probe_tmp" \
+        || runtime_apply_pass=false
+      runtime_apply_label='Debian apply preflights util-linux setsid before every mutation'
+      ;;
+    env)
+      runtime_apply_label='Debian apply preflights GNU env before every mutation'
+      ;;
+  esac
+  if [ "$runtime_apply_pass" = true ]; then
+    pass "$runtime_apply_label"
+  else
+    fail "$runtime_apply_label"
+  fi
+done
+
+runtime_boundary_pass=true
+for runtime_boundary_kind in setsid env; do
+  runtime_boundary_expected_args=$(
+    expected_runtime_capability_args "$runtime_boundary_kind"
+  )
+  runtime_boundary_expected_diagnostic=$(
+    runtime_capability_diagnostic "$runtime_boundary_kind"
+  )
+  for runtime_boundary_case in standalone remote; do
+    run_debian_runtime_boundary_case \
+      "$runtime_boundary_kind-$runtime_boundary_case" \
+      "$runtime_boundary_kind" \
+      "$runtime_boundary_case"
+    [ "$runtime_boundary_status" -ne 0 ] \
+      || runtime_boundary_pass=false
+    [ "$(printf '%s\n' "$runtime_boundary_output" \
+      | grep -Fxc "$runtime_boundary_expected_diagnostic" || true)" -eq 1 ] \
+      || runtime_boundary_pass=false
+    [ "$runtime_boundary_capability_args" \
+      = "$runtime_boundary_expected_args" ] \
+      || runtime_boundary_pass=false
+    [ "$runtime_boundary_commands" = runtime-command-baseline ] \
+      || runtime_boundary_pass=false
+    [ "$runtime_boundary_tracking_started" = false ] \
+      || runtime_boundary_pass=false
+    [ "$runtime_boundary_git_mutated" = false ] \
+      || runtime_boundary_pass=false
+    [ "$runtime_boundary_seed_preserved" = true ] \
+      || runtime_boundary_pass=false
+    [ ! -e "$runtime_boundary_home/.local" ] \
+      || runtime_boundary_pass=false
+    [ "$runtime_boundary_residue" = true ] \
+      || runtime_boundary_pass=false
+  done
+done
+if [ "$runtime_boundary_pass" = true ]; then
+  pass 'Debian runtime preflight guards standalone and remote Git mutation'
 else
-  fail 'Debian managed probes require util-linux setsid -f -w'
+  fail 'Debian runtime preflight guards standalone and remote Git mutation'
+fi
+
+probe_idle_root=$test_tmp/probe-idle-release-wait
+probe_idle_tmp=$probe_idle_root/tmp
+probe_idle_home=$probe_idle_root/home
+probe_idle_state=$probe_idle_root/state
+probe_idle_output=$probe_idle_root/output
+probe_idle_command=$probe_idle_root/probe-target
+probe_idle_marker=$probe_idle_root/target-started
+probe_idle_hold_ready=$probe_idle_root/parent-hold.ready
+probe_idle_hold_release=$probe_idle_root/parent-hold.release
+probe_idle_hold_failed=$probe_idle_root/parent-hold.failed
+probe_idle_bootstrap=$probe_idle_root/direct-probe-bootstrap
+mkdir -p "$probe_idle_tmp" "$probe_idle_home" "$probe_idle_state"
+make_probe_tree_command \
+  "$probe_idle_command" marker-success \
+  "$probe_idle_root/target.pid" \
+  "$probe_idle_root/child.pid" \
+  "$probe_idle_marker"
+make_probe_parent_hold_bootstrap \
+  "$direct_probe_bootstrap" "$probe_idle_bootstrap"
+"$test_real_env" \
+  TMPDIR="$probe_idle_tmp" \
+  HOME="$probe_idle_home" \
+  XDG_STATE_HOME="$probe_idle_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE=1 \
+  DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_COMMAND="$probe_idle_command" \
+  DOTFILES_BOOTSTRAP_TEST_PROBE_PARENT_HOLD=1 \
+  DOTFILES_BOOTSTRAP_TEST_PROBE_PARENT_HOLD_READY="$probe_idle_hold_ready" \
+  DOTFILES_BOOTSTRAP_TEST_PROBE_PARENT_HOLD_RELEASE="$probe_idle_hold_release" \
+  DOTFILES_BOOTSTRAP_TEST_PROBE_PARENT_HOLD_FAILED="$probe_idle_hold_failed" \
+  "$probe_idle_bootstrap" --apply \
+  >"$probe_idle_output" 2>&1 &
+probe_idle_owner=$!
+probe_idle_pass=true
+probe_idle_anchor=
+probe_idle_waiter=
+probe_idle_private_root=$probe_idle_root
+probe_idle_owner_identity=
+probe_idle_owner_command_line=
+probe_idle_anchor_identity=
+probe_idle_anchor_command_line=
+probe_idle_waiter_identity=
+probe_idle_waiter_command_line=
+if capture_test_process_bounded \
+  "$probe_idle_owner" "$probe_idle_bootstrap" "$$"; then
+  probe_idle_owner_identity=$captured_process_identity
+  probe_idle_owner_command_line=$captured_process_command
+else
+  probe_idle_pass=false
+fi
+probe_idle_hold_attempt=0
+while [ "$probe_idle_hold_attempt" -lt 80 ] \
+  && [ ! -e "$probe_idle_hold_ready" ]
+do
+  sleep 0.05
+  probe_idle_hold_attempt=$((probe_idle_hold_attempt + 1))
+done
+[ -e "$probe_idle_hold_ready" ] || probe_idle_pass=false
+if wait_for_probe_record \
+  "$probe_idle_tmp" anchor.ready "$probe_idle_owner"; then
+  probe_idle_private_root=$(dirname "$observed_probe_record")
+  probe_idle_anchor_record=$(
+    cat "$probe_idle_private_root/anchor.ready" 2>/dev/null || true
+  )
+  probe_idle_anchor=${probe_idle_anchor_record%%|*}
+  probe_idle_waiter=${probe_idle_anchor_record#*|}
+  test_pid_is_safe "$probe_idle_anchor" || probe_idle_pass=false
+  test_pid_is_safe "$probe_idle_waiter" || probe_idle_pass=false
+  if [ "$probe_idle_pass" = true ] \
+    && capture_test_process_bounded \
+      "$probe_idle_waiter" "$probe_idle_private_root" "$probe_idle_owner"; then
+    probe_idle_waiter_identity=$captured_process_identity
+    probe_idle_waiter_command_line=$captured_process_command
+  else
+    probe_idle_pass=false
+  fi
+  if [ "$probe_idle_pass" = true ] \
+    && capture_test_process_bounded \
+      "$probe_idle_anchor" "$probe_idle_private_root" "$probe_idle_waiter"; then
+    probe_idle_anchor_identity=$captured_process_identity
+    probe_idle_anchor_command_line=$captured_process_command
+    [ "$probe_idle_anchor_identity" \
+      = "$probe_idle_anchor|$probe_idle_waiter|$probe_idle_anchor|$probe_idle_anchor" ] \
+      || probe_idle_pass=false
+  else
+    probe_idle_pass=false
+  fi
+else
+  probe_idle_pass=false
+fi
+probe_idle_expected_snapshot=$probe_idle_anchor\|$probe_idle_waiter\|$probe_idle_anchor\|$probe_idle_anchor\|S
+probe_idle_snapshot_one=$(
+  probe_group_identity_snapshot "$probe_idle_anchor" 2>/dev/null || true
+)
+sleep 0.05
+probe_idle_snapshot_two=$(
+  probe_group_identity_snapshot "$probe_idle_anchor" 2>/dev/null || true
+)
+sleep 0.05
+probe_idle_snapshot_three=$(
+  probe_group_identity_snapshot "$probe_idle_anchor" 2>/dev/null || true
+)
+[ "$probe_idle_snapshot_one" = "$probe_idle_expected_snapshot" ] \
+  || probe_idle_pass=false
+[ "$probe_idle_snapshot_two" = "$probe_idle_expected_snapshot" ] \
+  || probe_idle_pass=false
+[ "$probe_idle_snapshot_three" = "$probe_idle_expected_snapshot" ] \
+  || probe_idle_pass=false
+: >"$probe_idle_hold_release"
+finish_async_probe_case \
+  "$probe_idle_owner" \
+  "$probe_idle_owner_identity" \
+  "$probe_idle_owner_command_line" \
+  "$probe_idle_anchor" \
+  "$probe_idle_anchor_identity" \
+  "$probe_idle_anchor_command_line" \
+  "$probe_idle_waiter" \
+  "$probe_idle_waiter_identity" \
+  "$probe_idle_waiter_command_line" \
+  "$probe_idle_private_root" \
+  "$probe_idle_bootstrap"
+[ "$async_probe_was_forced" = false ] || probe_idle_pass=false
+[ "$async_probe_reaped" = true ] || probe_idle_pass=false
+[ "$async_probe_status" -eq 0 ] || probe_idle_pass=false
+[ ! -e "$probe_idle_hold_failed" ] || probe_idle_pass=false
+runtime_probe_residue_is_absent "$probe_idle_tmp" \
+  || probe_idle_pass=false
+private_probe_processes_are_absent "$probe_idle_private_root" \
+  || {
+    probe_idle_pass=false
+    kill_private_probe_processes "$probe_idle_private_root"
+  }
+if [ "$probe_idle_pass" = true ]; then
+  pass 'probe supervisor release wait sleeps without a helper child'
+else
+  fail 'probe supervisor release wait sleeps without a helper child'
+fi
+
+probe_token_root=$test_tmp/probe-release-token-race
+probe_token_tmp=$probe_token_root/tmp
+probe_token_home=$probe_token_root/home
+probe_token_state=$probe_token_root/state
+probe_token_output=$probe_token_root/output
+probe_token_audit=$probe_token_root/audit
+probe_token_command=$probe_token_root/probe-target
+probe_token_marker=$probe_token_root/target-started
+mkdir -p "$probe_token_tmp" "$probe_token_home" "$probe_token_state"
+: >"$probe_token_audit"
+make_probe_tree_command \
+  "$probe_token_command" marker-success \
+  "$probe_token_root/target.pid" \
+  "$probe_token_root/child.pid" \
+  "$probe_token_marker"
+"$test_real_env" \
+  TMPDIR="$probe_token_tmp" \
+  HOME="$probe_token_home" \
+  XDG_STATE_HOME="$probe_token_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE=1 \
+  DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_COMMAND="$probe_token_command" \
+  DOTFILES_BOOTSTRAP_TEST_PROBE_AUDIT_FILE="$probe_token_audit" \
+  DOTFILES_BOOTSTRAP_TEST_PROBE_STOP_AFTER_RELEASE_READY=1 \
+  DOTFILES_BOOTSTRAP_TEST_PROBE_STOP_BETWEEN_WAITS=1 \
+  "$direct_probe_bootstrap" --apply \
+  >"$probe_token_output" 2>&1 &
+probe_token_owner=$!
+probe_token_pass=true
+probe_token_coordinated=true
+probe_token_anchor=
+probe_token_waiter=
+probe_token_private_root=$probe_token_root
+probe_token_owner_identity=
+probe_token_owner_command_line=
+probe_token_anchor_identity=
+probe_token_anchor_command_line=
+probe_token_waiter_identity=
+probe_token_waiter_command_line=
+probe_token_release_fifo=
+if capture_test_process_bounded \
+  "$probe_token_owner" "$direct_probe_bootstrap" "$$"; then
+  probe_token_owner_identity=$captured_process_identity
+  probe_token_owner_command_line=$captured_process_command
+else
+  probe_token_coordinated=false
+fi
+if wait_for_probe_record \
+  "$probe_token_tmp" release.ready "$probe_token_owner"; then
+  probe_token_private_root=$(dirname "$observed_probe_record")
+  probe_token_anchor_record=$(
+    cat "$probe_token_private_root/anchor.ready" 2>/dev/null || true
+  )
+  probe_token_anchor=${probe_token_anchor_record%%|*}
+  probe_token_waiter=${probe_token_anchor_record#*|}
+  test_pid_is_safe "$probe_token_anchor" \
+    || probe_token_coordinated=false
+  test_pid_is_safe "$probe_token_waiter" \
+    || probe_token_coordinated=false
+  if [ "$probe_token_coordinated" = true ] \
+    && capture_test_process_bounded \
+      "$probe_token_waiter" \
+      "$probe_token_private_root" \
+      "$probe_token_owner"; then
+    probe_token_waiter_identity=$captured_process_identity
+    probe_token_waiter_command_line=$captured_process_command
+  else
+    probe_token_coordinated=false
+  fi
+  if [ "$probe_token_coordinated" = true ] \
+    && capture_test_process_bounded \
+      "$probe_token_anchor" \
+      "$probe_token_private_root" \
+      "$probe_token_waiter"; then
+    probe_token_anchor_identity=$captured_process_identity
+    probe_token_anchor_command_line=$captured_process_command
+    [ "$probe_token_anchor_identity" \
+      = "$probe_token_anchor|$probe_token_waiter|$probe_token_anchor|$probe_token_anchor" ] \
+      || probe_token_coordinated=false
+  else
+    probe_token_coordinated=false
+  fi
+else
+  probe_token_coordinated=false
+fi
+if [ "$probe_token_coordinated" = true ] \
+  && ! wait_for_test_process_state \
+    "$probe_token_anchor" "$probe_token_anchor_identity" T; then
+  probe_token_coordinated=false
+fi
+[ "$probe_token_coordinated" = true ] || probe_token_pass=false
+if [ "$probe_token_coordinated" = true ]; then
+  probe_token_owner_fifo=$(
+    readlink "/proc/$probe_token_owner/fd/4" 2>/dev/null || true
+  )
+  probe_token_anchor_fifo=$(
+    readlink "/proc/$probe_token_anchor/fd/5" 2>/dev/null || true
+  )
+  probe_token_release_fifo=$probe_token_owner_fifo
+  [ -p "/proc/$probe_token_owner/fd/4" ] || probe_token_pass=false
+  [ -p "/proc/$probe_token_anchor/fd/5" ] || probe_token_pass=false
+  [ ! -e "/proc/$probe_token_anchor/fd/4" ] || probe_token_pass=false
+  case $probe_token_release_fifo in
+    /*) ;;
+    *) probe_token_pass=false ;;
+  esac
+  [ "$(dirname "$probe_token_release_fifo" 2>/dev/null || true)" \
+    = "$probe_token_private_root" ] \
+    || probe_token_pass=false
+  [ -p "$probe_token_release_fifo" ] || probe_token_pass=false
+  [ "/proc/$probe_token_owner/fd/4" -ef "$probe_token_release_fifo" ] \
+    || probe_token_pass=false
+  [ "/proc/$probe_token_anchor/fd/5" -ef "$probe_token_release_fifo" ] \
+    || probe_token_pass=false
+  [ "/proc/$probe_token_owner/fd/4" -ef "/proc/$probe_token_anchor/fd/5" ] \
+    || probe_token_pass=false
+  [ "$probe_token_owner_fifo" = "$probe_token_release_fifo" ] \
+    || probe_token_pass=false
+  [ "$probe_token_anchor_fifo" = "$probe_token_release_fifo" ] \
+    || probe_token_pass=false
+  [ "$(probe_fd_access_mode "$probe_token_owner" 4 2>/dev/null || true)" = 2 ] \
+    || probe_token_pass=false
+  [ "$(probe_fd_access_mode "$probe_token_anchor" 5 2>/dev/null || true)" = 0 ] \
+    || probe_token_pass=false
+  probe_token_private_fifos=$(
+    find "$probe_token_private_root" -mindepth 1 -maxdepth 1 \
+      -type p -print 2>/dev/null || true
+  )
+  [ "$probe_token_private_fifos" = "$probe_token_release_fifo" ] \
+    || probe_token_pass=false
+  [ "$(probe_group_member_count "$probe_token_anchor")" -eq 1 ] \
+    || probe_token_pass=false
+  [ "$(probe_child_count "$probe_token_anchor")" -eq 0 ] \
+    || probe_token_pass=false
+  probe_token_close_attempt=0
+  while [ "$probe_token_close_attempt" -lt 80 ] \
+    && [ -e "/proc/$probe_token_owner/fd/4" ]
+  do
+    sleep 0.05
+    probe_token_close_attempt=$((probe_token_close_attempt + 1))
+  done
+  [ ! -e "/proc/$probe_token_owner/fd/4" ] || probe_token_pass=false
+  signal_verified_test_process \
+    TERM "$probe_token_owner" \
+    "$probe_token_owner_identity" "$probe_token_owner_command_line" \
+    >/dev/null 2>&1 || probe_token_pass=false
+  probe_token_interrupt_attempt=0
+  while [ "$probe_token_interrupt_attempt" -lt 80 ] \
+    && ! grep -Eq '^wait-interrupted\|[0-9]+$' \
+      "$probe_token_audit" 2>/dev/null
+  do
+    sleep 0.05
+    probe_token_interrupt_attempt=$((probe_token_interrupt_attempt + 1))
+  done
+  grep -Eq '^wait-interrupted\|[0-9]+$' \
+    "$probe_token_audit" 2>/dev/null || probe_token_pass=false
+  if ! wait_for_test_process_state \
+    "$probe_token_owner" "$probe_token_owner_identity" T; then
+    probe_token_pass=false
+  fi
+  signal_verified_test_process \
+    CONT "$probe_token_anchor" \
+    "$probe_token_anchor_identity" "$probe_token_anchor_command_line" \
+    >/dev/null 2>&1 || probe_token_pass=false
+  if ! wait_for_test_process_state \
+    "$probe_token_waiter" "$probe_token_waiter_identity" Z; then
+    probe_token_pass=false
+  fi
+  signal_verified_test_process \
+    CONT "$probe_token_owner" \
+    "$probe_token_owner_identity" "$probe_token_owner_command_line" \
+    >/dev/null 2>&1 || probe_token_pass=false
+fi
+finish_async_probe_case \
+  "$probe_token_owner" \
+  "$probe_token_owner_identity" \
+  "$probe_token_owner_command_line" \
+  "$probe_token_anchor" \
+  "$probe_token_anchor_identity" \
+  "$probe_token_anchor_command_line" \
+  "$probe_token_waiter" \
+  "$probe_token_waiter_identity" \
+  "$probe_token_waiter_command_line" \
+  "$probe_token_private_root" \
+  "$direct_probe_bootstrap"
+[ "$async_probe_was_forced" = false ] || probe_token_pass=false
+[ "$async_probe_reaped" = true ] || probe_token_pass=false
+[ "$async_probe_status" -eq 143 ] || probe_token_pass=false
+probe_token_wait_attempts=$(
+  grep -Fxc "wait-attempt|$probe_token_waiter" \
+    "$probe_token_audit" 2>/dev/null || true
+)
+[ "$probe_token_wait_attempts" -ge 2 ] || probe_token_pass=false
+[ "$(grep -Fxc "wait-interrupted|$probe_token_waiter" \
+  "$probe_token_audit" 2>/dev/null || true)" -eq 1 ] \
+  || probe_token_pass=false
+[ "$(grep -Fxc "waiter-status|$probe_token_waiter|0" \
+  "$probe_token_audit" 2>/dev/null || true)" -eq 1 ] \
+  || probe_token_pass=false
+if grep -Eq '^waiter-kill-zero\|' "$probe_token_audit" 2>/dev/null; then
+  probe_token_pass=false
+fi
+probe_wait_block=$(
+  sed -n '/stop_owned_probe() {/,/^}/p' "$bootstrap"
+)
+if printf '%s\n' "$probe_wait_block" | grep -Eq 'kill[[:space:]]+-0'; then
+  probe_token_pass=false
+fi
+[ ! -e "/proc/$probe_token_owner" ] || probe_token_pass=false
+[ ! -e "/proc/$probe_token_anchor" ] || probe_token_pass=false
+[ ! -e "/proc/$probe_token_waiter" ] || probe_token_pass=false
+[ -z "$probe_token_release_fifo" ] \
+  || [ ! -e "$probe_token_release_fifo" ] \
+  || probe_token_pass=false
+[ ! -d "$probe_token_private_root" ] || probe_token_pass=false
+runtime_probe_residue_is_absent "$probe_token_tmp" \
+  || probe_token_pass=false
+if find "$probe_token_root" -type p -print -quit 2>/dev/null | grep -q .; then
+  probe_token_pass=false
+fi
+private_probe_processes_are_absent "$probe_token_private_root" \
+  || {
+    probe_token_pass=false
+    kill_private_probe_processes "$probe_token_private_root"
+  }
+if [ "$probe_token_pass" = true ]; then
+  pass 'probe release token survives STOP deferred TERM and interrupted wait'
+else
+  fail 'probe release token survives STOP deferred TERM and interrupted wait'
+fi
+
+probe_predelivery_root=$test_tmp/probe-predelivery-anchor-loss
+probe_predelivery_tmp=$probe_predelivery_root/tmp
+probe_predelivery_home=$probe_predelivery_root/home
+probe_predelivery_state=$probe_predelivery_root/state
+probe_predelivery_output=$probe_predelivery_root/output
+probe_predelivery_command=$probe_predelivery_root/probe-target
+probe_predelivery_audit=$probe_predelivery_root/audit
+probe_predelivery_target_release=$probe_predelivery_root/target.release
+mkdir -p \
+  "$probe_predelivery_tmp" \
+  "$probe_predelivery_home" \
+  "$probe_predelivery_state"
+: >"$probe_predelivery_audit"
+make_probe_tree_command \
+  "$probe_predelivery_command" wait-for-release \
+  "$probe_predelivery_root/target.pid" \
+  "$probe_predelivery_root/child.pid" \
+  "$probe_predelivery_target_release"
+"$test_real_env" \
+  TMPDIR="$probe_predelivery_tmp" \
+  HOME="$probe_predelivery_home" \
+  XDG_STATE_HOME="$probe_predelivery_state" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE=1 \
+  DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_COMMAND="$probe_predelivery_command" \
+  DOTFILES_BOOTSTRAP_TEST_PROBE_AUDIT_FILE="$probe_predelivery_audit" \
+  DOTFILES_BOOTSTRAP_TEST_PROBE_LOSE_ANCHOR_BEFORE_RELEASE_TOKEN=1 \
+  "$direct_probe_bootstrap" --apply \
+  >"$probe_predelivery_output" 2>&1 &
+probe_predelivery_owner=$!
+probe_predelivery_pass=true
+probe_predelivery_private_root=$probe_predelivery_tmp
+probe_predelivery_anchor=
+probe_predelivery_waiter=
+probe_predelivery_target=
+probe_predelivery_owner_identity=
+probe_predelivery_owner_command_line=
+probe_predelivery_anchor_identity=
+probe_predelivery_anchor_command_line=
+probe_predelivery_waiter_identity=
+probe_predelivery_waiter_command_line=
+if capture_test_process_bounded \
+  "$probe_predelivery_owner" "$direct_probe_bootstrap" "$$"; then
+  probe_predelivery_owner_identity=$captured_process_identity
+  probe_predelivery_owner_command_line=$captured_process_command
+else
+  probe_predelivery_pass=false
+fi
+if wait_for_probe_record \
+  "$probe_predelivery_tmp" anchor.ready "$probe_predelivery_owner"; then
+  probe_predelivery_private_root=$(dirname "$observed_probe_record")
+  probe_predelivery_anchor_record=$(
+    cat "$probe_predelivery_private_root/anchor.ready" 2>/dev/null || true
+  )
+  probe_predelivery_anchor=${probe_predelivery_anchor_record%%|*}
+  probe_predelivery_waiter=${probe_predelivery_anchor_record#*|}
+  test_pid_is_safe "$probe_predelivery_anchor" \
+    || probe_predelivery_pass=false
+  test_pid_is_safe "$probe_predelivery_waiter" \
+    || probe_predelivery_pass=false
+  if [ "$probe_predelivery_pass" = true ] \
+    && capture_test_process_bounded \
+      "$probe_predelivery_waiter" \
+      "$probe_predelivery_private_root" \
+      "$probe_predelivery_owner"; then
+    probe_predelivery_waiter_identity=$captured_process_identity
+    probe_predelivery_waiter_command_line=$captured_process_command
+  else
+    probe_predelivery_pass=false
+  fi
+  if [ "$probe_predelivery_pass" = true ] \
+    && capture_test_process_bounded \
+      "$probe_predelivery_anchor" \
+      "$probe_predelivery_private_root" \
+      "$probe_predelivery_waiter"; then
+    probe_predelivery_anchor_identity=$captured_process_identity
+    probe_predelivery_anchor_command_line=$captured_process_command
+    [ "$probe_predelivery_anchor_identity" \
+      = "$probe_predelivery_anchor|$probe_predelivery_waiter|$probe_predelivery_anchor|$probe_predelivery_anchor" ] \
+      || probe_predelivery_pass=false
+  else
+    probe_predelivery_pass=false
+  fi
+else
+  probe_predelivery_pass=false
+fi
+probe_predelivery_target_attempt=0
+while [ "$probe_predelivery_target_attempt" -lt 80 ] \
+  && [ ! -s "$probe_predelivery_root/target.pid" ]
+do
+  sleep 0.05
+  probe_predelivery_target_attempt=$((probe_predelivery_target_attempt + 1))
+done
+probe_predelivery_target=$(
+  cat "$probe_predelivery_root/target.pid" 2>/dev/null || true
+)
+test_pid_is_safe "$probe_predelivery_target" \
+  || probe_predelivery_pass=false
+test_process_identity_matches \
+  "$probe_predelivery_anchor" \
+  "$probe_predelivery_anchor_identity" \
+  "$probe_predelivery_anchor_command_line" \
+  || probe_predelivery_pass=false
+test_process_identity_matches \
+  "$probe_predelivery_waiter" \
+  "$probe_predelivery_waiter_identity" \
+  "$probe_predelivery_waiter_command_line" \
+  || probe_predelivery_pass=false
+: >"$probe_predelivery_target_release"
+finish_async_probe_case \
+  "$probe_predelivery_owner" \
+  "$probe_predelivery_owner_identity" \
+  "$probe_predelivery_owner_command_line" \
+  "$probe_predelivery_anchor" \
+  "$probe_predelivery_anchor_identity" \
+  "$probe_predelivery_anchor_command_line" \
+  "$probe_predelivery_waiter" \
+  "$probe_predelivery_waiter_identity" \
+  "$probe_predelivery_waiter_command_line" \
+  "$probe_predelivery_private_root" \
+  "$direct_probe_bootstrap"
+[ "$async_probe_reaped" = true ] || probe_predelivery_pass=false
+[ "$async_probe_was_forced" = false ] || probe_predelivery_pass=false
+[ "$async_probe_status" -eq 42 ] || probe_predelivery_pass=false
+if ! awk -F '|' '
+  $1 == "anchor-loss-before-release" {
+      loss_events += 1
+      loss_seen = 1
+      next
+    }
+  loss_seen && ($1 == "group-term" || $1 == "group-kill") {
+    later_group_signal = 1
+  }
+  END {
+    exit !(loss_events == 1 && !later_group_signal)
+  }
+' "$probe_predelivery_audit" 2>/dev/null; then
+  probe_predelivery_pass=false
+fi
+[ ! -e "/proc/$probe_predelivery_owner" ] \
+  || probe_predelivery_pass=false
+[ -z "$probe_predelivery_anchor" ] \
+  || [ ! -e "/proc/$probe_predelivery_anchor" ] \
+  || probe_predelivery_pass=false
+[ -z "$probe_predelivery_waiter" ] \
+  || [ ! -e "/proc/$probe_predelivery_waiter" ] \
+  || probe_predelivery_pass=false
+[ -z "$probe_predelivery_target" ] \
+  || [ ! -e "/proc/$probe_predelivery_target" ] \
+  || probe_predelivery_pass=false
+[ ! -d "$probe_predelivery_private_root" ] \
+  || probe_predelivery_pass=false
+runtime_probe_residue_is_absent "$probe_predelivery_tmp" \
+  || probe_predelivery_pass=false
+private_probe_processes_are_absent "$probe_predelivery_tmp" \
+  || {
+    probe_predelivery_pass=false
+    kill_private_probe_processes "$probe_predelivery_tmp"
+  }
+if find "$probe_predelivery_root" -type p -print -quit 2>/dev/null \
+  | grep -q .; then
+  probe_predelivery_pass=false
+fi
+if [ "$probe_predelivery_pass" = true ]; then
+  pass 'probe anchor loss before token delivery fails closed'
+else
+  fail 'probe anchor loss before token delivery fails closed'
 fi
 
 missing_handshake_pass=true

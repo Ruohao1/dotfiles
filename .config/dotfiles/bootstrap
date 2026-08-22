@@ -599,6 +599,58 @@ tool_is_satisfied() {
   version_at_least "$installed_version" "$required_version"
 }
 
+debian_probe_runtime_is_ready() {
+  case ${debian_probe_setsid_command:-} in
+    /*) [ -x "$debian_probe_setsid_command" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  case ${debian_probe_env_command:-} in
+    /*) [ -x "$debian_probe_env_command" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+require_debian_probe_runtime() {
+  debian_probe_runtime_is_ready && return 0
+  debian_probe_setsid_command=
+  debian_probe_env_command=
+
+  debian_probe_setsid_candidate=$(command -v setsid 2>/dev/null || true)
+  case $debian_probe_setsid_candidate in
+    /*) [ -x "$debian_probe_setsid_candidate" ] ;;
+    *) false ;;
+  esac || {
+    printf '%s\n' \
+      'bootstrap: util-linux setsid -f -w is required for Debian language-server probes' >&2
+    return 1
+  }
+
+  debian_probe_env_candidate=$(command -v env 2>/dev/null || true)
+  case $debian_probe_env_candidate in
+    /*) [ -x "$debian_probe_env_candidate" ] ;;
+    *) false ;;
+  esac || {
+    printf '%s\n' \
+      'bootstrap: GNU env --default-signal=HUP,INT,TERM is required for Debian language-server probes' >&2
+    return 1
+  }
+
+  if ! "$debian_probe_setsid_candidate" -f -w /bin/sh -c 'exit 0'; then
+    printf '%s\n' \
+      'bootstrap: util-linux setsid -f -w is required for Debian language-server probes' >&2
+    return 1
+  fi
+  if ! "$debian_probe_env_candidate" \
+    --default-signal=HUP,INT,TERM /bin/sh -c 'exit 0'; then
+    printf '%s\n' \
+      'bootstrap: GNU env --default-signal=HUP,INT,TERM is required for Debian language-server probes' >&2
+    return 1
+  fi
+
+  debian_probe_setsid_command=$debian_probe_setsid_candidate
+  debian_probe_env_command=$debian_probe_env_candidate
+}
+
 probe_decimal_id_is_safe() {
   case "$1" in
     ''|*[!0-9]*) return 1 ;;
@@ -768,10 +820,12 @@ PROBE_TARGET_WRAPPER
 set -u
 probe_root=$1
 target_wrapper=$2
-probe_stdin=$3
-probe_stdout=$4
-probe_stderr=$5
-shift 5
+probe_env=$3
+probe_release_fifo=$4
+probe_stdin=$5
+probe_stdout=$6
+probe_stderr=$7
+shift 7
 trap '' HUP INT TERM
 
 atomic_record() {
@@ -780,6 +834,20 @@ atomic_record() {
   record_tmp=$record_target.tmp.$$
   (umask 077 && printf '%s\n' "$record_content" >"$record_tmp") || exit 111
   mv -f "$record_tmp" "$record_target" || exit 111
+}
+
+wait_for_release() {
+  exec 5<"$probe_release_fifo" || exit 117
+  exec 4>&-
+  atomic_record "$probe_root/release.ready" release
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_PROBE_STOP_AFTER_RELEASE_READY:-0}" = 1 ]; then
+    kill -STOP "$$"
+  fi
+  probe_release_token=
+  IFS= read -r probe_release_token <&5 || exit 118
+  exec 5<&-
+  [ "$probe_release_token" = release ] || exit 119
 }
 
 case ${DOTFILES_BOOTSTRAP_TEST_PROBE_HANDSHAKE:-} in
@@ -805,11 +873,11 @@ done
 [ "$anchor_acknowledged" = true ] || exit 115
 
 if [ "${DOTFILES_BOOTSTRAP_TEST_PROBE_HANDSHAKE:-}" = missing-target ]; then
-  while [ ! -e "$probe_root/release.ready" ]; do :; done
+  wait_for_release
   exit 116
 fi
 
-env --default-signal=HUP,INT,TERM \
+"$probe_env" --default-signal=HUP,INT,TERM \
   "$target_wrapper" "$probe_root" "$$" \
   "$probe_stdin" "$probe_stdout" "$probe_stderr" "$@" &
 probe_target_pid=$!
@@ -820,7 +888,7 @@ case ${DOTFILES_BOOTSTRAP_TEST_PROBE_HANDSHAKE:-} in
   malformed-status) atomic_record "$probe_root/status.ready" 'malformed-status' ;;
   *) atomic_record "$probe_root/status.ready" "$probe_target_pid|$probe_target_status" ;;
 esac
-while [ ! -e "$probe_root/release.ready" ]; do :; done
+wait_for_release
 exit 0
 PROBE_SUPERVISOR
 
@@ -837,8 +905,74 @@ clear_active_probe_state() {
   active_probe_acknowledged=false
   active_probe_target_acknowledged=false
   active_probe_fifo=
+  active_probe_release_fifo=
+  active_probe_release_fd_open=false
   active_probe_supervisor=
   active_probe_target_wrapper=
+  active_probe_wait_in_progress=false
+  active_probe_wait_interrupted=false
+  last_probe_waiter_status_available=false
+  last_probe_waiter_status=
+}
+
+close_active_probe_release_fd() {
+  if [ "$active_probe_release_fd_open" = true ]; then
+    exec 4>&-
+    active_probe_release_fd_open=false
+  fi
+}
+
+send_active_probe_release_token() {
+  probe_release_send_status=0
+  if [ "$active_probe_release_fd_open" = true ]; then
+    printf '%s\n' release >&4 || probe_release_send_status=1
+    close_active_probe_release_fd
+  fi
+  return "$probe_release_send_status"
+}
+
+wait_for_owned_probe_waiter() {
+  probe_owned_waiter_pid=$1
+  probe_wait_candidate=
+  probe_wait_candidate_available=false
+  probe_wait_audit_status=0
+  last_probe_waiter_status_available=false
+  last_probe_waiter_status=
+
+  while :; do
+    active_probe_wait_interrupted=false
+    active_probe_wait_in_progress=true
+    record_probe_test_audit "wait-attempt|$probe_owned_waiter_pid" \
+      || probe_wait_audit_status=1
+    probe_wait_status=0
+    wait "$probe_owned_waiter_pid" || probe_wait_status=$?
+    active_probe_wait_in_progress=false
+
+    if [ "$active_probe_wait_interrupted" = true ]; then
+      record_probe_test_audit "wait-interrupted|$probe_owned_waiter_pid" \
+        || probe_wait_audit_status=1
+      if [ "$probe_wait_status" -ne 127 ]; then
+        probe_wait_candidate=$probe_wait_status
+        probe_wait_candidate_available=true
+      fi
+      if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+        && [ "${DOTFILES_BOOTSTRAP_TEST_PROBE_STOP_BETWEEN_WAITS:-0}" = 1 ]; then
+        kill -STOP "$$"
+      fi
+      continue
+    fi
+
+    if [ "$probe_wait_status" -eq 127 ] \
+      && [ "$probe_wait_candidate_available" = true ]; then
+      probe_wait_status=$probe_wait_candidate
+    fi
+    last_probe_waiter_status_available=true
+    last_probe_waiter_status=$probe_wait_status
+    record_probe_test_audit \
+      "waiter-status|$probe_owned_waiter_pid|$last_probe_waiter_status" \
+      || probe_wait_audit_status=1
+    return "$probe_wait_audit_status"
+  done
 }
 
 cancel_unacknowledged_probe() {
@@ -846,8 +980,9 @@ cancel_unacknowledged_probe() {
     probe_atomic_record "$active_probe_tmp/cancel.ready" cancel >/dev/null 2>&1 \
       || true
   fi
+  send_active_probe_release_token || true
   if [ -n "$active_probe_waiter_pid" ]; then
-    wait "$active_probe_waiter_pid" >/dev/null 2>&1 || true
+    wait_for_owned_probe_waiter "$active_probe_waiter_pid" || true
   fi
   if [ -n "$active_probe_tmp" ] && [ -d "$active_probe_tmp" ]; then
     remove_temporary_directory "$active_probe_tmp"
@@ -896,6 +1031,7 @@ stop_owned_probe() {
   probe_cleanup_active=true
   probe_cleanup_status=0
   probe_cleanup_owns_deferral=false
+  probe_cleanup_graceful_release=false
   if [ "$cleanup_registration_critical" = false ]; then
     cleanup_registration_critical=true
     probe_cleanup_owns_deferral=true
@@ -951,10 +1087,29 @@ stop_owned_probe() {
           probe_cleanup_status=1
         fi
       else
-        if probe_anchor_identity_is_valid \
+        if ! probe_wait_for_record "$active_probe_tmp/release.ready"; then
+          printf '%s\n' \
+            'bootstrap: probe supervisor did not become ready for release' >&2
+          probe_cleanup_status=1
+          if probe_anchor_identity_is_valid \
+            "$active_probe_anchor_pid" "$active_probe_anchor_parent"; then
+            record_probe_test_audit "group-kill|$active_probe_group_id" \
+              || probe_cleanup_status=1
+            kill -KILL -- "-$active_probe_group_id" >/dev/null 2>&1 \
+              || probe_cleanup_status=1
+          fi
+        elif probe_anchor_identity_is_valid \
           "$active_probe_anchor_pid" "$active_probe_anchor_parent"; then
-          probe_atomic_record "$active_probe_tmp/release.ready" release \
-            || probe_cleanup_status=1
+          if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+            && [ "${DOTFILES_BOOTSTRAP_TEST_PROBE_LOSE_ANCHOR_BEFORE_RELEASE_TOKEN:-0}" = 1 ]; then
+            record_probe_test_audit \
+              "anchor-loss-before-release|$active_probe_anchor_pid" \
+              || probe_cleanup_status=1
+            kill -KILL "$active_probe_anchor_pid" >/dev/null 2>&1 || true
+            sleep 0.05
+          fi
+          send_active_probe_release_token || probe_cleanup_status=1
+          probe_cleanup_graceful_release=true
         else
           printf '%s\n' \
             'bootstrap: probe anchor disappeared before release' >&2
@@ -966,7 +1121,18 @@ stop_owned_probe() {
         'bootstrap: probe anchor identity changed before group cleanup' >&2
       probe_cleanup_status=1
     fi
-    wait "$active_probe_waiter_pid" >/dev/null 2>&1 || true
+    if [ "$probe_cleanup_graceful_release" != true ]; then
+      close_active_probe_release_fd
+    fi
+    if [ -n "$active_probe_waiter_pid" ]; then
+      wait_for_owned_probe_waiter "$active_probe_waiter_pid" \
+        || probe_cleanup_status=1
+      if [ "$probe_cleanup_graceful_release" = true ] \
+        && { [ "$last_probe_waiter_status_available" != true ] \
+          || [ "$last_probe_waiter_status" -ne 0 ]; }; then
+        probe_cleanup_status=1
+      fi
+    fi
   else
     cancel_unacknowledged_probe
   fi
@@ -987,6 +1153,9 @@ stop_owned_probe() {
 start_owned_probe() {
   probe_start_mode=$1
   shift
+  if ! debian_probe_runtime_is_ready; then
+    require_debian_probe_runtime || return 1
+  fi
   begin_cleanup_registration_critical
   active_probe_tmp=$(temporary_directory) || {
     finish_cleanup_registration_critical
@@ -1005,16 +1174,28 @@ start_owned_probe() {
   active_probe_acknowledged=false
   active_probe_target_acknowledged=false
   active_probe_fifo=
-
-  if ! command -v setsid >/dev/null 2>&1; then
-    printf '%s\n' \
-      'bootstrap: util-linux setsid -f -w is required for Debian language-server probes' >&2
+  active_probe_release_fifo=
+  active_probe_release_fd_open=false
+  if ! write_probe_helper_scripts "$active_probe_tmp"; then
+    printf '%s\n' 'bootstrap: could not create private probe helpers' >&2
     cancel_unacknowledged_probe
     finish_cleanup_registration_critical
     return 1
   fi
-  if ! write_probe_helper_scripts "$active_probe_tmp"; then
-    printf '%s\n' 'bootstrap: could not create private probe helpers' >&2
+
+  active_probe_release_fifo=$active_probe_tmp/release
+  mkfifo "$active_probe_release_fifo" || {
+    cancel_unacknowledged_probe
+    finish_cleanup_registration_critical
+    return 1
+  }
+  if ! exec 4<>"$active_probe_release_fifo"; then
+    cancel_unacknowledged_probe
+    finish_cleanup_registration_critical
+    return 1
+  fi
+  active_probe_release_fd_open=true
+  if [ -n "$pending_transaction_signal_name" ]; then
     cancel_unacknowledged_probe
     finish_cleanup_registration_critical
     return 1
@@ -1040,8 +1221,9 @@ start_owned_probe() {
     export DOTFILES_BOOTSTRAP_TEST_PROBE_OWNER_PID
   fi
 
-  setsid -f -w "$active_probe_supervisor" \
+  "$debian_probe_setsid_command" -f -w "$active_probe_supervisor" \
     "$active_probe_tmp" "$active_probe_target_wrapper" \
+    "$debian_probe_env_command" "$active_probe_release_fifo" \
     "$probe_start_stdin" "$probe_start_stdout" "$probe_start_stderr" \
     "$@" &
   active_probe_waiter_pid=$!
@@ -3853,6 +4035,9 @@ exit_for_transaction_signal() {
 handle_transaction_signal() {
   signal_name=$1
   signal_code=$2
+  if [ "$active_probe_wait_in_progress" = true ]; then
+    active_probe_wait_interrupted=true
+  fi
   if [ "$managed_publication_critical" = true ] \
     || [ "$cleanup_registration_critical" = true ] \
     || [ "$probe_cleanup_active" = true ] \
@@ -3947,6 +4132,8 @@ pending_transaction_signal_name=
 pending_transaction_signal_code=
 selected_node=
 selected_npm=
+debian_probe_setsid_command=
+debian_probe_env_command=
 active_probe_tmp=
 active_probe_waiter_pid=
 active_probe_anchor_pid=
@@ -3956,11 +4143,17 @@ active_probe_target_pid=
 active_probe_acknowledged=false
 active_probe_target_acknowledged=false
 active_probe_fifo=
+active_probe_release_fifo=
+active_probe_release_fd_open=false
 active_probe_supervisor=
 active_probe_target_wrapper=
+active_probe_wait_in_progress=false
+active_probe_wait_interrupted=false
 probe_cleanup_active=false
 last_probe_status_available=false
 last_probe_status=
+last_probe_waiter_status_available=false
+last_probe_waiter_status=
 
 trap 'handle_process_exit "$?"' 0
 trap 'handle_transaction_signal HUP 129' HUP
@@ -3984,6 +4177,10 @@ if [ "$mode" = rollback ]; then
 fi
 
 select_window_manager "$platform" "$manager" "$window_manager"
+
+if [ "$manager" = apt ]; then
+  require_debian_probe_runtime || exit 1
+fi
 
 if [ "$mode" = apply ]; then
   start_package_tracking
