@@ -3327,7 +3327,7 @@ nvim_lock_is_exact() {
   [ "$#" -eq 1 ] || return 2
 
   jq -e '
-    keys == ["fzf-lua", "image.nvim", "jupytext.nvim", "lazy.nvim", "mini.icons", "mini.pairs", "mini.starter", "mini.surround", "molten-nvim", "nvim-treesitter", "oil.nvim", "otter.nvim", "quarto-nvim", "smart-splits.nvim", "tokyonight.nvim"]
+    keys == ["fzf-lua", "image.nvim", "jupytext.nvim", "lazy.nvim", "mini.icons", "mini.pairs", "mini.starter", "mini.surround", "molten-nvim", "nvim-treesitter", "oil.nvim", "otter.nvim", "quarto-nvim", "smart-splits.nvim", "tokyonight.nvim", "which-key.nvim"]
     and all(.[];
       if type == "object" then
         ((.commit? | type) == "string")
@@ -3469,6 +3469,9 @@ nvim_plugin_generated_tags_are_exact() {
       ;;
     tokyonight.nvim)
       nvim_tags_sources='doc/tokyonight.nvim.txt'
+      ;;
+    which-key.nvim)
+      nvim_tags_sources='doc/which-key.nvim.txt'
       ;;
     *)
       nvim_trust_reject "plugin has no generated-tags policy: $nvim_tags_name"
@@ -3617,7 +3620,7 @@ nvim_plugin_source_is_exact() {
   fi
 
   case "$nvim_source_name" in
-    lazy.nvim|fzf-lua|jupytext.nvim|oil.nvim|otter.nvim|nvim-treesitter|tokyonight.nvim)
+    lazy.nvim|fzf-lua|jupytext.nvim|oil.nvim|otter.nvim|nvim-treesitter|tokyonight.nvim|which-key.nvim)
       nvim_source_expected_status='!! doc/tags'
       ;;
     mini.icons|mini.pairs|mini.starter|mini.surround)
@@ -3684,14 +3687,14 @@ nvim_trust_write_lock_fixture() {
   nvim_lock_fixture_path=$1
   nvim_lock_fixture_mode=$2
   nvim_lock_fixture_mini='{"branch":"main","commit":"e56797f90192d81f1fda02e662fc3e8e3d775027"}'
-  nvim_lock_fixture_tokyonight='{"branch":"main","commit":"545d72cde6400835d895160ecb5853874fd5156d"}'
+  nvim_lock_fixture_which_key='  "which-key.nvim": {"branch":"main","commit":"3aab2147e74890957785941f0c1ad87d0a44c15a"}'
   nvim_lock_fixture_extra=''
 
   case "$nvim_lock_fixture_mode" in
     valid)
       ;;
     extra)
-      nvim_lock_fixture_tokyonight=$nvim_lock_fixture_tokyonight,
+      nvim_lock_fixture_which_key=$nvim_lock_fixture_which_key,
       nvim_lock_fixture_extra='  "unexpected.nvim": {"commit":"1111111111111111111111111111111111111111"}'
       ;;
     missing)
@@ -3724,7 +3727,8 @@ nvim_trust_write_lock_fixture() {
     '  "otter.nvim": {"commit":"f4a033d4e2bd86d4f09386a73d3861538601253d"},' \
     '  "quarto-nvim": {"commit":"17f1e5d664bc615478230dc0240666329efacf9b"},' \
     '  "smart-splits.nvim": {"branch":"master","commit":"ba2850ff3d3b09785a7105c69d06a12117d4b97d"},' \
-    "  \"tokyonight.nvim\": $nvim_lock_fixture_tokyonight" \
+    '  "tokyonight.nvim": {"branch":"main","commit":"545d72cde6400835d895160ecb5853874fd5156d"},' \
+    "$nvim_lock_fixture_which_key" \
     "$nvim_lock_fixture_extra" \
     '}' \
     > "$nvim_lock_fixture_path"
@@ -3750,6 +3754,10 @@ nvim_trust_fixture_init() {
       ;;
     tokyonight.nvim)
       nvim_fixture_help_name=tokyonight.nvim.txt
+      nvim_fixture_ignore_tags=true
+      ;;
+    which-key.nvim)
+      nvim_fixture_help_name=which-key.nvim.txt
       nvim_fixture_ignore_tags=true
       ;;
     *)
@@ -3868,7 +3876,7 @@ run_nvim_trust_self_test() {
     fi
   done
   nvim_trust_expect_accept \
-    "exact fifteen-object lock is accepted" \
+    "exact sixteen-object lock is accepted" \
     nvim_lock_is_exact "$check_tmp/nvim-lock-valid.json" || true
   nvim_trust_expect_reject \
     "extra lock key is rejected" \
@@ -3929,6 +3937,18 @@ run_nvim_trust_self_test() {
       "$check_tmp/audit-valid-tokyonight-tags" || true
   else
     fail "could not create TokyoNight tags fixture"
+  fi
+
+  nvim_fixture=$check_tmp/nvim-trust-valid-which-key-tags
+  if nvim_trust_fixture_init "$nvim_fixture" which-key.nvim; then
+    nvim_fixture_lock=$(hardened_plugin_git "$nvim_fixture" rev-parse HEAD)
+    nvim_trust_expect_accept \
+      "WhichKey generated tags are accepted" \
+      nvim_plugin_checkout_is_trusted \
+      "$nvim_fixture" which-key.nvim "$nvim_fixture_lock" \
+      "$check_tmp/audit-valid-which-key-tags" || true
+  else
+    fail "could not create WhichKey tags fixture"
   fi
 
   nvim_fixture_target=$check_tmp/nvim-trust-symlink-root-target
@@ -6968,6 +6988,7 @@ for static_lint_file in \
   "$nvim_root/lua/parquet/tool.lua" \
   "$nvim_root/lua/parquet/viewer.lua" \
   "$nvim_root/lua/plugins/editing.lua" \
+  "$nvim_root/lua/plugins/key-helper.lua" \
   "$nvim_root/lua/plugins/navigation.lua" \
   "$nvim_root/lua/plugins/notebook.lua" \
   "$nvim_root/lua/plugins/smart-splits.lua" \
@@ -6989,6 +7010,7 @@ for static_lint_file in \
   "$nvim_root/tests/data_query_workflow.lua" \
   "$nvim_root/tests/editing.lua" \
   "$nvim_root/tests/foundation.lua" \
+  "$nvim_root/tests/key_helper.lua" \
   "$nvim_root/tests/lsp.lua" \
   "$nvim_root/tests/navigation.lua" \
   "$nvim_root/tests/notebook_environment.lua" \
@@ -11450,6 +11472,7 @@ for nvim_file in \
   "$nvim_root/lua/navigation/root.lua" \
   "$nvim_root/lua/navigation/pickers.lua" \
   "$nvim_root/lua/plugins/editing.lua" \
+  "$nvim_root/lua/plugins/key-helper.lua" \
   "$nvim_root/lua/plugins/navigation.lua" \
   "$nvim_root/lua/plugins/notebook.lua" \
   "$nvim_root/lua/plugins/smart-splits.lua" \
@@ -11473,6 +11496,7 @@ for nvim_file in \
   "$nvim_root/tests/data_query_workflow.lua" \
   "$nvim_root/tests/editing.lua" \
   "$nvim_root/tests/foundation.lua" \
+  "$nvim_root/tests/key_helper.lua" \
   "$nvim_root/tests/lsp.lua" \
   "$nvim_root/tests/navigation.lua" \
   "$nvim_root/tests/notebook_environment.lua" \
@@ -11501,8 +11525,9 @@ do
   fi
 done
 
-approved_nvim_plugins='fzf-lua image.nvim jupytext.nvim lazy.nvim mini.icons mini.pairs mini.starter mini.surround molten-nvim nvim-treesitter oil.nvim otter.nvim quarto-nvim smart-splits.nvim tokyonight.nvim'
+approved_nvim_plugins='fzf-lua image.nvim jupytext.nvim lazy.nvim mini.icons mini.pairs mini.starter mini.surround molten-nvim nvim-treesitter oil.nvim otter.nvim quarto-nvim smart-splits.nvim tokyonight.nvim which-key.nvim'
 mini_icons_dir="$nvim_data_root/lazy/mini.icons"
+which_key_dir="$nvim_data_root/lazy/which-key.nvim"
 oil_dir="$nvim_data_root/lazy/oil.nvim"
 plugins_ready=true
 plugin_revisions_match=false
@@ -11525,9 +11550,9 @@ if command -v jq >/dev/null 2>&1 \
   && [ -r "$nvim_root/lazy-lock.json" ] \
   && nvim_lock_is_exact "$nvim_root/lazy-lock.json"; then
   lock_valid=true
-  pass "Neovim lockfile contains exactly fifteen object-valued pinned plugins"
+  pass "Neovim lockfile contains exactly sixteen object-valued pinned plugins"
 else
-  fail "Neovim lockfile must contain the exact fifteen-plugin object boundary"
+  fail "Neovim lockfile must contain the exact sixteen-plugin object boundary"
 fi
 
 if [ "$lock_valid" = true ] && [ "$plugins_ready" = true ]; then
@@ -11567,7 +11592,7 @@ if [ "$nvim_config_ready" = true ] \
   && [ "$plugin_revisions_match" = true ] \
   && [ "$plugin_worktrees_clean" = true ]; then
   plugins_trusted=true
-  pass "Neovim fifteen-plugin revision and source trust gate satisfied"
+  pass "Neovim sixteen-plugin revision and source trust gate satisfied"
 else
   fail "Neovim plugin trust gate is closed; live plugin code will not run"
   printf '%s\n' \
@@ -11762,15 +11787,43 @@ if [ "$nvim_config_ready" = true ] \
   fi
 fi
 
+if [ "$nvim_config_ready" = true ] \
+  && [ "$plugins_trusted" = true ] \
+  && command -v nvim >/dev/null 2>&1; then
+  nvim_key_helper_output="$check_tmp/nvim-key-helper.txt"
+  if env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
+    NVIM_LOG_FILE=/dev/null \
+    XDG_CONFIG_HOME="$config_root" \
+    XDG_DATA_HOME="$check_tmp/nvim-key-helper-data" \
+    XDG_STATE_HOME="$XDG_STATE_HOME" \
+    XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+    XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+    DOTFILES_NVIM_ROOT="$nvim_root" \
+    DOTFILES_MINI_ICONS_ROOT="$mini_icons_dir" \
+    DOTFILES_WHICH_KEY_ROOT="$which_key_dir" \
+    DOTFILES_KEY_HELPER_LIVE=1 \
+    nvim --clean --headless -u NONE -i NONE \
+    -l "$nvim_root/tests/key_helper.lua" \
+    > "$nvim_key_helper_output" 2>&1 \
+    && ! nvim_log_has_error "$nvim_key_helper_output"; then
+    pass "Neovim WhichKey modes, delay, completion, cancellation, cleanup, and diagnostics pass"
+  else
+    sed 's/^/      /' "$nvim_key_helper_output" >&2
+    fail "Neovim WhichKey focused assertions failed"
+  fi
+fi
+
 if [ "$nvim_config_ready" = true ] && [ "$plugins_trusted" = true ] && command -v nvim >/dev/null 2>&1; then
   if env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
     XDG_CONFIG_HOME="$config_root" XDG_DATA_HOME="$data_home" TERM_PROGRAM=ghostty \
     DOTFILES_NVIM_SKIP_PARSER_INSTALL=1 \
     DOTFILES_REQUIRE_EDITING_PLUGINS=1 \
     nvim --headless -i NONE \
+    -c 'lua vim.api.nvim_exec_autocmds("User", { pattern = "VeryLazy", modeline = false }); local plugin = assert(require("lazy.core.config").plugins["which-key.nvim"]); assert(plugin._.loaded, "WhichKey did not load on VeryLazy")' \
     -c 'lua local names = { "bashls", "jsonls", "lua_ls", "pyright", "yamlls" }; assert(vim.bo.filetype ~= "bash" and vim.bo.filetype ~= "sh" and vim.bo.filetype ~= "json" and vim.bo.filetype ~= "jsonc" and vim.bo.filetype ~= "lua" and vim.bo.filetype ~= "python" and vim.bo.filetype ~= "yaml" and vim.bo.filetype ~= "yaml.docker-compose" and vim.bo.filetype ~= "yaml.gitlab" and vim.bo.filetype ~= "yaml.helm-values", "configured startup assertion buffer must not match an enabled LSP"); for _, name in ipairs(names) do assert(vim.lsp.is_enabled(name), name .. " is not enabled during configured startup"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned before a matching buffer opened"); vim.lsp.enable(name, false); assert(not vim.lsp.is_enabled(name), name .. " remained enabled after configured startup disable") end; for _, command in ipairs({ "DataQuery", "DataQueryHealth" }) do assert(vim.fn.exists(":" .. command) == 2, command .. " is unavailable during passive startup") end; assert(package.loaded["data_query.tool"] == nil, "passive startup loaded the query resolver or started a probe"); local parent = vim.fs.joinpath(vim.fn.stdpath("cache"), "dotfiles-data-query"); assert(vim.uv.fs_lstat(parent) == nil, "passive startup created the data-query cache"); for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do local name = vim.api.nvim_buf_get_name(bufnr); assert(name:sub(1, 13) ~= "data-query://", "passive startup created a SQL scratch"); local metadata = vim.b[bufnr].dotfiles_parquet_viewer; assert(type(metadata) ~= "table" or type(metadata.path) ~= "string" or metadata.path:sub(1, #parent + 1) ~= parent .. "/", "passive startup created a query result") end' \
     -c "luafile $nvim_root/tests/platform.lua" \
     -c "luafile $nvim_root/tests/foundation.lua" \
+    -c "luafile $nvim_root/tests/key_helper.lua" \
     -c "luafile $nvim_root/tests/completion.lua" \
     -c "luafile $nvim_root/tests/editing.lua" \
     -c "luafile $nvim_root/tests/navigation.lua" \
@@ -11782,7 +11835,7 @@ if [ "$nvim_config_ready" = true ] && [ "$plugins_trusted" = true ] && command -
     && data_query_processes_absent \
       "$XDG_CACHE_HOME/nvim/dotfiles-data-query" \
       "$check_tmp/nvim-passive-processes.txt"; then
-    pass "Neovim platform, native Bash, JSON, Lua, Python, and YAML LSP startup and completion, navigation, TokyoNight, Treesitter, parser, FzfLua, Oil, MiniIcons, MiniPairs, MiniStarter, MiniSurround, smart-splits, statusline, and startup assertions pass"
+    pass "Neovim platform, native Bash, JSON, Lua, Python, and YAML LSP startup and completion, navigation, TokyoNight, Treesitter, parser, FzfLua, Oil, MiniIcons, MiniPairs, MiniStarter, MiniSurround, WhichKey, smart-splits, statusline, and startup assertions pass"
   else
     sed 's/^/      /' "$check_tmp/nvim-tests.txt" >&2
     fail "Neovim headless foundation assertions failed"

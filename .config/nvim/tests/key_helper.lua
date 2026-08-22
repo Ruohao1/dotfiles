@@ -210,6 +210,56 @@ eq(
   "WhichKey generated doc/tags allowance"
 )
 
+local config_root = vim.fs.dirname(nvim_root)
+local checker_source = table.concat(
+  vim.fn.readfile(vim.fs.joinpath(config_root, "dotfiles", "check-terminal-stack")),
+  "\n"
+)
+
+for _, fragment in ipairs({
+  'keys == ["fzf-lua", "image.nvim", "jupytext.nvim", "lazy.nvim", "mini.icons", "mini.pairs", "mini.starter", "mini.surround", "molten-nvim", "nvim-treesitter", "oil.nvim", "otter.nvim", "quarto-nvim", "smart-splits.nvim", "tokyonight.nvim", "which-key.nvim"]',
+  "which-key.nvim)",
+  "nvim_tags_sources='doc/which-key.nvim.txt'",
+  "lazy.nvim|fzf-lua|jupytext.nvim|oil.nvim|otter.nvim|nvim-treesitter|tokyonight.nvim|which-key.nvim)",
+  '"which-key.nvim": {"branch":"main","commit":"3aab2147e74890957785941f0c1ad87d0a44c15a"}',
+  "approved_nvim_plugins='fzf-lua image.nvim jupytext.nvim lazy.nvim mini.icons mini.pairs mini.starter mini.surround molten-nvim nvim-treesitter oil.nvim otter.nvim quarto-nvim smart-splits.nvim tokyonight.nvim which-key.nvim'",
+  'which_key_dir="$nvim_data_root/lazy/which-key.nvim"',
+  "Neovim lockfile contains exactly sixteen object-valued pinned plugins",
+  "Neovim sixteen-plugin revision and source trust gate satisfied",
+  "DOTFILES_KEY_HELPER_LIVE=1",
+  '-l "$nvim_root/tests/key_helper.lua"',
+  'vim.api.nvim_exec_autocmds("User", { pattern = "VeryLazy", modeline = false })',
+  'require("lazy.core.config").plugins["which-key.nvim"]',
+  '"WhichKey did not load on VeryLazy"',
+  '-c "luafile $nvim_root/tests/key_helper.lua"',
+  "Neovim WhichKey modes, delay, completion, cancellation, cleanup, and diagnostics pass",
+  "MiniSurround, WhichKey, smart-splits",
+}) do
+  assert(
+    checker_source:find(fragment, 1, true),
+    "checker missing key-helper integration fragment: " .. fragment
+  )
+end
+
+eq(
+  count_plain(checker_source, '"$nvim_root/lua/plugins/key-helper.lua"'),
+  2,
+  "checker key-helper plugin inventory count"
+)
+eq(
+  count_plain(checker_source, "$nvim_root/tests/key_helper.lua"),
+  4,
+  "checker key-helper test reference count"
+)
+for _, stale in ipairs({
+  "exact fifteen-object lock is accepted",
+  "exactly fifteen object-valued pinned plugins",
+  "exact fifteen-plugin object boundary",
+  "fifteen-plugin revision and source trust",
+}) do
+  assert(not checker_source:find(stale, 1, true), "stale checker wording remains: " .. stale)
+end
+
 if vim.env.DOTFILES_KEY_HELPER_LIVE ~= "1" then
   print("Neovim key helper static assertions: ok")
   return
