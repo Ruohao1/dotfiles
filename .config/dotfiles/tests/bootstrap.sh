@@ -63,6 +63,19 @@ run_capture() {
   set -e
 }
 
+run_capture_in_directory() {
+  output_file=$1
+  capture_directory=$2
+  shift 2
+  set +e
+  (
+    CDPATH='' cd -- "$capture_directory"
+    "$@"
+  ) >"$output_file" 2>&1
+  run_status=$?
+  set -e
+}
+
 make_version_command() {
   command_path=$1
   version_text=$2
@@ -310,12 +323,14 @@ make_parquet_uv_tool_command() {
     '        exit 0' \
     '        ;;' \
     '      install)' \
-    '        [ "$#" -eq 7 ] || exit 93' \
+    '        [ "$#" -eq 9 ] || exit 93' \
     '        [ "${3:-}" = --force ] || exit 94' \
     '        [ "${4:-}" = --with ] || exit 95' \
     '        [ "${5:-}" = pyarrow==25.0.0 ] || exit 96' \
-    '        [ "${6:-}" = --no-config ] || exit 97' \
-    '        [ "${7:-}" = visidata==3.4 ] || exit 98' \
+    '        [ "${6:-}" = --with ] || exit 97' \
+    '        [ "${7:-}" = duckdb==1.5.5 ] || exit 98' \
+    '        [ "${8:-}" = --no-config ] || exit 99' \
+    '        [ "${9:-}" = visidata==3.4 ] || exit 100' \
     '        if [ -n "${DOTFILES_BOOTSTRAP_TEST_PARQUET_INSTALL_MARKER:-}" ]; then' \
     '          : >"$DOTFILES_BOOTSTRAP_TEST_PARQUET_INSTALL_MARKER"' \
     '        fi' \
@@ -370,6 +385,11 @@ prepare_parquet_tool_environment() {
     '[ "${3:-}" = -c ] || exit 84' \
     '[ -n "${4:-}" ] || exit 85' \
     '[ -n "${DOTFILES_BOOTSTRAP_TEST_PARQUET_PROBE_MARKER:-}" ] || exit 86' \
+    'case "${4:-}" in *"\"visidata\":\"3.4\""*) ;; *) exit 87 ;; esac' \
+    'case "${4:-}" in *"\"pyarrow\":\"25.0.0\""*) ;; *) exit 88 ;; esac' \
+    'case "${4:-}" in *"\"duckdb\":\"1.5.5\""*) ;; *) exit 89 ;; esac' \
+    'case "${4:-}" in *"import importlib.metadata as m,duckdb,pyarrow"*) ;; *) exit 90 ;; esac' \
+    'case "${4:-}" in *"duckdb.__version__ == expected[\"duckdb\"]"*) ;; *) exit 91 ;; esac' \
     '[ -e "$DOTFILES_BOOTSTRAP_TEST_PARQUET_PROBE_MARKER" ]' \
     >"$parquet_environment_root/visidata/bin/python"
   printf '%s\n' '#!/bin/sh' 'exit 0' \
@@ -433,7 +453,7 @@ run_parquet_trailing_slash_target_case() {
     && [ -e "$parquet_trailing_install_marker" ] \
     && [ -e "$parquet_trailing_probe_marker" ] \
     && [ "$(cat "$parquet_trailing_actions" 2>/dev/null || true)" \
-      = 'uv-tool visidata@3.4+pyarrow@25.0.0' ]; then
+      = 'uv-tool visidata@3.4+pyarrow@25.0.0+duckdb@1.5.5' ]; then
     pass "Parquet installation accepts $parquet_trailing_name"
   else
     fail "Parquet installation accepts $parquet_trailing_name"
@@ -604,6 +624,27 @@ file_sha256_for_test() {
   else
     shasum -a 256 "$test_checksum_path" | awk '{ print $1 }'
   fi
+}
+
+project_state_fingerprint() {
+  project_state_root=$1
+  (
+    CDPATH='' cd -- "$project_state_root"
+    find . -print | LC_ALL=C sort | while IFS= read -r project_state_entry; do
+      if [ -L "$project_state_entry" ]; then
+        printf 'link %s %s\n' \
+          "$project_state_entry" "$(readlink "$project_state_entry")"
+      elif [ -d "$project_state_entry" ]; then
+        printf 'directory %s\n' "$project_state_entry"
+      elif [ -f "$project_state_entry" ]; then
+        printf 'file %s %s\n' \
+          "$project_state_entry" \
+          "$(file_sha256_for_test "$project_state_entry")"
+      else
+        printf 'other %s\n' "$project_state_entry"
+      fi
+    done
+  )
 }
 
 run_managed_architecture_case() {
@@ -1443,7 +1484,19 @@ run_parquet_trailing_slash_target_case \
 
 : >"$parquet_install_actions"
 parquet_caller_env_log=$parquet_probe_root/caller-uv-environment.log
-run_capture "$parquet_probe_root/install-sanitized.output" env \
+parquet_project_root=$parquet_probe_root/project-state
+mkdir -p "$parquet_project_root/.venv/bin" "$parquet_project_root/venv/bin"
+printf '%s\n' '[project]' 'name = "sentinel"' \
+  >"$parquet_project_root/pyproject.toml"
+printf '%s\n' 'uv lock sentinel' >"$parquet_project_root/uv.lock"
+printf '%s\n' 'poetry lock sentinel' >"$parquet_project_root/poetry.lock"
+printf '%s\n' 'managed .venv sentinel' \
+  >"$parquet_project_root/.venv/bin/python"
+printf '%s\n' 'managed venv sentinel' \
+  >"$parquet_project_root/venv/bin/python"
+parquet_project_before=$(project_state_fingerprint "$parquet_project_root")
+run_capture_in_directory \
+  "$parquet_probe_root/install-sanitized.output" "$parquet_project_root" env \
   PATH="$parquet_probe_bin:/usr/bin:/bin" \
   HOME="$parquet_probe_root/home" \
   UV_TOOL_DIR="$parquet_probe_tools" \
@@ -1470,6 +1523,7 @@ run_capture "$parquet_probe_root/install-sanitized.output" env \
   DOTFILES_BOOTSTRAP_TEST_PARQUET_ACTIONS="$parquet_install_actions" \
   DOTFILES_BOOTSTRAP_TEST_PARQUET_CALLER_ENV_LOG="$parquet_caller_env_log" \
   "$parquet_function_bootstrap"
+parquet_project_after=$(project_state_fingerprint "$parquet_project_root")
 parquet_expected_caller_env="UV_BUILD_CONSTRAINT=$parquet_probe_root/build-constraints.txt
 UV_CONSTRAINT=$parquet_probe_root/constraints.txt
 UV_DEFAULT_INDEX=https://default-index.invalid/simple
@@ -1486,11 +1540,17 @@ UV_PRERELEASE=disallow
 UV_RESOLUTION=lowest
 UV_TORCH_BACKEND=cpu"
 if [ "$run_status" -eq 0 ] \
-  && grep -Fqx 'uv-tool visidata@3.4+pyarrow@25.0.0' "$parquet_install_actions" \
-  && [ "$(cat "$parquet_caller_env_log" 2>/dev/null || true)" = "$parquet_expected_caller_env" ]; then
+  && grep -Fqx 'uv-tool visidata@3.4+pyarrow@25.0.0+duckdb@1.5.5' "$parquet_install_actions" \
+  && [ "$(cat "$parquet_caller_env_log" 2>/dev/null || true)" = "$parquet_expected_caller_env" ] \
+  && [ "$parquet_project_after" = "$parquet_project_before" ]; then
   pass 'Parquet installation clears resolver variables without mutating its caller'
 else
   fail 'Parquet installation clears resolver variables without mutating its caller'
+fi
+if [ "$parquet_project_after" = "$parquet_project_before" ]; then
+  pass 'data-query tool repair preserves project and virtual-environment state'
+else
+  fail 'data-query tool repair preserves project and virtual-environment state'
 fi
 
 run_capture "$test_tmp/help" "$bootstrap" --help
@@ -1591,9 +1651,11 @@ require_contains "$linux_output" 'install pacman imagemagick' \
   'pacman plan includes ImageMagick'
 require_contains "$linux_output" 'install pacman uv' \
   'pacman plan includes uv'
+require_contains "$linux_output" 'install pacman bubblewrap' \
+  'pacman plan includes Bubblewrap for sandboxed data queries'
 require_contains "$linux_output" \
-  'ensure uv-tool visidata==3.4 with pyarrow==25.0.0' \
-  'pacman plan includes the exact Parquet viewer tool'
+  'ensure uv-tool visidata==3.4 with pyarrow==25.0.0 and duckdb==1.5.5' \
+  'pacman plan includes the exact data-query tool environment'
 require_contains "$linux_output" 'manual sudo pacman -Syu --needed' 'pacman plan requires an explicit full upgrade'
 require_contains "$linux_output" 'install upstream herdr' 'pacman plan uses the official Herdr installer'
 for provider in \
@@ -1624,9 +1686,11 @@ require_contains "$apt_output" 'install upstream herdr' 'apt plan uses the offic
 require_contains "$apt_output" \
   'ensure upstream uv >=0.11.6 (fallback uv 0.12.5)' \
   'apt plan preserves the uv version floor and pinned fallback'
+require_contains "$apt_output" 'install apt bubblewrap' \
+  'apt plan includes Bubblewrap for sandboxed data queries'
 require_contains "$apt_output" \
-  'ensure uv-tool visidata==3.4 with pyarrow==25.0.0' \
-  'apt plan includes the exact Parquet viewer tool'
+  'ensure uv-tool visidata==3.4 with pyarrow==25.0.0 and duckdb==1.5.5' \
+  'apt plan includes the exact data-query tool environment'
 require_contains "$apt_output" 'blocked community ghostty' 'apt plan blocks community Ghostty without consent'
 apt_lsp_plan=$(printf '%s\n' "$apt_output" | sed -n '/ensure upstream node >=22.0.0/,/ensure npm yaml-language-server@1.24.0/p')
 expected_apt_lsp_plan='  ensure upstream node >=22.0.0 with npm >=10.0.0 (fallback node 24.19.0)
@@ -1687,8 +1751,10 @@ require_contains "$macos_output" \
 require_contains "$macos_output" 'install homebrew-formula neovim' 'Homebrew plan includes Neovim formula'
 require_contains "$macos_output" 'install homebrew-cask ghostty' 'Homebrew plan includes Ghostty cask'
 require_contains "$macos_output" \
-  'ensure uv-tool visidata==3.4 with pyarrow==25.0.0' \
-  'Homebrew plan includes the exact Parquet viewer tool'
+  'ensure uv-tool visidata==3.4 with pyarrow==25.0.0 and duckdb==1.5.5' \
+  'Homebrew plan keeps the shared editor tool environment exact'
+require_excludes "$macos_output" 'bubblewrap' \
+  'Homebrew plan excludes the Linux-only Bubblewrap dependency'
 for provider in \
   bash-language-server \
   vscode-langservers-extracted \
@@ -1773,8 +1839,8 @@ require_contains "$apt_apply_commands" 'direct-install uv' \
   'apt package phase installs the supported uv fallback'
 require_contains "$apt_apply_commands" 'community-installer ghostty' 'apt package phase records the consented Ghostty installer'
 require_contains "$apt_apply_commands" \
-  'uv tool install --force --with pyarrow==25.0.0 --no-config visidata==3.4' \
-  'apt apply installs the exact Parquet viewer tool'
+  'uv tool install --force --with pyarrow==25.0.0 --with duckdb==1.5.5 --no-config visidata==3.4' \
+  'apt apply installs the exact data-query tool environment'
 
 parquet_failure_log=$test_tmp/parquet-failure.commands
 run_capture "$test_tmp/parquet-failure.output" env \
@@ -1798,8 +1864,8 @@ else
   fail 'Parquet viewer installation failure stops the bootstrap'
 fi
 require_contains "$(cat "$parquet_failure_log" 2>/dev/null || true)" \
-  'uv tool install --force --with pyarrow==25.0.0 --no-config visidata==3.4' \
-  'Parquet viewer failure records the attempted exact install'
+  'uv tool install --force --with pyarrow==25.0.0 --with duckdb==1.5.5 --no-config visidata==3.4' \
+  'data-query tool failure records the attempted exact install'
 
 apt_update_line=$(printf '%s\n' "$apt_apply_commands" | grep -nF 'sudo apt-get update' | head -n 1 | cut -d: -f1)
 apt_install_line=$(printf '%s\n' "$apt_apply_commands" | grep -nF 'sudo apt-get install ' | head -n 1 | cut -d: -f1)
@@ -2866,8 +2932,8 @@ require_contains "$brew_apply_commands" 'pinned-installer homebrew a34ae4ee9151c
 require_contains "$brew_apply_commands" 'brew install neovim' 'Homebrew package phase installs missing formulae'
 require_contains "$brew_apply_commands" 'brew install --cask ghostty' 'Homebrew package phase installs missing casks'
 require_contains "$brew_apply_commands" \
-  'uv tool install --force --with pyarrow==25.0.0 --no-config visidata==3.4' \
-  'Homebrew apply installs the exact Parquet viewer tool'
+  'uv tool install --force --with pyarrow==25.0.0 --with duckdb==1.5.5 --no-config visidata==3.4' \
+  'Homebrew apply installs the exact shared editor tool environment'
 if printf '%s\n' "$brew_apply_commands" | grep -Fqx 'brew install bash-language-server' \
   && printf '%s\n' "$brew_apply_commands" | grep -Fqx 'brew install vscode-langservers-extracted' \
   && printf '%s\n' "$brew_apply_commands" | grep -Fqx 'brew install lua-language-server' \
@@ -4188,10 +4254,10 @@ else
 fi
 package_report=$(cat "$package_report_state/dotfiles-bootstrap/package-report/packages-retained.txt" 2>/dev/null || true)
 if printf '%s\n' "$package_report" \
-  | grep -Fqx 'uv-tool visidata@3.4+pyarrow@25.0.0'; then
-  pass 'transaction journals the exact retained Parquet viewer action'
+  | grep -Fqx 'uv-tool visidata@3.4+pyarrow@25.0.0+duckdb@1.5.5'; then
+  pass 'transaction journals the exact retained data-query tool action'
 else
-  fail 'transaction journals the exact retained Parquet viewer action'
+  fail 'transaction journals the exact retained data-query tool action'
 fi
 if printf '%s\n' "$package_report" | grep -Fq 'apt git' \
   && printf '%s\n' "$package_report" | grep -Fq 'apt i3-wm' \
@@ -4211,10 +4277,10 @@ run_capture "$test_tmp/package-report-rollback.output" env \
   "$bootstrap" --rollback package-report
 package_rollback_output=$(cat "$test_tmp/package-report-rollback.output")
 if printf '%s\n' "$package_rollback_output" \
-  | grep -Fqx 'uv-tool visidata@3.4+pyarrow@25.0.0'; then
-  pass 'rollback reports the exact retained Parquet viewer action'
+  | grep -Fqx 'uv-tool visidata@3.4+pyarrow@25.0.0+duckdb@1.5.5'; then
+  pass 'rollback reports the exact retained data-query tool action'
 else
-  fail 'rollback reports the exact retained Parquet viewer action'
+  fail 'rollback reports the exact retained data-query tool action'
 fi
 if [ "$run_status" -eq 0 ] \
   && printf '%s\n' "$package_rollback_output" | grep -Fq 'apt git' \

@@ -422,7 +422,8 @@ emit_package_plan() {
       ;;
     *) die "unsupported package manager: $selected_manager" ;;
   esac
-  printf '%s\n' '  ensure uv-tool visidata==3.4 with pyarrow==25.0.0'
+  printf '%s\n' \
+    '  ensure uv-tool visidata==3.4 with pyarrow==25.0.0 and duckdb==1.5.5'
 }
 
 record_test_command() {
@@ -1885,7 +1886,7 @@ parquet_viewer_is_satisfied() {
   [ -x "$parquet_tool_python" ] && [ -x "$parquet_tool_viewer" ] || return 1
 
   PYTHONDONTWRITEBYTECODE=1 "$parquet_tool_python" -I -B -c \
-    'import importlib.metadata as m,pyarrow; expected={"visidata":"3.4","pyarrow":"25.0.0"}; actual={name:m.version(name) for name in expected}; assert actual == expected, (actual, expected)' \
+    'import importlib.metadata as m,duckdb,pyarrow; expected={"visidata":"3.4","pyarrow":"25.0.0","duckdb":"1.5.5"}; actual={name:m.version(name) for name in expected}; assert actual == expected, (actual, expected); assert duckdb.__version__ == expected["duckdb"]' \
     >/dev/null 2>&1
 }
 
@@ -1936,7 +1937,8 @@ install_parquet_viewer() {
   if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
     && [ "${DOTFILES_BOOTSTRAP_TEST_PARQUET_INSTALL_FAIL:-0}" = 1 ]; then
     record_test_command \
-      uv tool install --force --with pyarrow==25.0.0 --no-config visidata==3.4
+      uv tool install --force --with pyarrow==25.0.0 \
+      --with duckdb==1.5.5 --no-config visidata==3.4
     return 42
   fi
 
@@ -1967,13 +1969,18 @@ install_parquet_viewer() {
       UV_RESOLUTION \
       UV_TORCH_BACKEND
     run_command \
-      "$parquet_uv" tool install --force --with pyarrow==25.0.0 --no-config visidata==3.4
+      "$parquet_uv" tool install --force \
+      --with pyarrow==25.0.0 \
+      --with duckdb==1.5.5 \
+      --no-config visidata==3.4
   ) || return $?
   if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" != 1 ]; then
     parquet_viewer_is_satisfied || return 1
   fi
-  record_package_action uv-tool visidata@3.4+pyarrow@25.0.0
-  printf '%s\n' '  installed uv-tool visidata 3.4 with pyarrow 25.0.0'
+  record_package_action \
+    uv-tool visidata@3.4+pyarrow@25.0.0+duckdb@1.5.5
+  printf '%s\n' \
+    '  installed uv-tool visidata 3.4 with pyarrow 25.0.0 and duckdb 1.5.5'
 }
 
 install_packages() {
