@@ -150,12 +150,20 @@ actual_platform=$("$real_tmux" -S "$socket_path" \
 assert_equal "$expected_platform" "$actual_platform" "fresh platform marker"
 
 passthrough=$("$real_tmux" -S "$socket_path" \
-  show-window-options -gqv allow-passthrough 2>/dev/null) \
+  show-options -wgqv allow-passthrough 2>/dev/null) \
   || fail "could not read global allow-passthrough"
 assert_equal on "$passthrough" "fresh global allow-passthrough"
 
 "$real_tmux" -S "$socket_path" kill-server \
   || fail "fresh private tmux server did not stop"
+case "$socket_path" in
+  "$test_root"/tmux.sock)
+    rm -f "$socket_path"
+    ;;
+  *)
+    fail "refusing to remove unexpected tmux socket: $socket_path"
+    ;;
+esac
 [ ! -e "$socket_path" ] \
   || fail "fresh private tmux socket remained after shutdown"
 socket_path=
