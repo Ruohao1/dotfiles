@@ -347,6 +347,10 @@ local checker_source = table.concat(
   vim.fn.readfile(vim.fs.joinpath(config_root, "dotfiles", "check-terminal-stack")),
   "\n"
 )
+local data_query_integration_source = table.concat(
+  vim.fn.readfile(vim.fs.joinpath(nvim_root, "tests", "data_query_integration.lua")),
+  "\n"
+)
 local plugin_source_test =
   table.concat(vim.fn.readfile(vim.fs.joinpath(nvim_root, "tests", "plugin_source.lua")), "\n")
 
@@ -356,8 +360,17 @@ for _, fragment in ipairs({
   '"$nvim_root/lua/parquet/health.lua"',
   '"$nvim_root/lua/parquet/tool.lua"',
   '"$nvim_root/lua/parquet/viewer.lua"',
+  '"$nvim_root/lua/data_query/health.lua"',
+  '"$nvim_root/lua/data_query/tool.lua"',
+  '"$nvim_root/lua/data_query/workflow.lua"',
+  '"$nvim_root/scripts/data-query-runner.py"',
   '"$nvim_root/lua/plugins/editing.lua"',
   '"$nvim_root/tests/editing.lua"',
+  '"$nvim_root/tests/data_query_health.lua"',
+  '"$nvim_root/tests/data_query_integration.lua"',
+  '"$nvim_root/tests/data_query_runner.py"',
+  '"$nvim_root/tests/data_query_tool.lua"',
+  '"$nvim_root/tests/data_query_workflow.lua"',
   '"$nvim_root/tests/parquet_health.lua"',
   '"$nvim_root/tests/parquet_integration.lua"',
   '"$nvim_root/tests/parquet_tool.lua"',
@@ -377,6 +390,12 @@ for _, fragment in ipairs({
   '-c "luafile $nvim_root/tests/editing.lua"',
   "visidata==3.4",
   "pyarrow==25.0.0",
+  "duckdb==1.5.5",
+  "bubblewrap",
+  "data query runner assertions: ok",
+  "data query tool assertions: ok",
+  "data query workflow assertions: ok",
+  "data query health assertions: ok",
   "parquet tool assertions: ok",
   "parquet viewer assertions: ok",
   "parquet health assertions: ok",
@@ -384,12 +403,44 @@ for _, fragment in ipairs({
   "Neovim Parquet resolver rejects malformed PATH uv and selects managed fallback",
   "Neovim Parquet integration rejects a nonzero viewer exit",
   "Neovim Parquet viewer loads and exits without changing its source",
+  "Neovim data query sandbox prevents host writes and network access",
+  "Neovim data query round trip preserves CSV TSV and Parquet sources",
+  "Neovim managed data query runner has exact DuckDB 1.5.5 and PyArrow 25.0.0",
+  "Neovim data query live Linux integration intentionally skipped on macOS",
+  "--kill-after=5s",
+  "command -p -v timeout",
+  "data_query_reap_owned_processes",
+  "data_query_cache_parent_is_empty",
+  "os.O_WRONLY|os.O_CREAT|os.O_EXCL",
   "Neovim lockfile contains exactly fifteen object-valued pinned plugins",
   "Neovim fifteen-plugin revision and source trust gate satisfied",
 }) do
   assert(
     checker_source:find(fragment, 1, true),
     "checker missing editing helper contract fragment: " .. fragment
+  )
+end
+
+local global_command_contract = checker_source:match("for required_command in ([^\n]+); do")
+assert(global_command_contract, "checker global command contract is missing")
+for _, linux_only in ipairs({ "bwrap", "readlink", "timeout" }) do
+  assert(
+    not global_command_contract:find(linux_only, 1, true),
+    "checker globally requires Linux-only command: " .. linux_only
+  )
+end
+
+for _, fragment in ipairs({
+  'autocmd.pattern == "DotfilesParquetViewerReady"',
+  "vim.api.nvim_del_autocmd",
+  "DQ-SENTINEL",
+  "import pyarrow as pa,pyarrow.parquet as pq",
+  "managed PyArrow changed while reading a query result",
+  "could not record live integration child identity",
+}) do
+  assert(
+    data_query_integration_source:find(fragment, 1, true),
+    "data-query integration test missing structural contract fragment: " .. fragment
   )
 end
 

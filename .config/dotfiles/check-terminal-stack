@@ -2195,6 +2195,12 @@ nvim_parquet_versions_are_exact() {
     'import importlib.metadata as m,pyarrow; expected_specs=("visidata==3.4","pyarrow==25.0.0"); expected=dict(spec.split("==",1) for spec in expected_specs); actual={name:m.version(name) for name in expected}; assert actual == expected, (actual, expected)'
 }
 
+nvim_data_query_versions_are_exact() {
+  [ "$#" -eq 1 ] || return 2
+  PYTHONDONTWRITEBYTECODE=1 "$1" -I -B -c \
+    'import importlib.metadata as m,duckdb,pyarrow; expected_specs=("visidata==3.4","pyarrow==25.0.0","duckdb==1.5.5"); expected=dict(spec.split("==",1) for spec in expected_specs); actual={name:m.version(name) for name in expected}; assert actual == expected, (actual, expected)'
+}
+
 parquet_file_fingerprint() {
   [ "$#" -eq 1 ] || return 2
   [ -x "$parquet_tool_python" ] || return 1
@@ -2515,6 +2521,594 @@ resolve_nvim_parquet_tool() {
   esac
   nvim_parquet_versions_are_exact "$parquet_tool_python" \
     >> "$parquet_probe_output" 2>&1
+}
+
+run_nvim_data_query_resolver_selection_test() {
+  data_query_selection_root="$check_tmp/nvim-data-query-resolver-selection"
+  data_query_selection_output="$data_query_selection_root/output.txt"
+  data_query_selection_log="$data_query_selection_root/nvim.log"
+  data_query_selection_nvim=$(command -v nvim 2>/dev/null || true)
+  case "$data_query_selection_nvim" in
+    /*) [ -x "$data_query_selection_nvim" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  if ! (umask 077 && mkdir -p \
+    "$data_query_selection_root/home" \
+    "$data_query_selection_root/config" \
+    "$data_query_selection_root/data" \
+    "$data_query_selection_root/state" \
+    "$data_query_selection_root/cache" \
+    "$data_query_selection_root/runtime" \
+    "$data_query_selection_root/path-bin" \
+    "$data_query_selection_root/managed-bin" \
+    "$data_query_selection_root/tools/visidata/bin"); then
+    return 1
+  fi
+  : > "$data_query_selection_log"
+  if env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
+    HOME="$data_query_selection_root/home" \
+    XDG_CONFIG_HOME="$data_query_selection_root/config" \
+    XDG_DATA_HOME="$data_query_selection_root/data" \
+    XDG_STATE_HOME="$data_query_selection_root/state" \
+    XDG_CACHE_HOME="$data_query_selection_root/cache" \
+    XDG_RUNTIME_DIR="$data_query_selection_root/runtime" \
+    NVIM_LOG_FILE="$data_query_selection_log" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    DOTFILES_NVIM_ROOT="$nvim_root" \
+    DOTFILES_DATA_QUERY_RESOLVER_SELECTION_TEST=1 \
+    DOTFILES_DATA_QUERY_SELECTION_ROOT="$data_query_selection_root" \
+    "$data_query_selection_nvim" --clean --headless -u NONE -i NONE \
+    -c 'lua vim.opt.runtimepath:prepend(vim.env.DOTFILES_NVIM_ROOT)' \
+    -l "$nvim_root/tests/data_query_integration.lua" \
+    > "$data_query_selection_output" 2>&1 \
+    && ! nvim_log_has_error "$data_query_selection_output" \
+    && grep -Fqx 'data query resolver selection assertions: ok' \
+      "$data_query_selection_output" \
+    && [ ! -s "$data_query_selection_log" ]; then
+    return 0
+  fi
+
+  [ ! -s "$data_query_selection_output" ] \
+    || sed 's/^/      /' "$data_query_selection_output" >&2
+  [ ! -s "$data_query_selection_log" ] \
+    || sed 's/^/      /' "$data_query_selection_log" >&2
+  return 1
+}
+
+resolve_nvim_data_query_tool() {
+  [ "$platform" = "linux" ] || return 2
+  [ "$data_query_linux_tools_ready" = true ] || return 1
+  data_query_resolver_root="$check_tmp/nvim-data-query-resolver"
+  data_query_resolver_report="$data_query_resolver_root/report.json"
+  data_query_resolver_log="$data_query_resolver_root/nvim.log"
+  data_query_resolver_nvim=$(command -v nvim 2>/dev/null || true)
+  data_query_resolver_jq=$(command -v jq 2>/dev/null || true)
+  case "$data_query_resolver_nvim" in
+    /*) [ -x "$data_query_resolver_nvim" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  case "$data_query_resolver_jq" in
+    /*) [ -x "$data_query_resolver_jq" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  if ! (umask 077 && mkdir -p \
+    "$data_query_resolver_root/home" \
+    "$data_query_resolver_root/config" \
+    "$data_query_resolver_root/state" \
+    "$data_query_resolver_root/cache" \
+    "$data_query_resolver_root/runtime"); then
+    return 1
+  fi
+  : > "$data_query_resolver_log"
+
+  if ! env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
+    HOME="$data_query_resolver_root/home" \
+    XDG_CONFIG_HOME="$data_query_resolver_root/config" \
+    XDG_DATA_HOME="$data_home" \
+    XDG_STATE_HOME="$data_query_resolver_root/state" \
+    XDG_CACHE_HOME="$data_query_resolver_root/cache" \
+    XDG_RUNTIME_DIR="$data_query_resolver_root/runtime" \
+    NVIM_LOG_FILE="$data_query_resolver_log" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_OFFLINE=1 \
+    DOTFILES_NVIM_ROOT="$nvim_root" \
+    DOTFILES_DATA_QUERY_REPORT="$data_query_resolver_report" \
+    "$data_query_resolver_nvim" --clean --headless -u NONE -i NONE \
+    -c 'lua vim.opt.runtimepath:prepend(vim.env.DOTFILES_NVIM_ROOT)' \
+    -c 'lua local report = require("data_query.tool").probe({ refresh = true }); assert(vim.fn.writefile({ vim.json.encode(report) }, vim.env.DOTFILES_DATA_QUERY_REPORT) == 0)' \
+    -c qa > "$data_query_probe_output" 2>&1 \
+    || nvim_log_has_error "$data_query_probe_output" \
+    || [ -s "$data_query_resolver_log" ]; then
+    return 1
+  fi
+
+  # shellcheck disable=SC2016  # Preserve the jq $runner binding literally.
+  if ! "$data_query_resolver_jq" -e \
+    --arg runner "$nvim_root/scripts/data-query-runner.py" '
+      def safe_absolute:
+        type == "string"
+        and length > 1
+        and startswith("/")
+        and (test("[[:cntrl:]]") | not);
+      type == "object"
+      and .ok == true
+      and (.errors | type == "array" and length == 0)
+      and .expected == {"duckdb":"1.5.5","pyarrow":"25.0.0","uv":"0.11.6","visidata":"3.4"}
+      and .platform == "Linux"
+      and (.uv | type == "object" and .ok == true and (.path | safe_absolute) and (.version | type == "string"))
+      and (.environment | safe_absolute)
+      and (.python | safe_absolute)
+      and (.viewer | type == "object" and .ok == true and .version == "3.4" and (.path | safe_absolute))
+      and (.pyarrow | type == "object" and .ok == true and .version == "25.0.0" and (.path | safe_absolute))
+      and (.duckdb | type == "object" and .ok == true and .version == "1.5.5" and (.path | safe_absolute))
+      and (.sandbox | type == "object" and .ok == true and (.path | safe_absolute) and (.version | type == "string") and .probe == "data-query-sandbox-ok")
+      and (.runner | type == "object" and .ok == true and .path == $runner)
+    ' "$data_query_resolver_report" > /dev/null 2>> "$data_query_probe_output"; then
+    return 1
+  fi
+
+  data_query_tool_uv=$("$data_query_resolver_jq" -er '.uv.path' \
+    "$data_query_resolver_report" 2>> "$data_query_probe_output") || return 1
+  data_query_tool_environment=$("$data_query_resolver_jq" -er '.environment' \
+    "$data_query_resolver_report" 2>> "$data_query_probe_output") || return 1
+  data_query_tool_python=$("$data_query_resolver_jq" -er '.python' \
+    "$data_query_resolver_report" 2>> "$data_query_probe_output") || return 1
+  data_query_tool_viewer=$("$data_query_resolver_jq" -er '.viewer.path' \
+    "$data_query_resolver_report" 2>> "$data_query_probe_output") || return 1
+  data_query_tool_pyarrow=$("$data_query_resolver_jq" -er '.pyarrow.path' \
+    "$data_query_resolver_report" 2>> "$data_query_probe_output") || return 1
+  data_query_tool_duckdb=$("$data_query_resolver_jq" -er '.duckdb.path' \
+    "$data_query_resolver_report" 2>> "$data_query_probe_output") || return 1
+  data_query_tool_bwrap=$("$data_query_resolver_jq" -er '.sandbox.path' \
+    "$data_query_resolver_report" 2>> "$data_query_probe_output") || return 1
+  data_query_tool_runner=$("$data_query_resolver_jq" -er '.runner.path' \
+    "$data_query_resolver_report" 2>> "$data_query_probe_output") || return 1
+  data_query_tool_uv_directory=${data_query_tool_uv%/*}
+  [ -n "$data_query_tool_uv_directory" ] || data_query_tool_uv_directory=/
+
+  [ "$data_query_tool_uv" = "$parquet_tool_uv" ] \
+    && [ "$data_query_tool_environment" = "$parquet_tool_environment" ] \
+    && [ "$data_query_tool_python" = "$parquet_tool_python" ] \
+    && [ "$data_query_tool_viewer" = "$parquet_tool_viewer" ] \
+    && [ "$data_query_tool_pyarrow" = "$parquet_tool_pyarrow" ] \
+    && [ "$data_query_tool_runner" = "$nvim_root/scripts/data-query-runner.py" ] \
+    && [ -x "$data_query_tool_python" ] \
+    && [ -x "$data_query_tool_viewer" ] \
+    && [ -r "$data_query_tool_pyarrow" ] \
+    && [ -r "$data_query_tool_duckdb" ] \
+    && [ -x "$data_query_tool_bwrap" ] \
+    && [ -r "$data_query_tool_runner" ] \
+    || return 1
+  case "$data_query_tool_pyarrow" in
+    "$data_query_tool_environment"/*) ;;
+    *) return 1 ;;
+  esac
+  case "$data_query_tool_duckdb" in
+    "$data_query_tool_environment"/*) ;;
+    *) return 1 ;;
+  esac
+  PYTHONDONTWRITEBYTECODE=1 "$data_query_tool_python" -I -B -c \
+    'import os,stat,sys; path=sys.argv[1]; value=os.lstat(path); assert stat.S_ISREG(value.st_mode); assert value.st_uid == 0; assert value.st_mode & 0o022 == 0; assert os.access(path,os.X_OK)' \
+    "$data_query_tool_bwrap" >> "$data_query_probe_output" 2>&1 \
+    && nvim_data_query_versions_are_exact "$data_query_tool_python" \
+      >> "$data_query_probe_output" 2>&1 \
+    && [ ! -e "$data_query_resolver_root/cache/nvim/dotfiles-data-query" ] \
+    && [ ! -L "$data_query_resolver_root/cache/nvim/dotfiles-data-query" ]
+}
+
+data_query_cache_parent_is_empty() {
+  [ "$#" -eq 1 ] || return 2
+  data_query_instance_parent=$1
+  [ ! -L "$data_query_instance_parent" ] || return 1
+  if [ ! -e "$data_query_instance_parent" ]; then
+    return 0
+  fi
+  [ -d "$data_query_instance_parent" ] || return 1
+  for data_query_instance_path in \
+    "$data_query_instance_parent"/* \
+    "$data_query_instance_parent"/.[!.]* \
+    "$data_query_instance_parent"/..?*
+  do
+    [ ! -e "$data_query_instance_path" ] \
+      && [ ! -L "$data_query_instance_path" ] \
+      && continue
+    return 1
+  done
+  return 0
+}
+
+data_query_processes_absent() {
+  [ "$#" -eq 2 ] || return 2
+  data_query_process_root=$1
+  data_query_process_snapshot=$2
+  ps -eo pid=,comm=,args= > "$data_query_process_snapshot" 2>/dev/null || return 1
+  ! grep -F "$data_query_process_root" "$data_query_process_snapshot" > /dev/null 2>&1
+}
+
+data_query_recorded_processes_absent() {
+  [ "$#" -eq 2 ] || return 2
+  [ "$platform" = "linux" ] || return 2
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  case "$2" in
+    0|1) ;;
+    *) return 2 ;;
+  esac
+  PYTHONDONTWRITEBYTECODE=1 "$data_query_tool_python" -I -B -c \
+    'import pathlib,re,sys; records=pathlib.Path(sys.argv[1]).read_text(encoding="ascii").splitlines(); assert records or sys.argv[2] == "0"; assert all(re.fullmatch(r"[1-9][0-9]*:[1-9][0-9]*",record) for record in records); assert len(records) == len(set(records)); active=[]
+for record in records:
+ pid_text,ticks_text=record.split(":",1); path=pathlib.Path("/proc")/pid_text/"stat"
+ try: value=path.read_text(encoding="ascii")
+ except (FileNotFoundError,ProcessLookupError): continue
+ except PermissionError as error: raise AssertionError(f"permission denied reading {path}") from error
+ close=value.rfind(")"); assert close > 1, (record,value); assert value[:value.find(" ")] == pid_text, (record,value); fields=value[close+1:].split(); assert len(fields) >= 20 and fields[19].isdigit() and int(fields[19]) > 0, (record,value)
+ if fields[19] == ticks_text: active.append(record)
+assert not active, active' \
+    "$1" "$2"
+}
+
+data_query_reap_owned_processes() {
+  [ "$#" -eq 2 ] || return 2
+  [ "$platform" = "linux" ] || return 2
+  data_query_reap_root=$1
+  data_query_reap_records=$2
+  case "$data_query_reap_root" in
+    "$check_tmp"/nvim-data-query-*) ;;
+    *) return 2 ;;
+  esac
+  [ -f "$data_query_reap_records" ] \
+    && [ ! -L "$data_query_reap_records" ] \
+    || return 1
+  PYTHONDONTWRITEBYTECODE=1 "$data_query_tool_python" -I -B -c \
+    'import os,pathlib,re,signal,sys,time
+root=sys.argv[1].encode(); record_path=pathlib.Path(sys.argv[2]); lines=record_path.read_text(encoding="ascii").splitlines(); assert all(re.fullmatch(r"[1-9][0-9]*:[1-9][0-9]*",line) for line in lines); recorded={int(line.split(":",1)[0]):int(line.split(":",1)[1]) for line in lines}; assert len(recorded) == len(lines)
+def identity(pid,strict=False):
+ path=pathlib.Path("/proc")/str(pid)/"stat"
+ try: value=path.read_text(encoding="ascii")
+ except (FileNotFoundError,ProcessLookupError): return None
+ except PermissionError:
+  if strict: raise
+  return None
+ close=value.rfind(")")
+ if close <= 1:
+  if strict: raise AssertionError(f"malformed {path}")
+  return None
+ fields=value[close+1:].split()
+ if len(fields) < 20 or not fields[19].isdigit():
+  if strict: raise AssertionError(f"malformed {path}")
+  return None
+ return int(fields[19])
+def owned():
+ matches={}
+ for entry in pathlib.Path("/proc").iterdir():
+  if not entry.name.isdigit(): continue
+  pid=int(entry.name)
+  if pid in (os.getpid(),os.getppid()): continue
+  expected=recorded.get(pid); ticks=identity(pid,expected is not None)
+  if ticks is None: continue
+  exact=expected == ticks
+  try: command=(entry/"cmdline").read_bytes()
+  except (FileNotFoundError,ProcessLookupError,PermissionError): command=b""
+  if exact or root in command: matches[pid]=ticks
+ return matches
+def signal_owned(sig):
+ for pid,ticks in owned().items():
+  if identity(pid,True) != ticks: continue
+  try: os.kill(pid,sig)
+  except (FileNotFoundError,ProcessLookupError): pass
+signal_owned(signal.SIGTERM)
+deadline=time.monotonic()+2.0
+while owned() and time.monotonic()<deadline: time.sleep(0.02)
+signal_owned(signal.SIGKILL)
+deadline=time.monotonic()+5.0
+while owned() and time.monotonic()<deadline: time.sleep(0.02)
+assert not owned(), owned()' \
+    "$data_query_reap_root" "$data_query_reap_records"
+}
+
+data_query_integration_postchecks() {
+  [ "$#" -eq 4 ] || return 2
+  data_query_postcheck_root=$1
+  data_query_postcheck_records=$2
+  data_query_postcheck_snapshot=$3
+  data_query_postcheck_require_records=$4
+  data_query_postcheck_ready=true
+  data_query_cache_parent_is_empty \
+    "$data_query_postcheck_root/cache/nvim/dotfiles-data-query" \
+    || data_query_postcheck_ready=false
+  data_query_processes_absent \
+    "$data_query_postcheck_root" "$data_query_postcheck_snapshot" \
+    || data_query_postcheck_ready=false
+  data_query_recorded_processes_absent \
+    "$data_query_postcheck_records" "$data_query_postcheck_require_records" \
+    || data_query_postcheck_ready=false
+  [ "$data_query_postcheck_ready" = true ]
+}
+
+run_nvim_data_query_integration_test() {
+  [ "$#" -eq 7 ] || return 2
+  [ "$platform" = "linux" ] || return 2
+  [ "$data_query_linux_tools_ready" = true ] || return 1
+  data_query_integration_mode=$1
+  data_query_integration_csv=$2
+  data_query_integration_tsv=$3
+  data_query_integration_parquet=$4
+  data_query_integration_root=$5
+  data_query_integration_output=$6
+  data_query_integration_log=$7
+  data_query_integration_notifications="$data_query_integration_root/notifications.txt"
+  data_query_integration_pids="$data_query_integration_root/child-pids.txt"
+  data_query_integration_cache_parent="$data_query_integration_root/cache/nvim/dotfiles-data-query"
+  data_query_integration_env=$(command -p -v env 2>/dev/null || true)
+  data_query_integration_nvim=$(command -v nvim 2>/dev/null || true)
+  case "$data_query_integration_env" in
+    /*) [ -x "$data_query_integration_env" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  case "$data_query_integration_nvim" in
+    /*) [ -x "$data_query_integration_nvim" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  case "$data_query_timeout" in
+    /*) [ -x "$data_query_timeout" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  [ -d "$data_query_tool_uv_directory" ] || return 1
+  : > "$data_query_integration_log"
+  : > "$data_query_integration_notifications"
+  : > "$data_query_integration_pids"
+
+  nvim_parquet_with_path_entry "$data_query_tool_uv_directory" \
+    "$data_query_integration_env" -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
+    HOME="$data_query_integration_root/home" \
+    TMPDIR="$data_query_integration_root/tmp" \
+    XDG_CONFIG_HOME="$config_root" \
+    XDG_DATA_HOME="$data_home" \
+    XDG_STATE_HOME="$data_query_integration_root/state" \
+    XDG_CACHE_HOME="$data_query_integration_root/cache" \
+    XDG_RUNTIME_DIR="$data_query_integration_root/runtime" \
+    NVIM_LOG_FILE="$data_query_integration_log" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_OFFLINE=1 \
+    TERM=xterm-256color \
+    TERM_PROGRAM=ghostty \
+    DOTFILES_NVIM_SKIP_PARSER_INSTALL=1 \
+    DOTFILES_DATA_QUERY_MODE="$data_query_integration_mode" \
+    DOTFILES_DATA_QUERY_CSV="$data_query_integration_csv" \
+    DOTFILES_DATA_QUERY_TSV="$data_query_integration_tsv" \
+    DOTFILES_DATA_QUERY_PARQUET="$data_query_integration_parquet" \
+    DOTFILES_DATA_QUERY_CACHE_PARENT="$data_query_integration_cache_parent" \
+    DOTFILES_DATA_QUERY_NOTIFICATIONS="$data_query_integration_notifications" \
+    DOTFILES_DATA_QUERY_PIDS="$data_query_integration_pids" \
+    DOTFILES_DATA_QUERY_EXPECTED_UV="$data_query_tool_uv" \
+    DOTFILES_DATA_QUERY_EXPECTED_ENVIRONMENT="$data_query_tool_environment" \
+    DOTFILES_DATA_QUERY_EXPECTED_PYTHON="$data_query_tool_python" \
+    DOTFILES_DATA_QUERY_EXPECTED_VIEWER="$data_query_tool_viewer" \
+    DOTFILES_DATA_QUERY_EXPECTED_PYARROW="$data_query_tool_pyarrow" \
+    DOTFILES_DATA_QUERY_EXPECTED_DUCKDB="$data_query_tool_duckdb" \
+    DOTFILES_DATA_QUERY_EXPECTED_BWRAP="$data_query_tool_bwrap" \
+    DOTFILES_DATA_QUERY_EXPECTED_RUNNER="$data_query_tool_runner" \
+    "$data_query_timeout" --kill-after=5s 45s \
+    "$data_query_integration_nvim" --headless -i NONE \
+    --cmd 'lua local path = vim.env.DOTFILES_DATA_QUERY_NOTIFICATIONS; vim.notify = function(message) pcall(vim.fn.writefile, vim.split(tostring(message), "\n", { plain = true }), path, "a") end' \
+    -c "luafile $nvim_root/tests/data_query_integration.lua" \
+    -c qa > "$data_query_integration_output" 2>&1
+}
+
+run_nvim_data_query_sandbox_probe() {
+  [ "$platform" = "linux" ] || return 2
+  [ "$data_query_linux_tools_ready" = true ] || return 1
+  data_query_sandbox_root="$check_tmp/nvim-data-query-sandbox"
+  data_query_sandbox_project="$data_query_sandbox_root/project"
+  data_query_sandbox_home="$data_query_sandbox_root/home"
+  data_query_sandbox_host_tmp="$data_query_sandbox_root/host-tmp"
+  data_query_sandbox_workspace="$data_query_sandbox_root/workspace"
+  data_query_sandbox_spill="$data_query_sandbox_workspace/spill"
+  data_query_sandbox_source="$data_query_sandbox_project/sandbox.csv"
+  data_query_sandbox_sibling="$data_query_sandbox_project/sibling.txt"
+  data_query_sandbox_home_target="$data_query_sandbox_home/target.txt"
+  data_query_sandbox_tmp_target="$data_query_sandbox_host_tmp/target.txt"
+  data_query_sandbox_result="$data_query_sandbox_workspace/result.parquet"
+  data_query_sandbox_marker="$data_query_sandbox_workspace/sandbox-marker"
+  data_query_sandbox_probe="$data_query_sandbox_root/data-query-probe.py"
+  data_query_sandbox_launcher="$data_query_sandbox_root/launch-probe.py"
+  data_query_sandbox_argv="$data_query_sandbox_root/argv.json"
+  data_query_sandbox_output="$data_query_sandbox_root/output.json"
+  data_query_sandbox_error="$data_query_sandbox_root/error.txt"
+  data_query_sandbox_log="$data_query_sandbox_root/nvim.log"
+  data_query_sandbox_pids="$data_query_sandbox_root/child-pids.txt"
+  data_query_sandbox_processes="$data_query_sandbox_root/processes.txt"
+  data_query_sandbox_parent_net=$(PYTHONDONTWRITEBYTECODE=1 \
+    "$data_query_tool_python" -I -B -c \
+      'import os; print(os.readlink("/proc/self/ns/net"))' \
+    2>/dev/null || true)
+  case "$data_query_sandbox_parent_net" in
+    net:\[*\]) ;;
+    *) return 1 ;;
+  esac
+  if ! (umask 077 && mkdir -p \
+    "$data_query_sandbox_project" \
+    "$data_query_sandbox_home" \
+    "$data_query_sandbox_host_tmp" \
+    "$data_query_sandbox_spill" \
+    "$data_query_sandbox_root/config" \
+    "$data_query_sandbox_root/state" \
+    "$data_query_sandbox_root/cache" \
+    "$data_query_sandbox_root/runtime"); then
+    return 1
+  fi
+  chmod 700 "$data_query_sandbox_workspace" "$data_query_sandbox_spill" || return 1
+  printf '%s\n' 'id,label' '1,sandbox' > "$data_query_sandbox_source"
+  chmod 600 "$data_query_sandbox_source"
+  : > "$data_query_sandbox_pids"
+  [ ! -e "$data_query_sandbox_sibling" ] \
+    && [ ! -L "$data_query_sandbox_sibling" ] \
+    && [ ! -e "$data_query_sandbox_home_target" ] \
+    && [ ! -L "$data_query_sandbox_home_target" ] \
+    && [ ! -e "$data_query_sandbox_tmp_target" ] \
+    && [ ! -L "$data_query_sandbox_tmp_target" ] \
+    || return 1
+
+  # shellcheck disable=SC2016  # Preserve Python source literally.
+  printf '%s\n' \
+    'import argparse,json,os,socket' \
+    'parser=argparse.ArgumentParser()' \
+    'parser.add_argument("--source",required=True)' \
+    'parser.add_argument("--workspace",required=True)' \
+    'parser.add_argument("--result",required=True)' \
+    'parser.add_argument("--probe-sibling",required=True)' \
+    'parser.add_argument("--probe-home",required=True)' \
+    'parser.add_argument("--probe-host-tmp",required=True)' \
+    'parser.add_argument("--parent-net-ns",required=True)' \
+    'args=parser.parse_args()' \
+    'def blocked_write(path):' \
+    '    try:' \
+    '        with open(path,"r+b") as handle: handle.write(b"blocked-write")' \
+    '    except OSError:' \
+    '        return True' \
+    '    return False' \
+    'def blocked_create(path):' \
+    '    descriptor=None' \
+    '    try:' \
+    '        descriptor=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)' \
+    '        os.write(descriptor,b"forbidden-create")' \
+    '    except OSError:' \
+    '        return True' \
+    '    finally:' \
+    '        if descriptor is not None: os.close(descriptor)' \
+    '    return False' \
+    'marker=os.path.join(args.workspace,"sandbox-marker")' \
+    'with open(marker,"xb") as handle: handle.write(b"workspace-only\n")' \
+    'child_net=os.readlink("/proc/self/ns/net")' \
+    'default_route=False' \
+    'with open("/proc/net/route",encoding="ascii") as handle:' \
+    '    next(handle,None)' \
+    '    default_route=any(line.split()[1] == "00000000" for line in handle if len(line.split()) > 1)' \
+    'connection_failed=False' \
+    'probe_socket=socket.socket()' \
+    'probe_socket.settimeout(0.25)' \
+    'try:' \
+    '    probe_socket.connect(("1.1.1.1",53))' \
+    'except OSError:' \
+    '    connection_failed=True' \
+    'finally:' \
+    '    probe_socket.close()' \
+    'forbidden={"VIRTUAL_ENV","CONDA_PREFIX","CONDA_DEFAULT_ENV","PYTHONPATH","PYTHONHOME","UV_PROJECT_ENVIRONMENT","POETRY_ACTIVE","PIP_CONFIG_FILE","AWS_ACCESS_KEY_ID","AWS_SECRET_ACCESS_KEY","AWS_SESSION_TOKEN","GOOGLE_APPLICATION_CREDENTIALS","AZURE_CLIENT_ID","AZURE_CLIENT_SECRET","HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","NO_PROXY","http_proxy","https_proxy","all_proxy","no_proxy","DUCKDB_EXTENSION_REPOSITORY"}' \
+    'record={"source_write_blocked":blocked_write(args.source),"sibling_write_blocked":blocked_create(args.probe_sibling),"home_write_blocked":blocked_create(args.probe_home),"host_tmp_write_blocked":blocked_create(args.probe_host_tmp),"workspace_write_succeeded":os.path.isfile(marker),"network_namespace_changed":child_net != args.parent_net_ns,"default_route_absent":not default_route,"network_connection_failed":connection_failed,"environment_isolated":not (forbidden & set(os.environ)) and os.environ.get("HOME") == "/nonexistent"}' \
+    'print(json.dumps(record,sort_keys=True,separators=(",",":")))' \
+    > "$data_query_sandbox_probe"
+
+  # shellcheck disable=SC2016  # Preserve Python source literally.
+  printf '%s\n' \
+    'import json,subprocess,sys' \
+    'argv=json.load(open(sys.argv[1],encoding="utf-8"))' \
+    'insert_at=argv.index("--chdir")' \
+    'argv[insert_at:insert_at]=["--ro-bind",sys.argv[2],"/tmp/dotfiles-data-query-probe.py"]' \
+    'runner_at=argv.index(sys.argv[3])' \
+    'argv[runner_at]="/tmp/dotfiles-data-query-probe.py"' \
+    'argv.extend(["--probe-sibling",sys.argv[4],"--probe-home",sys.argv[5],"--probe-host-tmp",sys.argv[6],"--parent-net-ns",sys.argv[7]])' \
+    'poisoned={"PATH":"/usr/bin:/bin","VIRTUAL_ENV":"/poison/venv","CONDA_PREFIX":"/poison/conda","PYTHONPATH":"/poison/python","UV_PROJECT_ENVIRONMENT":"/poison/uv","POETRY_ACTIVE":"1","HTTP_PROXY":"http://poison.invalid","AWS_ACCESS_KEY_ID":"poison","GOOGLE_APPLICATION_CREDENTIALS":"/poison/google.json","AZURE_CLIENT_SECRET":"poison","DUCKDB_EXTENSION_REPOSITORY":"https://poison.invalid"}' \
+    'result=subprocess.run(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=poisoned,check=False)' \
+    'sys.stdout.write(result.stdout)' \
+    'sys.stderr.write(result.stderr)' \
+    'raise SystemExit(result.returncode)' \
+    > "$data_query_sandbox_launcher"
+  chmod 600 "$data_query_sandbox_probe" "$data_query_sandbox_launcher"
+
+  data_query_sandbox_source_before=$(parquet_file_fingerprint \
+    "$data_query_sandbox_source" 2>/dev/null || true)
+  [ -n "$data_query_sandbox_source_before" ] || return 1
+  : > "$data_query_sandbox_log"
+
+  if ! env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
+    HOME="$data_query_sandbox_home" \
+    XDG_CONFIG_HOME="$data_query_sandbox_root/config" \
+    XDG_DATA_HOME="$data_home" \
+    XDG_STATE_HOME="$data_query_sandbox_root/state" \
+    XDG_CACHE_HOME="$data_query_sandbox_root/cache" \
+    XDG_RUNTIME_DIR="$data_query_sandbox_root/runtime" \
+    NVIM_LOG_FILE="$data_query_sandbox_log" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_OFFLINE=1 \
+    DOTFILES_NVIM_ROOT="$nvim_root" \
+    DOTFILES_DATA_QUERY_SANDBOX_ARGV="$data_query_sandbox_argv" \
+    DOTFILES_DATA_QUERY_SANDBOX_SOURCE="$data_query_sandbox_source" \
+    DOTFILES_DATA_QUERY_SANDBOX_WORKSPACE="$data_query_sandbox_workspace" \
+    DOTFILES_DATA_QUERY_SANDBOX_RESULT="$data_query_sandbox_result" \
+    nvim --clean --headless -u NONE -i NONE \
+    -c 'lua vim.opt.runtimepath:prepend(vim.env.DOTFILES_NVIM_ROOT)' \
+    -c 'lua local argv, virtual, failure = require("data_query.tool").command({ source = vim.env.DOTFILES_DATA_QUERY_SANDBOX_SOURCE, visible_name = "sandbox.csv", workspace = vim.env.DOTFILES_DATA_QUERY_SANDBOX_WORKSPACE, result = vim.env.DOTFILES_DATA_QUERY_SANDBOX_RESULT }); assert(argv, failure); assert(virtual == "/tmp/dotfiles-data-query-source/sandbox.csv"); assert(vim.fn.writefile({ vim.json.encode(argv) }, vim.env.DOTFILES_DATA_QUERY_SANDBOX_ARGV) == 0)' \
+    -c qa >> "$data_query_sandbox_error" 2>&1 \
+    || nvim_log_has_error "$data_query_sandbox_error" \
+    || [ -s "$data_query_sandbox_error" ] \
+    || [ -s "$data_query_sandbox_log" ]; then
+    return 1
+  fi
+
+  data_query_sandbox_status=0
+  PYTHONDONTWRITEBYTECODE=1 \
+    "$data_query_timeout" --kill-after=5s 45s \
+    "$data_query_tool_python" -I -B \
+      "$data_query_sandbox_launcher" \
+      "$data_query_sandbox_argv" \
+      "$data_query_sandbox_probe" \
+      "$data_query_tool_runner" \
+      "$data_query_sandbox_sibling" \
+      "$data_query_sandbox_home_target" \
+      "$data_query_sandbox_tmp_target" \
+      "$data_query_sandbox_parent_net" \
+      > "$data_query_sandbox_output" 2> "$data_query_sandbox_error" \
+    || data_query_sandbox_status=$?
+  if [ "$data_query_sandbox_status" -ne 0 ]; then
+    data_query_reap_owned_processes \
+      "$data_query_sandbox_root" "$data_query_sandbox_pids" \
+      >> "$data_query_sandbox_error" 2>&1 \
+      || true
+    data_query_processes_absent \
+      "$data_query_sandbox_root" "$data_query_sandbox_processes" \
+      || return 1
+    return 1
+  fi
+
+  if jq -e '
+      . == {
+        "default_route_absent":true,
+        "environment_isolated":true,
+        "home_write_blocked":true,
+        "host_tmp_write_blocked":true,
+        "network_connection_failed":true,
+        "network_namespace_changed":true,
+        "sibling_write_blocked":true,
+        "source_write_blocked":true,
+        "workspace_write_succeeded":true
+      }
+    ' "$data_query_sandbox_output" > /dev/null 2>> "$data_query_sandbox_error" \
+    && [ ! -s "$data_query_sandbox_error" ] \
+    && [ ! -s "$data_query_sandbox_log" ] \
+    && [ -f "$data_query_sandbox_marker" ] \
+    && [ ! -e "$data_query_sandbox_result" ] \
+    && [ ! -L "$data_query_sandbox_result" ] \
+    && PYTHONDONTWRITEBYTECODE=1 "$data_query_tool_python" -I -B -c \
+      'import os,sys; assert set(os.listdir(sys.argv[1])) == {"sandbox-marker","spill"}; assert open(os.path.join(sys.argv[1],"sandbox-marker"),"rb").read() == b"workspace-only\n"' \
+      "$data_query_sandbox_workspace" \
+    && [ "$(parquet_file_fingerprint "$data_query_sandbox_source")" = "$data_query_sandbox_source_before" ] \
+    && [ ! -e "$data_query_sandbox_sibling" ] \
+    && [ ! -L "$data_query_sandbox_sibling" ] \
+    && [ ! -e "$data_query_sandbox_home_target" ] \
+    && [ ! -L "$data_query_sandbox_home_target" ] \
+    && [ ! -e "$data_query_sandbox_tmp_target" ] \
+    && [ ! -L "$data_query_sandbox_tmp_target" ] \
+    && data_query_processes_absent \
+      "$data_query_sandbox_root" "$data_query_sandbox_processes"; then
+    return 0
+  fi
+  data_query_reap_owned_processes \
+    "$data_query_sandbox_root" "$data_query_sandbox_pids" \
+    >> "$data_query_sandbox_error" 2>&1 \
+    || true
+  data_query_processes_absent \
+    "$data_query_sandbox_root" "$data_query_sandbox_processes" \
+    || return 1
+  return 1
 }
 
 run_nvim_parquet_integration_test() {
@@ -6128,6 +6722,13 @@ case "${DOTFILES_CHECK_MODE:-}" in
       || sed 's/^/      /' "$parquet_probe_output" >&2
     exit 1
     ;;
+  nvim-data-query-resolver-self-test)
+    if run_nvim_data_query_resolver_selection_test; then
+      printf '%s\n' 'data query resolver selection assertions: ok'
+      exit 0
+    fi
+    exit 1
+    ;;
   nvim-trust-self-test)
     if run_nvim_trust_self_test; then
       exit 0
@@ -6158,6 +6759,34 @@ for required_command in uname awk sed grep cmp mktemp mkfifo wc ps infocmp git e
     esac
   fi
 done
+
+data_query_linux_tools_ready=false
+data_query_timeout=""
+if [ "$platform" = "linux" ]; then
+  data_query_linux_tools_ready=true
+  for data_query_linux_command in bwrap timeout; do
+    if ! require_command "$data_query_linux_command"; then
+      data_query_linux_tools_ready=false
+    fi
+  done
+  data_query_timeout=$(command -p -v timeout 2>/dev/null || true)
+  case "$data_query_timeout" in
+    /*) [ -x "$data_query_timeout" ] || data_query_linux_tools_ready=false ;;
+    *) data_query_linux_tools_ready=false ;;
+  esac
+  data_query_timeout_version="$check_tmp/data-query-timeout-version.txt"
+  if [ -n "$data_query_timeout" ] \
+    && "$data_query_timeout" --version > "$data_query_timeout_version" 2>&1 \
+    && sed -n '1p' "$data_query_timeout_version" \
+      | grep -Fq 'timeout (GNU coreutils)'; then
+    pass "GNU timeout is available for bounded Linux data-query probes"
+  else
+    [ ! -s "$data_query_timeout_version" ] \
+      || sed 's/^/      /' "$data_query_timeout_version" >&2
+    fail "GNU coreutils timeout is required for Linux data-query probes"
+    data_query_linux_tools_ready=false
+  fi
+fi
 
 if command -v magick >/dev/null 2>&1 \
   || { command -v identify >/dev/null 2>&1 && command -v convert >/dev/null 2>&1; }; then
@@ -6208,6 +6837,51 @@ if resolve_nvim_parquet_tool; then
 else
   [ ! -s "$parquet_probe_output" ] || sed 's/^/      /' "$parquet_probe_output" >&2
   fail "Neovim Parquet viewer is missing or mismatched; run the dotfiles bootstrap"
+fi
+
+data_query_runtime_ready=false
+data_query_tool_uv=""
+data_query_tool_uv_directory=""
+data_query_tool_environment=""
+data_query_tool_python=""
+data_query_tool_viewer=""
+data_query_tool_pyarrow=""
+data_query_tool_duckdb=""
+data_query_tool_bwrap=""
+data_query_tool_runner=""
+data_query_probe_output="$check_tmp/data-query-tool.txt"
+data_query_managed_runner_ready=false
+
+if run_nvim_data_query_resolver_selection_test; then
+  pass "Neovim data query resolver rejects malformed PATH candidates and selects canonical fallbacks"
+else
+  fail "Neovim data query resolver selection regression failed"
+fi
+
+: > "$data_query_probe_output"
+if [ "$parquet_runtime_ready" = true ] \
+  && nvim_data_query_versions_are_exact "$parquet_tool_python" \
+    >> "$data_query_probe_output" 2>&1; then
+  pass "Neovim managed data query runner has exact DuckDB 1.5.5 and PyArrow 25.0.0"
+  data_query_managed_runner_ready=true
+else
+  [ ! -s "$data_query_probe_output" ] \
+    || sed 's/^/      /' "$data_query_probe_output" >&2
+  fail "Neovim managed data query runner dependencies are missing or mismatched"
+fi
+
+: > "$data_query_probe_output"
+if [ "$platform" = "linux" ]; then
+  if [ "$parquet_runtime_ready" = true ] \
+    && [ "$data_query_linux_tools_ready" = true ] \
+    && resolve_nvim_data_query_tool; then
+    pass "Neovim Linux data query runtime has exact DuckDB 1.5.5 PyArrow 25.0.0 VisiData 3.4 and bubblewrap"
+    data_query_runtime_ready=true
+  else
+    [ ! -s "$data_query_probe_output" ] \
+      || sed 's/^/      /' "$data_query_probe_output" >&2
+    fail "Neovim Linux data query runtime is missing or mismatched; run the dotfiles bootstrap"
+  fi
 fi
 
 tree_sitter_version=""
@@ -6287,6 +6961,9 @@ for static_lint_file in \
   "$nvim_root/lua/notebook/python.lua" \
   "$nvim_root/lua/notebook/save.lua" \
   "$nvim_root/lua/notebook/workflow.lua" \
+  "$nvim_root/lua/data_query/health.lua" \
+  "$nvim_root/lua/data_query/tool.lua" \
+  "$nvim_root/lua/data_query/workflow.lua" \
   "$nvim_root/lua/parquet/health.lua" \
   "$nvim_root/lua/parquet/tool.lua" \
   "$nvim_root/lua/parquet/viewer.lua" \
@@ -6299,11 +6976,17 @@ for static_lint_file in \
   "$nvim_root/lua/plugins/treesitter.lua" \
   "$nvim_root/lua/ui/startup.lua" \
   "$nvim_root/lua/ui/statusline.lua" \
+  "$nvim_root/scripts/data-query-runner.py" \
   "$nvim_root/python/pyproject.toml" \
   "$nvim_root/python/uv.lock" \
   "$nvim_root/tests/bashls.lua" \
   "$nvim_root/tests/jsonls.lua" \
   "$nvim_root/tests/completion.lua" \
+  "$nvim_root/tests/data_query_health.lua" \
+  "$nvim_root/tests/data_query_integration.lua" \
+  "$nvim_root/tests/data_query_runner.py" \
+  "$nvim_root/tests/data_query_tool.lua" \
+  "$nvim_root/tests/data_query_workflow.lua" \
   "$nvim_root/tests/editing.lua" \
   "$nvim_root/tests/foundation.lua" \
   "$nvim_root/tests/lsp.lua" \
@@ -6333,6 +7016,36 @@ do
     static_lint_files_ready=false
   fi
 done
+
+data_query_python_static_output="$check_tmp/data-query-python-static.txt"
+data_query_runner_output="$check_tmp/data-query-runner.txt"
+if [ "$data_query_managed_runner_ready" = true ] \
+  && [ "$static_lint_files_ready" = true ]; then
+  if PYTHONDONTWRITEBYTECODE=1 "$parquet_tool_python" -I -B -c \
+    'import ast,pathlib,sys; [ast.parse(pathlib.Path(path).read_text(encoding="utf-8"),filename=path) for path in sys.argv[1:]]' \
+    "$nvim_root/scripts/data-query-runner.py" \
+    "$nvim_root/tests/data_query_runner.py" \
+    > "$data_query_python_static_output" 2>&1 \
+    && [ ! -s "$data_query_python_static_output" ]; then
+    pass "Neovim data query Python sources parse without repository bytecode"
+  else
+    [ ! -s "$data_query_python_static_output" ] \
+      || sed 's/^/      /' "$data_query_python_static_output" >&2
+    fail "Neovim data query Python static parsing failed"
+  fi
+
+  if PYTHONDONTWRITEBYTECODE=1 \
+    "$parquet_tool_python" -I -B "$nvim_root/tests/data_query_runner.py" \
+    > "$data_query_runner_output" 2>&1 \
+    && grep -Fqx 'data query runner assertions: ok' \
+      "$data_query_runner_output"; then
+    pass "data query runner assertions: ok"
+  else
+    [ ! -s "$data_query_runner_output" ] \
+      || sed 's/^/      /' "$data_query_runner_output" >&2
+    fail "Neovim data query runner assertions failed"
+  fi
+fi
 
 if [ "$static_lint_files_ready" = true ]; then
   shell_syntax_ok=true
@@ -6423,6 +7136,15 @@ if command -v nvim >/dev/null 2>&1 \
   run_nvim_focused_test \
     parquet-health "$nvim_root/tests/parquet_health.lua" \
     'parquet health assertions: ok' || true
+  run_nvim_focused_test \
+    data-query-tool "$nvim_root/tests/data_query_tool.lua" \
+    'data query tool assertions: ok' || true
+  run_nvim_focused_test \
+    data-query-workflow "$nvim_root/tests/data_query_workflow.lua" \
+    'data query workflow assertions: ok' || true
+  run_nvim_focused_test \
+    data-query-health "$nvim_root/tests/data_query_health.lua" \
+    'data query health assertions: ok' || true
 fi
 
 if [ "$static_shellcheck_ready" = true ] \
@@ -10719,6 +11441,9 @@ for nvim_file in \
   "$nvim_root/lua/notebook/python.lua" \
   "$nvim_root/lua/notebook/save.lua" \
   "$nvim_root/lua/notebook/workflow.lua" \
+  "$nvim_root/lua/data_query/health.lua" \
+  "$nvim_root/lua/data_query/tool.lua" \
+  "$nvim_root/lua/data_query/workflow.lua" \
   "$nvim_root/lua/parquet/health.lua" \
   "$nvim_root/lua/parquet/tool.lua" \
   "$nvim_root/lua/parquet/viewer.lua" \
@@ -10734,12 +11459,18 @@ for nvim_file in \
   "$nvim_root/lua/ui/startup.lua" \
   "$nvim_root/lua/ui/statusline.lua" \
   "$nvim_root/lua/integrations/tmux_status.lua" \
+  "$nvim_root/scripts/data-query-runner.py" \
   "$nvim_root/python/pyproject.toml" \
   "$nvim_root/python/uv.lock" \
   "$nvim_root/tests/platform.lua" \
   "$nvim_root/tests/bashls.lua" \
   "$nvim_root/tests/jsonls.lua" \
   "$nvim_root/tests/completion.lua" \
+  "$nvim_root/tests/data_query_health.lua" \
+  "$nvim_root/tests/data_query_integration.lua" \
+  "$nvim_root/tests/data_query_runner.py" \
+  "$nvim_root/tests/data_query_tool.lua" \
+  "$nvim_root/tests/data_query_workflow.lua" \
   "$nvim_root/tests/editing.lua" \
   "$nvim_root/tests/foundation.lua" \
   "$nvim_root/tests/lsp.lua" \
@@ -11037,7 +11768,7 @@ if [ "$nvim_config_ready" = true ] && [ "$plugins_trusted" = true ] && command -
     DOTFILES_NVIM_SKIP_PARSER_INSTALL=1 \
     DOTFILES_REQUIRE_EDITING_PLUGINS=1 \
     nvim --headless -i NONE \
-    -c 'lua local names = { "bashls", "jsonls", "lua_ls", "pyright", "yamlls" }; assert(vim.bo.filetype ~= "bash" and vim.bo.filetype ~= "sh" and vim.bo.filetype ~= "json" and vim.bo.filetype ~= "jsonc" and vim.bo.filetype ~= "lua" and vim.bo.filetype ~= "python" and vim.bo.filetype ~= "yaml" and vim.bo.filetype ~= "yaml.docker-compose" and vim.bo.filetype ~= "yaml.gitlab" and vim.bo.filetype ~= "yaml.helm-values", "configured startup assertion buffer must not match an enabled LSP"); for _, name in ipairs(names) do assert(vim.lsp.is_enabled(name), name .. " is not enabled during configured startup"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned before a matching buffer opened"); vim.lsp.enable(name, false); assert(not vim.lsp.is_enabled(name), name .. " remained enabled after configured startup disable") end' \
+    -c 'lua local names = { "bashls", "jsonls", "lua_ls", "pyright", "yamlls" }; assert(vim.bo.filetype ~= "bash" and vim.bo.filetype ~= "sh" and vim.bo.filetype ~= "json" and vim.bo.filetype ~= "jsonc" and vim.bo.filetype ~= "lua" and vim.bo.filetype ~= "python" and vim.bo.filetype ~= "yaml" and vim.bo.filetype ~= "yaml.docker-compose" and vim.bo.filetype ~= "yaml.gitlab" and vim.bo.filetype ~= "yaml.helm-values", "configured startup assertion buffer must not match an enabled LSP"); for _, name in ipairs(names) do assert(vim.lsp.is_enabled(name), name .. " is not enabled during configured startup"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned before a matching buffer opened"); vim.lsp.enable(name, false); assert(not vim.lsp.is_enabled(name), name .. " remained enabled after configured startup disable") end; for _, command in ipairs({ "DataQuery", "DataQueryHealth" }) do assert(vim.fn.exists(":" .. command) == 2, command .. " is unavailable during passive startup") end; assert(package.loaded["data_query.tool"] == nil, "passive startup loaded the query resolver or started a probe"); local parent = vim.fs.joinpath(vim.fn.stdpath("cache"), "dotfiles-data-query"); assert(vim.uv.fs_lstat(parent) == nil, "passive startup created the data-query cache"); for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do local name = vim.api.nvim_buf_get_name(bufnr); assert(name:sub(1, 13) ~= "data-query://", "passive startup created a SQL scratch"); local metadata = vim.b[bufnr].dotfiles_parquet_viewer; assert(type(metadata) ~= "table" or type(metadata.path) ~= "string" or metadata.path:sub(1, #parent + 1) ~= parent .. "/", "passive startup created a query result") end' \
     -c "luafile $nvim_root/tests/platform.lua" \
     -c "luafile $nvim_root/tests/foundation.lua" \
     -c "luafile $nvim_root/tests/completion.lua" \
@@ -11047,7 +11778,10 @@ if [ "$nvim_config_ready" = true ] && [ "$plugins_trusted" = true ] && command -
     -c "luafile $nvim_root/tests/startup.lua" \
     -c 'lua for _, name in ipairs({ "bashls", "jsonls", "lua_ls", "pyright", "yamlls" }) do assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned during configured foundation assertions") end' \
     -c qa > "$check_tmp/nvim-tests.txt" 2>&1 \
-    && ! nvim_log_has_error "$check_tmp/nvim-tests.txt"; then
+    && ! nvim_log_has_error "$check_tmp/nvim-tests.txt" \
+    && data_query_processes_absent \
+      "$XDG_CACHE_HOME/nvim/dotfiles-data-query" \
+      "$check_tmp/nvim-passive-processes.txt"; then
     pass "Neovim platform, native Bash, JSON, Lua, Python, and YAML LSP startup and completion, navigation, TokyoNight, Treesitter, parser, FzfLua, Oil, MiniIcons, MiniPairs, MiniStarter, MiniSurround, smart-splits, statusline, and startup assertions pass"
   else
     sed 's/^/      /' "$check_tmp/nvim-tests.txt" >&2
@@ -11181,7 +11915,7 @@ if [ "$nvim_config_ready" = true ] \
       DOTFILES_NOTEBOOK_ORDINARY="$notebook_ordinary" \
       nvim --headless -i NONE \
       -c 'lua vim.cmd.edit(vim.fn.fnameescape(vim.env.DOTFILES_NOTEBOOK_ORDINARY))' \
-      -c 'lua assert(vim.bo.filetype == "markdown", "ordinary fixture did not use Markdown"); assert(not vim.b.dotfiles_notebook, "ordinary Markdown was marked as a notebook"); assert(#vim.fn.MoltenRunningKernels(true) == 0, "configured startup started a Molten kernel"); for _, lhs in ipairs({ "<leader>jc", "<leader>jv", "<leader>ja", "<leader>jn", "<leader>jp", "<leader>jo", "<leader>jx", "<leader>jR", "<leader>js" }) do assert(vim.fn.maparg(lhs, "n", false, true).buffer ~= 1, "ordinary Markdown received " .. lhs) end; assert(vim.fn.maparg("<leader>jv", "x", false, true).buffer ~= 1, "ordinary Markdown received visual <leader>jv"); local plugins = require("lazy.core.config").plugins; assert(plugins["jupytext.nvim"] and plugins["jupytext.nvim"]._.loaded, "Jupytext did not load eagerly"); assert(type(plugins["image.nvim"].opts) == "table" and plugins["image.nvim"].opts.backend == "kitty", "image.nvim must retain the Kitty backend"); assert(vim.g.molten_image_provider == "image.nvim", "Molten must retain the image.nvim provider"); for _, name in ipairs({ "image.nvim", "molten-nvim", "otter.nvim", "quarto-nvim" }) do assert(plugins[name] and not plugins[name]._.loaded, name .. " activated for ordinary Markdown") end; for _, command in ipairs({ "NotebookBootstrap", "NotebookHealth", "MoltenInit", "MoltenImportOutput", "MoltenExportOutput" }) do assert(vim.fn.exists(":" .. command) == 2, command .. " is unavailable") end' \
+      -c 'lua assert(vim.bo.filetype == "markdown", "ordinary fixture did not use Markdown"); assert(not vim.b.dotfiles_notebook, "ordinary Markdown was marked as a notebook"); assert(#vim.fn.MoltenRunningKernels(true) == 0, "configured startup started a Molten kernel"); assert(package.loaded["data_query.tool"] == nil, "ordinary Markdown loaded the data-query resolver"); for _, lhs in ipairs({ "<leader>jc", "<leader>jv", "<leader>ja", "<leader>jn", "<leader>jp", "<leader>jo", "<leader>jx", "<leader>jR", "<leader>js" }) do assert(vim.fn.maparg(lhs, "n", false, true).buffer ~= 1, "ordinary Markdown received " .. lhs) end; assert(vim.fn.maparg("<leader>jv", "x", false, true).buffer ~= 1, "ordinary Markdown received visual <leader>jv"); for _, lhs in ipairs({ "<leader>dq", "<leader>dr", "<leader>dx", "<leader>db" }) do assert(vim.fn.maparg(lhs, "n", false, true).buffer ~= 1, "ordinary Markdown received " .. lhs) end; local plugins = require("lazy.core.config").plugins; assert(plugins["jupytext.nvim"] and plugins["jupytext.nvim"]._.loaded, "Jupytext did not load eagerly"); assert(type(plugins["image.nvim"].opts) == "table" and plugins["image.nvim"].opts.backend == "kitty", "image.nvim must retain the Kitty backend"); assert(vim.g.molten_image_provider == "image.nvim", "Molten must retain the image.nvim provider"); for _, name in ipairs({ "image.nvim", "molten-nvim", "otter.nvim", "quarto-nvim" }) do assert(plugins[name] and not plugins[name]._.loaded, name .. " activated for ordinary Markdown") end; for _, command in ipairs({ "NotebookBootstrap", "NotebookHealth", "MoltenInit", "MoltenImportOutput", "MoltenExportOutput", "DataQuery", "DataQueryHealth" }) do assert(vim.fn.exists(":" .. command) == 2, command .. " is unavailable") end' \
       -c qa > "$notebook_scope_output" 2>&1 \
       && ! nvim_log_has_error "$notebook_scope_output" \
       && [ ! -s "$notebook_scope_log" ]; then
@@ -11287,6 +12021,163 @@ if [ "$nvim_config_ready" = true ] \
   fi
 else
   fail "could not prepare the checker-owned Parquet integration fixture"
+fi
+
+data_query_fixture_root="$check_tmp/nvim-data-query-fixtures"
+data_query_fixture_csv="$data_query_fixture_root/source.csv"
+data_query_fixture_tsv="$data_query_fixture_root/source.tsv"
+data_query_fixture_parquet="$data_query_fixture_root/source.parquet"
+data_query_integration_ready=true
+
+if [ "$platform" = "linux" ]; then
+  if [ "$nvim_config_ready" = true ] \
+    && [ "$plugins_trusted" = true ] \
+    && [ "$data_query_runtime_ready" = true ] \
+    && command -v nvim >/dev/null 2>&1 \
+    && (umask 077 && mkdir -p "$data_query_fixture_root") \
+    && printf '%s\n' 'id,label' '1,csv-one' '2,csv-two' \
+      > "$data_query_fixture_csv" \
+    && printf 'id\tlabel\n1\ttsv-one\n2\ttsv-two\n' \
+      > "$data_query_fixture_tsv" \
+    && PYTHONDONTWRITEBYTECODE=1 "$data_query_tool_python" -I -B -c \
+      'import pyarrow as pa,pyarrow.parquet as pq,sys; pq.write_table(pa.table({"id":[1,2],"label":["parquet-one","parquet-two"]}),sys.argv[1])' \
+      "$data_query_fixture_parquet" \
+    && chmod 600 \
+      "$data_query_fixture_csv" \
+      "$data_query_fixture_tsv" \
+      "$data_query_fixture_parquet"; then
+  for data_query_integration_mode in normal invalid rejected cancel source-change; do
+    data_query_integration_root="$check_tmp/nvim-data-query-$data_query_integration_mode"
+    data_query_integration_data="$data_query_integration_root/data"
+    data_query_integration_csv="$data_query_integration_data/source.csv"
+    data_query_integration_tsv="$data_query_integration_data/source.tsv"
+    data_query_integration_parquet="$data_query_integration_data/source.parquet"
+    data_query_integration_output="$data_query_integration_root/output.txt"
+    data_query_integration_log="$data_query_integration_root/nvim.log"
+    data_query_integration_processes="$data_query_integration_root/processes.txt"
+    if ! (umask 077 && mkdir -p \
+      "$data_query_integration_root/home" \
+      "$data_query_integration_root/tmp" \
+      "$data_query_integration_root/state" \
+      "$data_query_integration_root/cache" \
+      "$data_query_integration_root/runtime" \
+      "$data_query_integration_data") \
+      || ! cp "$data_query_fixture_csv" "$data_query_integration_csv" \
+      || ! cp "$data_query_fixture_tsv" "$data_query_integration_tsv" \
+      || ! cp "$data_query_fixture_parquet" "$data_query_integration_parquet" \
+      || ! chmod 600 \
+        "$data_query_integration_csv" \
+        "$data_query_integration_tsv" \
+        "$data_query_integration_parquet"; then
+      data_query_integration_ready=false
+      continue
+    fi
+
+    data_query_csv_before=$(parquet_file_fingerprint \
+      "$data_query_integration_csv" 2>/dev/null || true)
+    data_query_tsv_before=$(parquet_file_fingerprint \
+      "$data_query_integration_tsv" 2>/dev/null || true)
+    data_query_parquet_before=$(parquet_file_fingerprint \
+      "$data_query_integration_parquet" 2>/dev/null || true)
+    : > "$data_query_integration_output"
+    : > "$data_query_integration_log"
+    : > "$data_query_integration_root/child-pids.txt"
+    data_query_mode_status=0
+    if [ -z "$data_query_csv_before" ] \
+      || [ -z "$data_query_tsv_before" ] \
+      || [ -z "$data_query_parquet_before" ]; then
+      data_query_mode_status=125
+    else
+      run_nvim_data_query_integration_test \
+        "$data_query_integration_mode" \
+        "$data_query_integration_csv" \
+        "$data_query_integration_tsv" \
+        "$data_query_integration_parquet" \
+        "$data_query_integration_root" \
+        "$data_query_integration_output" \
+        "$data_query_integration_log" \
+        || data_query_mode_status=$?
+    fi
+
+    case "$data_query_integration_mode" in
+      normal|cancel|source-change) data_query_mode_require_records=1 ;;
+      *) data_query_mode_require_records=0 ;;
+    esac
+    data_query_mode_postcheck_ready=true
+    data_query_integration_postchecks \
+      "$data_query_integration_root" \
+      "$data_query_integration_root/child-pids.txt" \
+      "$data_query_integration_processes" \
+      "$data_query_mode_require_records" \
+      >> "$data_query_integration_output" 2>&1 \
+      || data_query_mode_postcheck_ready=false
+    if [ "$data_query_mode_status" -ne 0 ] \
+      || [ "$data_query_mode_postcheck_ready" != true ]; then
+      data_query_reap_owned_processes \
+        "$data_query_integration_root" \
+        "$data_query_integration_root/child-pids.txt" \
+        >> "$data_query_integration_output" 2>&1 \
+        || data_query_mode_postcheck_ready=false
+    fi
+    data_query_integration_postchecks \
+      "$data_query_integration_root" \
+      "$data_query_integration_root/child-pids.txt" \
+      "$data_query_integration_processes" \
+      "$data_query_mode_require_records" \
+      >> "$data_query_integration_output" 2>&1 \
+      || data_query_mode_postcheck_ready=false
+
+    data_query_mode_ready=true
+    [ "$data_query_mode_status" -eq 0 ] || data_query_mode_ready=false
+    [ "$data_query_mode_postcheck_ready" = true ] || data_query_mode_ready=false
+    nvim_log_has_error "$data_query_integration_output" \
+      && data_query_mode_ready=false
+    grep -Fqx 'data query integration assertions: ok' \
+      "$data_query_integration_output" \
+      || data_query_mode_ready=false
+    [ ! -s "$data_query_integration_log" ] || data_query_mode_ready=false
+    [ "$(parquet_file_fingerprint "$data_query_integration_csv")" \
+      = "$data_query_csv_before" ] || data_query_mode_ready=false
+    [ "$(parquet_file_fingerprint "$data_query_integration_tsv")" \
+      = "$data_query_tsv_before" ] || data_query_mode_ready=false
+    [ "$(parquet_file_fingerprint "$data_query_integration_parquet")" \
+      = "$data_query_parquet_before" ] || data_query_mode_ready=false
+    PYTHONDONTWRITEBYTECODE=1 "$data_query_tool_python" -I -B -c \
+        'import os,sys; assert set(os.listdir(sys.argv[1])) == {"source.csv","source.parquet","source.tsv"}' \
+        "$data_query_integration_data" \
+        >> "$data_query_integration_output" 2>&1 \
+      || data_query_mode_ready=false
+    if [ "$data_query_mode_ready" != true ]; then
+      [ ! -s "$data_query_integration_output" ] \
+        || sed 's/^/      /' "$data_query_integration_output" >&2
+      [ ! -s "$data_query_integration_log" ] \
+        || sed 's/^/      /' "$data_query_integration_log" >&2
+      data_query_integration_ready=false
+    fi
+  done
+
+  if [ "$data_query_integration_ready" = true ]; then
+    pass "Neovim data query round trip preserves CSV TSV and Parquet sources"
+  else
+    fail "Neovim configured data query round trips or forced failures failed"
+  fi
+
+  if run_nvim_data_query_sandbox_probe; then
+    pass "Neovim data query sandbox prevents host writes and network access"
+  else
+    [ ! -s "$data_query_sandbox_output" ] \
+      || sed 's/^/      /' "$data_query_sandbox_output" >&2
+    [ ! -s "$data_query_sandbox_error" ] \
+      || sed 's/^/      /' "$data_query_sandbox_error" >&2
+    [ ! -s "$data_query_sandbox_log" ] \
+      || sed 's/^/      /' "$data_query_sandbox_log" >&2
+    fail "Neovim data query operating-system sandbox probe failed"
+  fi
+  else
+    fail "could not prepare the checker-owned data query integration fixtures"
+  fi
+elif [ "$platform" = "macos" ]; then
+  pass "Neovim data query live Linux integration intentionally skipped on macOS"
 fi
 
 task9_ready=false
