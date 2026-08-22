@@ -38,14 +38,47 @@ local function new(deps)
   end
 
   local function valid_buffer(bufnr, excluded)
-    if type(bufnr) ~= "number" or bufnr == excluded then
+    if type(bufnr) ~= "number" or bufnr <= 0 or bufnr == excluded then
       return false
     end
     local ok, valid = pcall(deps.buffer_valid, bufnr)
     return ok and valid == true
   end
 
-  local function return_buffer(placeholder)
+  local function normalize_options(options)
+    if options == nil then
+      return {}, nil
+    end
+    if type(options) ~= "table" then
+      return nil, "viewer options must be a table"
+    end
+    if options.on_complete ~= nil and type(options.on_complete) ~= "function" then
+      return nil, "on_complete must be a function"
+    end
+    return options, nil
+  end
+
+  local function completion_callback(callback)
+    if callback == nil then
+      return nil
+    end
+    local completed = false
+    return function(event)
+      if completed then
+        return
+      end
+      completed = true
+      pcall(callback, event)
+    end
+  end
+
+  local function return_buffer(placeholder, options)
+    if options.return_buffer ~= nil then
+      if not valid_buffer(options.return_buffer, placeholder) then
+        return nil, false, "return_buffer must be a valid buffer distinct from the placeholder"
+      end
+      return options.return_buffer, false
+    end
     local alternate_ok, alternate = pcall(deps.alternate_buffer)
     if not alternate_ok then
       return nil, false, "could not resolve the alternate buffer: " .. tostring(alternate)
@@ -116,13 +149,20 @@ local function new(deps)
     end
   end
 
-  local function fail_open(winid, placeholder, target, target_owned, message)
+  local function complete(completion, event)
+    if completion then
+      completion(event)
+    end
+  end
+
+  local function fail_open(winid, placeholder, target, target_owned, message, completion)
     local restored = restore(winid, placeholder, target)
     if not restored then
       release_owned_return(target, target_owned)
     end
     delete_if_hidden(placeholder)
     safe_notify("Parquet viewer failed: " .. message, deps.levels.ERROR)
+    complete(completion, { reason = "startup-failure" })
     return false
   end
 
@@ -150,13 +190,15 @@ local function new(deps)
     return true
   end
 
-  local function finish(terminal, code, startup_placeholder)
-    local session = sessions[terminal]
-    if not session or not detach(session) then
-      return
+  local function finalize(session, event, startup_placeholder, failure_message)
+    if not detach(session) then
+      return false
+    end
+    if event.reason == "startup-failure" then
+      stop_session(session)
     end
 
-    local restored = restore(session.window, terminal, session.return_buffer)
+    local restored = restore(session.window, session.terminal, session.return_buffer)
     if not restored and startup_placeholder then
       restored = restore(session.window, startup_placeholder, session.return_buffer)
     end
@@ -165,36 +207,67 @@ local function new(deps)
     else
       release_owned_return(session.return_buffer, session.return_buffer_owned)
     end
-    delete_if_hidden(terminal)
+    delete_if_hidden(session.terminal)
     if startup_placeholder then
       delete_if_hidden(startup_placeholder)
     end
-    if code ~= 0 and not safe_exiting() then
-      safe_notify("Parquet viewer exited with status " .. tostring(code), deps.levels.WARN)
+    if failure_message then
+      safe_notify("Parquet viewer failed: " .. failure_message, deps.levels.ERROR)
+    elseif event.reason == "exit" and event.code ~= 0 and not safe_exiting() then
+      safe_notify("Parquet viewer exited with status " .. tostring(event.code), deps.levels.WARN)
     end
+    complete(session.completion, event)
+    return true
+  end
+
+  local function finish(terminal, code, startup_placeholder)
+    local session = sessions[terminal]
+    if not session then
+      return
+    end
+    local event = { reason = "exit" }
+    if type(code) == "number" then
+      event.code = code
+    end
+    finalize(session, event, startup_placeholder)
   end
 
   local function fail_started(session, placeholder, message)
-    detach(session)
-    stop_session(session)
-    local restored = restore(session.window, session.terminal, session.return_buffer)
-    if not restored then
-      restored = restore(session.window, placeholder, session.return_buffer)
+    finalize(session, { reason = "startup-failure" }, placeholder, message)
+    return false
+  end
+
+  local function finish_wipe(session, exit_code)
+    local event = { reason = "wipe" }
+    if type(exit_code) == "number" then
+      event.code = exit_code
     end
-    if restored then
-      session.return_buffer_owned = false
-    else
-      release_owned_return(session.return_buffer, session.return_buffer_owned)
+    finalize(session, event, session.startup_placeholder, session.startup_failure_message)
+  end
+
+  local function defer_startup_wipe(session, placeholder, message)
+    if not session.programmatic then
+      return fail_started(session, placeholder, message)
     end
-    delete_if_hidden(session.terminal)
-    delete_if_hidden(placeholder)
-    safe_notify("Parquet viewer failed: " .. message, deps.levels.ERROR)
+    session.starting = false
+    session.startup_placeholder = placeholder
+    session.startup_failure_message = message
+    if session.exit_pending then
+      finish_wipe(session, session.exit_code)
+    end
     return false
   end
 
   local function handle_exit(terminal, exit_code)
     local active = sessions[terminal]
     if not active or active.finished then
+      return
+    end
+    if active.shutting_down then
+      if not active.exit_pending then
+        active.exit_code = exit_code
+        active.exit_pending = true
+      end
       return
     end
     if active.starting then
@@ -204,7 +277,11 @@ local function new(deps)
       end
       return
     end
-    finish(terminal, exit_code)
+    if active.wiped then
+      finish_wipe(active, exit_code)
+    else
+      finish(terminal, exit_code)
+    end
   end
 
   local function schedule_exit(terminal, exit_code)
@@ -217,166 +294,109 @@ local function new(deps)
     end
   end
 
-  local function open(placeholder, requested)
-    local window_ok, winid = pcall(deps.current_window)
-    if not window_ok or type(winid) ~= "number" or winid <= 0 then
-      notify_ownership_failure("could not resolve the current window")
+  local function open(placeholder, requested, raw_options)
+    local options, options_error = normalize_options(raw_options)
+    if not options then
+      notify_ownership_failure(options_error)
       return false
     end
-    if not valid_buffer(placeholder) or not window_owns(winid, placeholder) then
-      notify_ownership_failure("current window no longer owns the Parquet placeholder")
+    local completion = completion_callback(options.on_complete)
+    local programmatic = raw_options ~= nil
+    local function fail_without_transfer(message)
+      notify_ownership_failure(message)
+      complete(completion, { reason = "startup-failure" })
       return false
     end
 
-    local target, target_owned, target_error = return_buffer(placeholder)
+    local window_ok, winid = pcall(deps.current_window)
+    if not window_ok or type(winid) ~= "number" or winid <= 0 then
+      return fail_without_transfer("could not resolve the current window")
+    end
+    if not valid_buffer(placeholder) or not window_owns(winid, placeholder) then
+      return fail_without_transfer("current window no longer owns the Parquet placeholder")
+    end
+
+    local target, target_owned, target_error = return_buffer(placeholder, options)
     if not target then
-      notify_ownership_failure(target_error)
-      return false
+      return fail_without_transfer(target_error)
+    end
+    local function fail(message)
+      return fail_open(winid, placeholder, target, target_owned, message, completion)
     end
     local path = nonempty(requested)
     if not path or path:match("^%a[%w+.-]*://") then
-      return fail_open(winid, placeholder, target, target_owned, "only local files are supported")
+      return fail("only local files are supported")
     end
     if path:sub(-8) ~= ".parquet" then
-      return fail_open(winid, placeholder, target, target_owned, "path must end in .parquet")
+      return fail("path must end in .parquet")
     end
 
     local absolute_ok, absolute = pcall(deps.abspath, path)
     if not absolute_ok or not safe_absolute_parquet(absolute) then
-      return fail_open(
-        winid,
-        placeholder,
-        target,
-        target_owned,
-        "path must resolve to a safe absolute local .parquet file"
-      )
+      return fail("path must resolve to a safe absolute local .parquet file")
     end
     local normalize_ok, normalized = pcall(deps.normalize, absolute, { expand_env = false })
     if not normalize_ok or not safe_absolute_parquet(normalized) then
-      return fail_open(
-        winid,
-        placeholder,
-        target,
-        target_owned,
-        "path must normalize to a safe absolute local .parquet file"
-      )
+      return fail("path must normalize to a safe absolute local .parquet file")
     end
     path = normalized
     local stat_ok, stat = pcall(deps.stat, path)
     if not stat_ok then
-      return fail_open(
-        winid,
-        placeholder,
-        target,
-        target_owned,
-        "could not inspect file: " .. tostring(stat)
-      )
+      return fail("could not inspect file: " .. tostring(stat))
     end
     if not stat then
-      return fail_open(winid, placeholder, target, target_owned, "file does not exist: " .. path)
+      return fail("file does not exist: " .. path)
     end
     if type(stat) ~= "table" then
-      return fail_open(winid, placeholder, target, target_owned, "file metadata is invalid")
+      return fail("file metadata is invalid")
     end
     if stat.type ~= "file" then
-      return fail_open(
-        winid,
-        placeholder,
-        target,
-        target_owned,
-        "path is not a regular file: " .. path
-      )
+      return fail("path is not a regular file: " .. path)
     end
     local readable_ok, readable = pcall(deps.file_readable, path)
     if not readable_ok then
-      return fail_open(
-        winid,
-        placeholder,
-        target,
-        target_owned,
-        "could not check file readability: " .. tostring(readable)
-      )
+      return fail("could not check file readability: " .. tostring(readable))
     end
     if readable ~= true then
-      return fail_open(winid, placeholder, target, target_owned, "file is not readable: " .. path)
+      return fail("file is not readable: " .. path)
     end
 
     local viewer_ok, executable, tool_error = pcall(deps.viewer)
     if not viewer_ok then
-      return fail_open(
-        winid,
-        placeholder,
-        target,
-        target_owned,
-        "viewer executable resolution failed: " .. tostring(executable)
-      )
+      return fail("viewer executable resolution failed: " .. tostring(executable))
     end
     if not executable then
-      return fail_open(winid, placeholder, target, target_owned, tostring(tool_error))
+      return fail(tostring(tool_error))
     end
     if not safe_absolute(executable) then
-      return fail_open(
-        winid,
-        placeholder,
-        target,
-        target_owned,
-        "viewer executable must be a safe absolute path"
-      )
+      return fail("viewer executable must be a safe absolute path")
     end
     local executable_ok, executable_state = pcall(deps.executable, executable)
     if not executable_ok or executable_state ~= 1 then
-      return fail_open(
-        winid,
-        placeholder,
-        target,
-        target_owned,
-        "viewer executable is unavailable or not executable"
-      )
+      return fail("viewer executable is unavailable or not executable")
     end
 
     local cwd_ok, cwd = pcall(deps.dirname, path)
     if not cwd_ok or not safe_absolute_directory(cwd) then
-      return fail_open(
-        winid,
-        placeholder,
-        target,
-        target_owned,
-        "viewer working directory must be a safe absolute path"
-      )
+      return fail("viewer working directory must be a safe absolute path")
     end
     if not window_owns(winid, placeholder) then
-      return fail_open(
-        winid,
-        placeholder,
-        target,
-        target_owned,
-        "current window no longer owns the Parquet placeholder"
-      )
+      return fail("current window no longer owns the Parquet placeholder")
     end
 
     local terminal_ok, terminal = pcall(deps.create_buffer, false, true)
     if not terminal_ok or terminal == target or not valid_buffer(terminal, placeholder) then
-      return fail_open(
-        winid,
-        placeholder,
-        target,
-        target_owned,
-        "could not create a valid terminal buffer"
-      )
+      return fail("could not create a valid terminal buffer")
     end
     if not window_owns(winid, placeholder) then
       delete_if_hidden(terminal)
-      return fail_open(
-        winid,
-        placeholder,
-        target,
-        target_owned,
-        "current window no longer owns the Parquet placeholder after terminal allocation"
-      )
+      return fail("current window no longer owns the Parquet placeholder after terminal allocation")
     end
     local session = {
+      completion = completion,
       exit_pending = false,
       finished = false,
+      programmatic = programmatic,
       return_buffer = target,
       return_buffer_owned = target_owned,
       starting = true,
@@ -422,7 +442,7 @@ local function new(deps)
     if session.exit_pending then
       session.starting = false
       finish(terminal, session.exit_code, placeholder)
-      return true
+      return true, terminal
     end
 
     local metadata_ok, metadata_error = pcall(deps.set_metadata, terminal, {
@@ -448,18 +468,33 @@ local function new(deps)
     if session.exit_pending then
       session.starting = false
       finish(terminal, session.exit_code, placeholder)
-      return true
+      return true, terminal
     end
 
     local wipe_ok, wipe_error = pcall(deps.on_wipe, terminal, function()
       local active = sessions[terminal]
-      if not active or not detach(active) then
+      if not active or active.finished then
+        return
+      end
+      active.wiped = true
+      if active.starting or active.programmatic then
+        stop_session(active)
+        return
+      end
+      if not detach(active) then
         return
       end
       stop_session(active)
       release_owned_return(active.return_buffer, active.return_buffer_owned)
       active.return_buffer_owned = false
     end)
+    if session.wiped then
+      return defer_startup_wipe(
+        session,
+        placeholder,
+        "wipe-hook setup failed: terminal buffer was wiped during startup"
+      )
+    end
     if not wipe_ok then
       return fail_started(session, placeholder, "wipe-hook setup failed: " .. tostring(wipe_error))
     end
@@ -480,10 +515,17 @@ local function new(deps)
     if session.exit_pending then
       session.starting = false
       finish(terminal, session.exit_code, placeholder)
-      return true
+      return true, terminal
     end
 
     local delete_ok, delete_error = delete_if_hidden(placeholder)
+    if session.wiped then
+      return defer_startup_wipe(
+        session,
+        placeholder,
+        "placeholder cleanup failed: terminal buffer was wiped during startup"
+      )
+    end
     if not delete_ok then
       return fail_started(
         session,
@@ -507,6 +549,13 @@ local function new(deps)
     end
 
     local insert_ok, insert_error = pcall(deps.start_insert, winid)
+    if session.wiped then
+      return defer_startup_wipe(
+        session,
+        placeholder,
+        "insert-mode setup failed: terminal buffer was wiped during startup"
+      )
+    end
     if not insert_ok then
       return fail_started(
         session,
@@ -531,14 +580,50 @@ local function new(deps)
     if session.exit_pending then
       session.starting = false
       finish(terminal, session.exit_code, placeholder)
-      return true
+      return true, terminal
     end
     if not window_owns(winid, terminal) then
       return fail_started(session, placeholder, "current window no longer owns the terminal")
     end
 
     session.starting = false
-    return true
+    return true, terminal
+  end
+
+  local function wait_for_job(job, timeout)
+    local wait_ok, statuses = pcall(deps.wait_jobs, { job }, timeout)
+    if not wait_ok or type(statuses) ~= "table" then
+      return nil
+    end
+    return statuses[1]
+  end
+
+  local function shutdown()
+    local active = {}
+    for _, session in pairs(sessions) do
+      if session.programmatic and not session.finished then
+        active[#active + 1] = session
+      end
+    end
+    table.sort(active, function(left, right)
+      return left.terminal < right.terminal
+    end)
+
+    for _, session in ipairs(active) do
+      if sessions[session.terminal] == session and not session.finished then
+        session.shutting_down = true
+        stop_session(session)
+        local status = wait_for_job(session.job, 500)
+        if status == -1 then
+          local pid_ok, pid = pcall(deps.job_pid, session.job)
+          if pid_ok and type(pid) == "number" and pid > 0 then
+            pcall(deps.kill_pid, pid, 9)
+          end
+          wait_for_job(session.job, 500)
+        end
+        finalize(session, { reason = "shutdown" }, session.startup_placeholder)
+      end
+    end
   end
 
   local function setup()
@@ -553,6 +638,11 @@ local function new(deps)
       callback = function(args)
         open(args.buf, args.file)
       end,
+    })
+    deps.create_autocmd("VimLeavePre", {
+      group = group,
+      desc = "Reap managed Parquet result viewers",
+      callback = shutdown,
     })
     configured = true
   end
@@ -580,6 +670,10 @@ local runtime = new({
     return vim.fn.filereadable(path) == 1
   end,
   find_windows = vim.fn.win_findbuf,
+  job_pid = vim.fn.jobpid,
+  kill_pid = function(pid, signal)
+    return vim.uv.kill(pid, signal)
+  end,
   levels = vim.log.levels,
   normalize = vim.fs.normalize,
   notify = vim.notify,
@@ -620,6 +714,7 @@ local runtime = new({
   end,
   stat = vim.uv.fs_stat,
   stop_job = vim.fn.jobstop,
+  wait_jobs = vim.fn.jobwait,
   viewer = function()
     return require("parquet.tool").viewer()
   end,

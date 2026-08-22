@@ -16,14 +16,19 @@ local viewer = require("parquet.viewer")
 local function fixture(overrides)
   local state = {
     alternate = 1,
+    alternate_calls = 0,
     autocmds = {},
     buffers = { [1] = true, [2] = true },
     deleted = {},
+    job_pids = {},
+    killed_pids = {},
     metadata = {},
     next_buffer = 20,
     notifications = {},
+    shutdown_callbacks = {},
     started = {},
     stopped = {},
+    waited_jobs = {},
     windows = { [10] = 2 },
     wipes = {},
   }
@@ -32,6 +37,7 @@ local function fixture(overrides)
       return path:sub(1, 1) == "/" and path or "/work/" .. path
     end,
     alternate_buffer = function()
+      state.alternate_calls = state.alternate_calls + 1
       return state.alternate
     end,
     buffer_valid = function(bufnr)
@@ -43,6 +49,9 @@ local function fixture(overrides)
     end,
     create_autocmd = function(event, options)
       state.autocmds[#state.autocmds + 1] = { event = event, options = options }
+      if event == "VimLeavePre" then
+        state.shutdown_callbacks[#state.shutdown_callbacks + 1] = options.callback
+      end
     end,
     create_buffer = function()
       local bufnr = state.next_buffer
@@ -80,6 +89,12 @@ local function fixture(overrides)
       return result
     end,
     levels = { ERROR = 1, WARN = 2 },
+    job_pid = function(job)
+      return state.job_pids[job] or 5500 + job
+    end,
+    kill_pid = function(pid, signal)
+      state.killed_pids[#state.killed_pids + 1] = { pid = pid, signal = signal }
+    end,
     normalize = vim.fs.normalize,
     notify = function(message, level)
       state.notifications[#state.notifications + 1] = { level = level, message = message }
@@ -116,6 +131,15 @@ local function fixture(overrides)
     end,
     stop_job = function(job)
       state.stopped[#state.stopped + 1] = job
+    end,
+    wait_jobs = function(jobs, timeout)
+      state.waited_jobs[#state.waited_jobs + 1] = {
+        jobs = vim.deepcopy(jobs),
+        timeout = timeout,
+      }
+      return vim.tbl_map(function()
+        return 0
+      end, jobs)
     end,
     viewer = function()
       return "/tools/visidata/bin/vd"
@@ -200,6 +224,7 @@ do
   expect(state.buffers[2] == nil, "Parquet placeholder survived")
   expect(state.windows[10] == terminal, "terminal did not replace current window")
   expect(state.insert_window == 10, "terminal did not enter insert mode")
+  expect(state.alternate_calls == 1, "two-argument open did not resolve the alternate exactly once")
 
   state.started[1].on_exit(0)
   expect(state.windows[10] == 1, "previous buffer was not restored")
@@ -316,9 +341,508 @@ do
   local runtime, state = fixture()
   runtime.setup()
   runtime.setup()
-  expect(#state.autocmds == 1, "setup was not idempotent")
+  expect(#state.autocmds == 2, "setup was not idempotent")
   expect(state.autocmds[1].event == "BufReadCmd", "wrong event")
   expect(state.autocmds[1].options.pattern == "*.parquet", "wrong pattern")
+  expect(state.autocmds[1].options.group == 77, "BufReadCmd used the wrong group")
+  expect(state.autocmds[2].event == "VimLeavePre", "wrong shutdown event")
+  expect(state.autocmds[2].options.group == 77, "VimLeavePre used the wrong group")
+  expect(#state.shutdown_callbacks == 1, "setup did not retain exactly one shutdown callback")
+end
+
+for _, case in ipairs({
+  { name = "non-table options", options = "invalid", needle = "options" },
+  {
+    name = "non-function completion",
+    options = { on_complete = "invalid" },
+    needle = "on_complete",
+  },
+}) do
+  local runtime, state = fixture()
+  local called, opened = pcall(runtime.open, 2, "/work/data.parquet", case.options)
+  expect(called, case.name .. " escaped open()")
+  expect(not opened, case.name .. " returned success")
+  expect(state.windows[10] == 2, case.name .. " changed the current window")
+  expect(state.buffers[2], case.name .. " deleted the placeholder")
+  expect(state.alternate_calls == 0, case.name .. " resolved an alternate buffer")
+  expect(#state.started == 0, case.name .. " started a terminal")
+  expect(#state.notifications == 1, case.name .. " did not notify exactly once")
+  expect(
+    state.notifications[1].message:find(case.needle, 1, true),
+    case.name .. " reported the wrong error"
+  )
+end
+
+do
+  local completions = {}
+  local runtime, state = fixture(function(current)
+    current.buffers[20] = true
+    current.next_buffer = 21
+    return {}
+  end)
+  local opened, terminal = runtime.open(2, "/work/result.parquet", {
+    return_buffer = 20,
+    on_complete = function(event)
+      completions[#completions + 1] = vim.deepcopy(event)
+    end,
+  })
+  expect(opened, "explicit-return open failed")
+  expect(terminal == 21, "explicit-return open did not return its terminal")
+  expect(state.alternate_calls == 0, "explicit return resolved the alternate buffer")
+  eq(state.metadata[terminal], {
+    job = 55,
+    path = "/work/result.parquet",
+    readonly = true,
+    return_buffer = 20,
+  }, "explicit-return metadata")
+  state.started[1].on_exit(0)
+  expect(state.windows[10] == 20, "explicit return buffer was not restored")
+  eq(completions, { { code = 0, reason = "exit" } }, "normal programmatic completion")
+end
+
+do
+  local completions = {}
+  local runtime, state = fixture(function(current)
+    current.buffers[20] = true
+    current.next_buffer = 21
+    return {}
+  end)
+  expect(
+    runtime.open(2, "/work/result.parquet", {
+      return_buffer = 20,
+      on_complete = function(event)
+        completions[#completions + 1] = vim.deepcopy(event)
+      end,
+    }),
+    "nonzero completion fixture failed"
+  )
+  state.started[1].on_exit(7)
+  state.started[1].on_exit(9)
+  eq(completions, { { code = 7, reason = "exit" } }, "nonzero completion was not idempotent")
+  expect(#state.notifications == 1, "nonzero programmatic exit did not warn exactly once")
+end
+
+do
+  local completions = {}
+  local runtime, state = fixture(function(current)
+    current.buffers[20] = true
+    current.next_buffer = 21
+    current.buffers[99] = true
+    return {}
+  end)
+  expect(
+    runtime.open(2, "/work/result.parquet", {
+      return_buffer = 20,
+      on_complete = function(event)
+        completions[#completions + 1] = vim.deepcopy(event)
+      end,
+    }),
+    "moved programmatic viewer fixture failed"
+  )
+  local terminal = state.started[1].bufnr
+  state.windows[10] = 99
+  state.windows[11] = terminal
+  state.started[1].on_exit(0)
+  expect(state.windows[10] == 99, "moved programmatic exit replaced the origin window")
+  expect(state.windows[11] == terminal, "moved programmatic exit replaced the terminal window")
+  expect(state.buffers[terminal], "moved programmatic exit deleted a visible terminal")
+  eq(completions, { { code = 0, reason = "exit" } }, "moved programmatic completion")
+end
+
+do
+  local completion_calls = 0
+  local runtime, state = fixture(function(current)
+    current.buffers[20] = true
+    current.next_buffer = 21
+    return {
+      start_terminal = function(winid, bufnr, command, cwd, environment, on_exit)
+        current.windows[winid] = bufnr
+        current.started[#current.started + 1] = {
+          bufnr = bufnr,
+          command = vim.deepcopy(command),
+          cwd = cwd,
+          environment = vim.deepcopy(environment),
+          on_exit = on_exit,
+          winid = winid,
+        }
+        on_exit(0)
+        on_exit(4)
+        return 55
+      end,
+    }
+  end)
+  local opened, terminal = runtime.open(2, "/work/result.parquet", {
+    return_buffer = 20,
+    on_complete = function(event)
+      completion_calls = completion_calls + 1
+      eq(event, { code = 0, reason = "exit" }, "synchronous completion event")
+    end,
+  })
+  expect(opened, "synchronous programmatic exit rejected a started job")
+  expect(terminal == 21, "synchronous programmatic exit lost its terminal")
+  expect(completion_calls == 1, "synchronous programmatic exit completed more than once")
+  expect(#state.stopped == 0, "synchronous programmatic exit stopped an exited job")
+end
+
+do
+  local completions = {}
+  local runtime, state = fixture()
+  local called, opened = pcall(runtime.open, 2, "/work/result.parquet", {
+    return_buffer = 99,
+    on_complete = function(event)
+      completions[#completions + 1] = vim.deepcopy(event)
+    end,
+  })
+  expect(called, "invalid explicit return escaped open()")
+  expect(not opened, "invalid explicit return was accepted")
+  expect(state.alternate_calls == 0, "invalid explicit return resolved the alternate buffer")
+  expect(state.windows[10] == 2, "invalid explicit return changed the current window")
+  expect(state.buffers[2], "invalid explicit return deleted the placeholder")
+  eq(completions, { { reason = "startup-failure" } }, "invalid-return completion")
+end
+
+do
+  local completions = {}
+  local runtime, state = fixture(function(current)
+    current.buffers[0] = true
+    return {}
+  end)
+  local called, opened = pcall(runtime.open, 2, "/work/result.parquet", {
+    return_buffer = 0,
+    on_complete = function(event)
+      completions[#completions + 1] = vim.deepcopy(event)
+    end,
+  })
+  expect(called, "dynamic return buffer escaped open()")
+  expect(not opened, "dynamic return buffer 0 was accepted")
+  expect(state.alternate_calls == 0, "dynamic return buffer resolved the alternate buffer")
+  expect(state.windows[10] == 2, "dynamic return buffer changed the current window")
+  expect(state.buffers[2], "dynamic return buffer deleted the placeholder")
+  expect(#state.started == 0, "dynamic return buffer started a terminal")
+  eq(completions, { { reason = "startup-failure" } }, "dynamic-return completion")
+end
+
+for _, case in ipairs({
+  {
+    name = "resolver failure",
+    override = function()
+      return {
+        viewer = function()
+          return nil, "managed viewer missing"
+        end,
+      }
+    end,
+  },
+  {
+    name = "terminal creation failure",
+    override = function()
+      return {
+        create_buffer = function()
+          error("terminal creation exploded")
+        end,
+      }
+    end,
+  },
+  {
+    name = "jobstart failure",
+    override = function(current)
+      return {
+        start_terminal = function(winid, bufnr)
+          current.windows[winid] = bufnr
+          return -1
+        end,
+      }
+    end,
+  },
+  {
+    name = "metadata failure",
+    override = function()
+      return {
+        set_metadata = function()
+          error("metadata exploded")
+        end,
+      }
+    end,
+  },
+  {
+    name = "wipe-hook failure",
+    override = function()
+      return {
+        on_wipe = function()
+          error("wipe hook exploded")
+        end,
+      }
+    end,
+  },
+  {
+    name = "insert-mode failure",
+    override = function()
+      return {
+        start_insert = function()
+          error("insert mode exploded")
+        end,
+      }
+    end,
+  },
+}) do
+  local completions = {}
+  local runtime, state = fixture(function(current)
+    current.buffers[20] = true
+    current.next_buffer = 21
+    return case.override(current)
+  end)
+  local called, opened = pcall(runtime.open, 2, "/work/result.parquet", {
+    return_buffer = 20,
+    on_complete = function(event)
+      completions[#completions + 1] = vim.deepcopy(event)
+    end,
+  })
+  expect(called, case.name .. " escaped programmatic open()")
+  expect(not opened, case.name .. " returned success")
+  eq(completions, { { reason = "startup-failure" } }, case.name .. " completion")
+  if state.started[1] and state.started[1].on_exit then
+    expect(pcall(state.started[1].on_exit, 143), case.name .. " late exit escaped")
+    expect(#completions == 1, case.name .. " late exit completed twice")
+  end
+  expect(state.alternate_calls == 0, case.name .. " resolved the alternate buffer")
+end
+
+do
+  local runtime, state = fixture(function(current)
+    current.buffers[20] = true
+    current.next_buffer = 21
+    return {}
+  end)
+  expect(
+    runtime.open(2, "/work/result.parquet", {
+      return_buffer = 20,
+      on_complete = function()
+        error("completion exploded")
+      end,
+    }),
+    "throwing completion fixture failed"
+  )
+  expect(pcall(state.started[1].on_exit, 0), "completion exception escaped terminal exit")
+  expect(state.windows[10] == 20, "completion exception prevented return restoration")
+end
+
+do
+  local runtime, state = fixture(function(current)
+    current.buffers[20] = true
+    current.next_buffer = 21
+    return {
+      viewer = function()
+        return nil, "managed viewer missing"
+      end,
+    }
+  end)
+  local called, opened = pcall(runtime.open, 2, "/work/result.parquet", {
+    return_buffer = 20,
+    on_complete = function()
+      error("startup completion exploded")
+    end,
+  })
+  expect(called, "startup completion exception escaped programmatic open()")
+  expect(not opened, "startup completion exception changed the failure result")
+  expect(state.windows[10] == 20, "startup completion exception prevented restoration")
+end
+
+do
+  local completions = {}
+  local runtime, state = fixture(function(current)
+    current.buffers[20] = true
+    current.next_buffer = 21
+    return {}
+  end)
+  expect(
+    runtime.open(2, "/work/result.parquet", {
+      return_buffer = 20,
+      on_complete = function(event)
+        completions[#completions + 1] = vim.deepcopy(event)
+      end,
+    }),
+    "programmatic wipe fixture failed"
+  )
+  local terminal = state.started[1].bufnr
+  state.buffers[terminal] = nil
+  state.windows[10] = 20
+  state.wipes[terminal]()
+  eq(state.stopped, { 55 }, "programmatic wipe stopped the wrong job")
+  expect(#completions == 0, "programmatic wipe completed before job reap")
+  state.started[1].on_exit(143)
+  state.started[1].on_exit(143)
+  eq(completions, { { code = 143, reason = "wipe" } }, "programmatic wipe completion")
+  expect(#state.notifications == 0, "programmatic wipe emitted an exit warning")
+end
+
+do
+  local completions = {}
+  local runtime, state = fixture(function(current)
+    current.buffers[20] = true
+    current.next_buffer = 21
+    return {
+      on_wipe = function(bufnr, callback)
+        current.wipes[bufnr] = callback
+        current.buffers[bufnr] = nil
+        callback()
+        callback()
+        error("wipe-hook registration exploded after terminal wipe")
+      end,
+    }
+  end)
+  local called, opened = pcall(runtime.open, 2, "/work/result.parquet", {
+    return_buffer = 20,
+    on_complete = function(event)
+      completions[#completions + 1] = vim.deepcopy(event)
+    end,
+  })
+  expect(called, "programmatic wipe during hook setup escaped open()")
+  expect(not opened, "programmatic wipe during hook setup returned success")
+  eq(state.stopped, { 55 }, "programmatic hook-setup wipe did not stop once")
+  expect(#completions == 0, "programmatic hook-setup wipe completed before job reap")
+  expect(state.buffers[2], "programmatic hook-setup wipe discarded its startup placeholder")
+
+  state.started[1].on_exit(143)
+  state.started[1].on_exit(143)
+  eq(completions, { { code = 143, reason = "wipe" } }, "programmatic hook-setup wipe")
+  expect(state.windows[10] == 20, "programmatic hook-setup wipe did not restore")
+  expect(state.buffers[2] == nil, "programmatic hook-setup wipe kept its startup placeholder")
+  expect(#state.notifications == 1, "programmatic hook-setup wipe did not notify once")
+end
+
+do
+  local completions = {}
+  local runtime, state = fixture(function(current)
+    current.buffers[20] = true
+    current.next_buffer = 21
+    return {
+      delete_buffer = function(bufnr)
+        current.deleted[#current.deleted + 1] = bufnr
+        current.buffers[bufnr] = nil
+        if bufnr == 2 then
+          local terminal = current.started[1].bufnr
+          current.buffers[terminal] = nil
+          current.wipes[terminal]()
+          error("placeholder cleanup exploded after terminal wipe")
+        elseif current.wipes[bufnr] then
+          current.wipes[bufnr]()
+        end
+      end,
+    }
+  end)
+  local called, opened = pcall(runtime.open, 2, "/work/result.parquet", {
+    return_buffer = 20,
+    on_complete = function(event)
+      completions[#completions + 1] = vim.deepcopy(event)
+    end,
+  })
+  expect(called, "programmatic wipe during placeholder cleanup escaped open()")
+  expect(not opened, "programmatic wipe during placeholder cleanup returned success")
+  eq(state.stopped, { 55 }, "programmatic placeholder-cleanup wipe did not stop once")
+  expect(#completions == 0, "programmatic placeholder-cleanup wipe completed before job reap")
+
+  state.started[1].on_exit(143)
+  state.started[1].on_exit(143)
+  eq(completions, { { code = 143, reason = "wipe" } }, "programmatic placeholder-cleanup wipe")
+  expect(state.windows[10] == 20, "programmatic placeholder-cleanup wipe did not restore")
+  expect(#state.notifications == 1, "programmatic placeholder-cleanup wipe did not notify once")
+end
+
+do
+  local completions = {}
+  local runtime, state = fixture(function(current)
+    current.buffers[3] = true
+    current.buffers[4] = true
+    current.buffers[30] = true
+    current.next_buffer = 20
+    local next_job = 55
+    local waits = {}
+    return {
+      start_terminal = function(winid, bufnr, command, cwd, environment, on_exit)
+        local job = next_job
+        next_job = next_job + 1
+        current.windows[winid] = bufnr
+        current.started[#current.started + 1] = {
+          bufnr = bufnr,
+          command = vim.deepcopy(command),
+          cwd = cwd,
+          environment = vim.deepcopy(environment),
+          on_exit = on_exit,
+          winid = winid,
+        }
+        current.job_pids[job] = 7000 + job
+        return job
+      end,
+      wait_jobs = function(jobs, timeout)
+        local job = jobs[1]
+        waits[job] = (waits[job] or 0) + 1
+        current.waited_jobs[#current.waited_jobs + 1] = {
+          jobs = vim.deepcopy(jobs),
+          timeout = timeout,
+        }
+        if job == 56 and waits[job] == 1 then
+          return { -1 }
+        end
+        return { 0 }
+      end,
+      stop_job = function(job)
+        current.stopped[#current.stopped + 1] = job
+        if job == 57 then
+          current.started[3].on_exit(143)
+        end
+      end,
+    }
+  end)
+  runtime.setup()
+  expect(runtime.open(2, "/work/ordinary.parquet"), "ordinary shutdown fixture failed")
+  local ordinary_terminal = state.started[1].bufnr
+  state.windows[11] = ordinary_terminal
+  state.windows[10] = 3
+
+  expect(
+    runtime.open(3, "/work/programmatic-one.parquet", {
+      return_buffer = 30,
+      on_complete = function()
+        completions[#completions + 1] = "first"
+        error("first completion exploded")
+      end,
+    }),
+    "first programmatic shutdown fixture failed"
+  )
+  local first_terminal = state.started[2].bufnr
+  state.windows[12] = first_terminal
+  state.windows[10] = 4
+
+  expect(
+    runtime.open(4, "/work/programmatic-two.parquet", {
+      return_buffer = 30,
+      on_complete = function(event)
+        completions[#completions + 1] = vim.deepcopy(event)
+      end,
+    }),
+    "second programmatic shutdown fixture failed"
+  )
+  local second_terminal = state.started[3].bufnr
+
+  expect(pcall(state.shutdown_callbacks[1]), "programmatic shutdown escaped its callback")
+  expect(pcall(state.shutdown_callbacks[1]), "repeated programmatic shutdown escaped its callback")
+  eq(state.stopped, { 56, 57 }, "shutdown stopped an ordinary viewer or missed a programmatic one")
+  eq(state.waited_jobs, {
+    { jobs = { 56 }, timeout = 500 },
+    { jobs = { 56 }, timeout = 500 },
+    { jobs = { 57 }, timeout = 500 },
+  }, "shutdown wait sequence")
+  eq(state.killed_pids, { { pid = 7056, signal = 9 } }, "shutdown force-kill sequence")
+  expect(completions[1] == "first", "throwing shutdown completion did not run")
+  eq(completions[2], { reason = "shutdown" }, "shutdown completion event")
+  expect(state.windows[10] == 30, "shutdown did not restore the owned programmatic window")
+  expect(state.windows[11] == ordinary_terminal, "shutdown changed an ordinary viewer window")
+  expect(state.windows[12] == first_terminal, "shutdown stole a moved programmatic window")
+  expect(state.buffers[second_terminal] == nil, "shutdown kept a hidden programmatic terminal")
+
+  state.started[2].on_exit(143)
+  state.started[3].on_exit(137)
+  expect(#completions == 2, "late shutdown callbacks completed twice")
 end
 
 do
@@ -615,7 +1139,7 @@ do
   expect(pcall(runtime.setup), "augroup registration was not retryable")
   expect(pcall(runtime.setup), "configured augroup setup did not stay idempotent")
   expect(attempts == 2, "successful augroup registration was repeated")
-  expect(#state.autocmds == 1, "augroup retry did not register exactly one autocmd")
+  expect(#state.autocmds == 2, "augroup retry did not register both autocmds exactly once")
 end
 
 do
@@ -639,8 +1163,8 @@ do
   expect(not first_ok, "failed autocmd registration did not throw")
   expect(pcall(runtime.setup), "autocmd registration was not retryable")
   expect(pcall(runtime.setup), "configured autocmd setup did not stay idempotent")
-  expect(attempts == 2, "successful autocmd registration was repeated")
-  expect(#state.autocmds == 1, "autocmd retry did not register exactly one autocmd")
+  expect(attempts == 3, "successful autocmd registration was repeated")
+  expect(#state.autocmds == 2, "autocmd retry did not register both autocmds exactly once")
 end
 
 for _, case in ipairs({
