@@ -11818,12 +11818,11 @@ if [ "$nvim_config_ready" = true ] && [ "$plugins_trusted" = true ] && command -
     XDG_CONFIG_HOME="$config_root" XDG_DATA_HOME="$data_home" TERM_PROGRAM=ghostty \
     DOTFILES_NVIM_SKIP_PARSER_INSTALL=1 \
     DOTFILES_REQUIRE_EDITING_PLUGINS=1 \
+    DOTFILES_NVIM_ROOT="$nvim_root" \
     nvim --headless -i NONE \
     -c 'lua vim.api.nvim_exec_autocmds("User", { pattern = "VeryLazy", modeline = false }); local plugin = assert(require("lazy.core.config").plugins["which-key.nvim"]); assert(plugin._.loaded, "WhichKey did not load on VeryLazy")' \
     -c 'lua local names = { "bashls", "jsonls", "lua_ls", "pyright", "yamlls" }; assert(vim.bo.filetype ~= "bash" and vim.bo.filetype ~= "sh" and vim.bo.filetype ~= "json" and vim.bo.filetype ~= "jsonc" and vim.bo.filetype ~= "lua" and vim.bo.filetype ~= "python" and vim.bo.filetype ~= "yaml" and vim.bo.filetype ~= "yaml.docker-compose" and vim.bo.filetype ~= "yaml.gitlab" and vim.bo.filetype ~= "yaml.helm-values", "configured startup assertion buffer must not match an enabled LSP"); for _, name in ipairs(names) do assert(vim.lsp.is_enabled(name), name .. " is not enabled during configured startup"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned before a matching buffer opened"); vim.lsp.enable(name, false); assert(not vim.lsp.is_enabled(name), name .. " remained enabled after configured startup disable") end; for _, command in ipairs({ "DataQuery", "DataQueryHealth" }) do assert(vim.fn.exists(":" .. command) == 2, command .. " is unavailable during passive startup") end; assert(package.loaded["data_query.tool"] == nil, "passive startup loaded the query resolver or started a probe"); local parent = vim.fs.joinpath(vim.fn.stdpath("cache"), "dotfiles-data-query"); assert(vim.uv.fs_lstat(parent) == nil, "passive startup created the data-query cache"); for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do local name = vim.api.nvim_buf_get_name(bufnr); assert(name:sub(1, 13) ~= "data-query://", "passive startup created a SQL scratch"); local metadata = vim.b[bufnr].dotfiles_parquet_viewer; assert(type(metadata) ~= "table" or type(metadata.path) ~= "string" or metadata.path:sub(1, #parent + 1) ~= parent .. "/", "passive startup created a query result") end' \
-    -c "luafile $nvim_root/tests/platform.lua" \
-    -c "luafile $nvim_root/tests/foundation.lua" \
-    -c "luafile $nvim_root/tests/key_helper.lua" \
+    -c 'lua for _, name in ipairs({ "platform", "foundation", "key_helper" }) do dofile(vim.fs.joinpath(vim.env.DOTFILES_NVIM_ROOT, "tests", name .. ".lua")) end' \
     -c "luafile $nvim_root/tests/completion.lua" \
     -c "luafile $nvim_root/tests/editing.lua" \
     -c "luafile $nvim_root/tests/navigation.lua" \

@@ -216,6 +216,26 @@ local checker_source = table.concat(
   "\n"
 )
 
+local configured_start = assert(
+  checker_source:find("DOTFILES_REQUIRE_EDITING_PLUGINS=1", 1, true),
+  "configured Neovim invocation start is missing"
+)
+local configured_finish = assert(
+  checker_source:find('> "$check_tmp/nvim-tests.txt" 2>&1', configured_start, true),
+  "configured Neovim invocation end is missing"
+)
+local configured_invocation = checker_source:sub(configured_start, configured_finish)
+local configured_command_count = 0
+for line in configured_invocation:gmatch("[^\n]+") do
+  if line:match("^%s+%-c%s") or line:match("^%s+%-%-cmd%s") or line:match("^%s+%+%S") then
+    configured_command_count = configured_command_count + 1
+  end
+end
+assert(
+  configured_command_count <= 10,
+  "configured Neovim command count exceeds 10: " .. configured_command_count
+)
+
 for _, fragment in ipairs({
   'keys == ["fzf-lua", "image.nvim", "jupytext.nvim", "lazy.nvim", "mini.icons", "mini.pairs", "mini.starter", "mini.surround", "molten-nvim", "nvim-treesitter", "oil.nvim", "otter.nvim", "quarto-nvim", "smart-splits.nvim", "tokyonight.nvim", "which-key.nvim"]',
   "which-key.nvim)",
@@ -231,7 +251,8 @@ for _, fragment in ipairs({
   'vim.api.nvim_exec_autocmds("User", { pattern = "VeryLazy", modeline = false })',
   'require("lazy.core.config").plugins["which-key.nvim"]',
   '"WhichKey did not load on VeryLazy"',
-  '-c "luafile $nvim_root/tests/key_helper.lua"',
+  'for _, name in ipairs({ "platform", "foundation", "key_helper" }) do',
+  'dofile(vim.fs.joinpath(vim.env.DOTFILES_NVIM_ROOT, "tests", name .. ".lua"))',
   "Neovim WhichKey modes, delay, completion, cancellation, cleanup, and diagnostics pass",
   "MiniSurround, WhichKey, smart-splits",
 }) do
@@ -248,8 +269,8 @@ eq(
 )
 eq(
   count_plain(checker_source, "$nvim_root/tests/key_helper.lua"),
-  4,
-  "checker key-helper test reference count"
+  3,
+  "checker direct key-helper test reference count"
 )
 for _, stale in ipairs({
   "exact fifteen-object lock is accepted",
