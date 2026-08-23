@@ -103,6 +103,16 @@ local resolver = identity._test.new({
     end
     return path:match("main.lua$") and { type = "file" } or { type = "directory" }
   end,
+  lstat = function(path)
+    if path == "/physical/repo/.git" then
+      return { type = "file", size = #"gitdir: /git/worktrees/repo\n", dev = 41, ino = 901 }
+    end
+    return nil
+  end,
+  read_git_entry = function(path)
+    eq(path, "/physical/repo/.git", "linked-worktree Git entry read")
+    return "gitdir: /git/worktrees/repo\n"
+  end,
   find_git_entry = function()
     return nil
   end,
@@ -260,6 +270,7 @@ local linked_fallback = assert(identity._test
         ["/logical/worktree"] = "/physical/worktree",
         ["/logical/git-dir"] = "/physical/git/worktrees/worktree",
         ["/logical/common"] = "/physical/git",
+        ["/physical/git/worktrees/worktree"] = "/physical/git/worktrees/worktree",
       }
       return paths[path]
     end,
@@ -268,6 +279,21 @@ local linked_fallback = assert(identity._test
         return { type = "file" }
       end
       return { type = "directory" }
+    end,
+    lstat = function(path)
+      if path == "/physical/worktree/.git" then
+        return {
+          type = "file",
+          size = #"gitdir: /physical/git/worktrees/worktree\n",
+          dev = 4,
+          ino = 10,
+        }
+      end
+      return nil
+    end,
+    read_git_entry = function(path)
+      eq(path, "/physical/worktree/.git", "cwd fallback Git entry read")
+      return "gitdir: /physical/git/worktrees/worktree\n"
     end,
     git = function(start)
       table.insert(linked_calls, start)
@@ -298,6 +324,81 @@ eq(linked_fallback, {
   tmux_socket = nil,
   namespace = "nvim:101_202",
 }, "linked cwd fallback identity")
+
+local function git_boundary_fixture(entry_stat, entry_target, entry_bytes)
+  return identity._test.new({
+    env = {},
+    nonce = function()
+      return "boundary_1"
+    end,
+    cwd = function()
+      return "/logical/repo"
+    end,
+    buffer_name = function()
+      return ""
+    end,
+    buffer_type = function()
+      return ""
+    end,
+    realpath = function(path)
+      local paths = {
+        ["/logical/repo"] = "/physical/repo",
+        ["/logical/git-dir"] = "/physical/git-dir",
+        ["/logical/common"] = "/physical/common",
+        ["/physical/repo/.git"] = entry_target,
+        ["/physical/git-dir"] = "/physical/git-dir",
+      }
+      return paths[path]
+    end,
+    stat = function()
+      return { type = "directory" }
+    end,
+    lstat = function(path)
+      return path == "/physical/repo/.git" and vim.deepcopy(entry_stat) or nil
+    end,
+    read_git_entry = function()
+      return entry_bytes
+    end,
+    find_git_entry = function()
+      return nil
+    end,
+    git = function()
+      return {
+        code = 0,
+        signal = 0,
+        stdout = "/logical/repo\n/logical/git-dir\n/logical/common\n",
+        stderr = "",
+      }
+    end,
+    hash = function()
+      return string.rep("8", 64)
+    end,
+  })
+end
+
+local mismatched_entry, mismatched_entry_error =
+  git_boundary_fixture({ type = "directory", dev = 7, ino = 10 }, "/physical/other-git"):resolve()
+rejected(
+  mismatched_entry,
+  mismatched_entry_error,
+  "does not match returned Git directory",
+  "mismatched Git directory entry"
+)
+
+local symlinked_entry, symlinked_entry_error = git_boundary_fixture({
+  type = "link",
+  size = 24,
+  dev = 7,
+  ino = 11,
+}, "/physical/git-dir"):resolve()
+rejected(symlinked_entry, symlinked_entry_error, "nonsymlink", "symlinked Git metadata entry")
+
+local malformed_entry, malformed_entry_error = git_boundary_fixture(
+  { type = "file", size = 43, dev = 7, ino = 12 },
+  nil,
+  "gitdir: /physical/git-dir\nsecond line\n"
+):resolve()
+rejected(malformed_entry, malformed_entry_error, "invalid shape", "multiline Git metadata entry")
 
 local validation_calls = 0
 local drift_git_calls = 0
@@ -345,6 +446,7 @@ local identity_rejections = {
   {
     label = "unexpected Git exit",
     needle = "Git root query failed",
+    expected_error = "Git root query failed",
     overrides = {
       git = function()
         return { code = 2, signal = 0, stdout = "", stderr = "fatal" }
@@ -466,6 +568,9 @@ local identity_rejections = {
 for _, case in ipairs(identity_rejections) do
   local value, err = identity._test.new(base_identity_deps(case.overrides)):resolve()
   rejected(value, err, case.needle, case.label)
+  if case.expected_error then
+    eq(err, case.expected_error, case.label .. " bounded error")
+  end
 end
 
 local tool_metadata = { type = "file", mode = 493, uid = 1000, dev = 7, ino = 8 }
@@ -595,6 +700,7 @@ changing.ino = 99
 local unchanged, changed_error = changing_tools:revalidate(changing_path)
 rejected(unchanged, changed_error, "changed", "tool replacement detected")
 
+local configured_shell_lookups = 0
 local host_fixture = tools._test.new(tool_deps({
   exepath = function(name)
     local paths = {
@@ -602,7 +708,11 @@ local host_fixture = tools._test.new(tool_deps({
       python3 = "/usr/bin/python3",
       bwrap = "/usr/bin/bwrap",
       tmux = "/usr/bin/tmux",
+      sh = "/bin/sh",
     }
+    if name == "sh" then
+      configured_shell_lookups = configured_shell_lookups + 1
+    end
     return paths[name] or ""
   end,
 }))
@@ -613,13 +723,177 @@ eq(host_fixture:resolve_host({ shell = "/bin/sh", identity = { tmux_socket = nil
   bwrap = "/usr/bin/bwrap",
   shell = "/bin/sh",
 }, "standalone host tools")
+for _, shell in ipairs({ "sh", "bin/sh" }) do
+  local invalid_host, invalid_host_error = host_fixture:resolve_host({
+    shell = shell,
+    identity = { tmux_socket = nil },
+  })
+  rejected(invalid_host, invalid_host_error, "absolute", "nonabsolute configured shell " .. shell)
+end
+eq(configured_shell_lookups, 0, "configured shell never resolved through exepath")
 
 local fixture = vim.fn.tempname()
 local previous_runtime = vim.env.XDG_RUNTIME_DIR
 local previous_state = vim.env.XDG_STATE_HOME
+local git_environment_names = {
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_COMMON_DIR",
+  "GIT_CONFIG",
+  "GIT_CONFIG_SYSTEM",
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_NOSYSTEM",
+  "GIT_CONFIG_COUNT",
+  "GIT_CONFIG_KEY_0",
+  "GIT_CONFIG_VALUE_0",
+  "GIT_CEILING_DIRECTORIES",
+  "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+}
+local previous_git_environment = {}
+for _, name in ipairs(git_environment_names) do
+  previous_git_environment[name] = vim.env[name] == nil and vim.NIL or vim.env[name]
+end
+
+local function clear_git_environment()
+  for _, name in ipairs(git_environment_names) do
+    vim.env[name] = nil
+  end
+end
 
 local function run_filesystem_tests()
   assert(vim.fn.mkdir(fixture, "p", 448) == 1, "state fixture")
+
+  local setup_git = assert(tools.resolve("git"))
+  local safe_git_environment = {
+    LC_ALL = "C",
+    GIT_OPTIONAL_LOCKS = "0",
+    GIT_CONFIG_NOSYSTEM = "1",
+    GIT_CONFIG_GLOBAL = "/dev/null",
+  }
+  local function run_git(arguments, label)
+    local command = { setup_git }
+    vim.list_extend(command, arguments)
+    local result = vim
+      .system(command, {
+        text = true,
+        clear_env = true,
+        env = safe_git_environment,
+      })
+      :wait(5000)
+    assert(
+      result.code == 0 and result.signal == 0,
+      string.format("%s failed: %s", label, tostring(result.stderr))
+    )
+    return result
+  end
+
+  clear_git_environment()
+  local standard_repo = vim.fs.joinpath(fixture, "standard-repo")
+  local linked_repo = vim.fs.joinpath(fixture, "linked-repo")
+  local foreign_worktree = vim.fs.joinpath(fixture, "foreign-worktree")
+  assert(vim.fn.mkdir(foreign_worktree, "p", 448) == 1, "foreign worktree fixture")
+  run_git({ "init", "--quiet", standard_repo }, "standard repository init")
+  local tracked_file = vim.fs.joinpath(standard_repo, "tracked.txt")
+  assert(vim.fn.writefile({ "tracked" }, tracked_file) == 0, "tracked file fixture")
+  run_git({ "-C", standard_repo, "add", "tracked.txt" }, "standard repository add")
+  run_git({
+    "-C",
+    standard_repo,
+    "-c",
+    "user.name=AI Identity Test",
+    "-c",
+    "user.email=ai-identity@example.invalid",
+    "commit",
+    "--quiet",
+    "-m",
+    "fixture",
+  }, "standard repository commit")
+
+  local standard_identity =
+    assert(identity.resolve({ name = "", buftype = "", cwd = standard_repo }))
+  eq(standard_identity.root, standard_repo, "standard repository root")
+  eq(standard_identity.git_dir, vim.fs.joinpath(standard_repo, ".git"), "standard Git directory")
+  eq(standard_identity.git_entry, vim.fs.joinpath(standard_repo, ".git"), "standard Git entry")
+
+  run_git({
+    "-C",
+    standard_repo,
+    "worktree",
+    "add",
+    "--quiet",
+    "--detach",
+    linked_repo,
+  }, "linked worktree creation")
+  local linked_git_result = run_git(
+    { "-C", linked_repo, "rev-parse", "--path-format=absolute", "--absolute-git-dir" },
+    "linked Git directory query"
+  )
+  local linked_git_dir = linked_git_result.stdout:gsub("\n$", "")
+  assert(
+    linked_git_dir:sub(1, #fixture + 1) == fixture .. "/",
+    "linked Git directory escaped fixture"
+  )
+  local relative_git_dir = "../" .. linked_git_dir:sub(#fixture + 2)
+  assert(
+    vim.fn.writefile({ "gitdir: " .. relative_git_dir }, vim.fs.joinpath(linked_repo, ".git")) == 0,
+    "relative linked-worktree Git entry"
+  )
+  local linked_identity = assert(identity.resolve({ name = "", buftype = "", cwd = linked_repo }))
+  eq(linked_identity.root, linked_repo, "linked-worktree root")
+  eq(linked_identity.git_dir, linked_git_dir, "linked-worktree Git directory")
+  eq(
+    linked_identity.git_common_dir,
+    vim.fs.joinpath(standard_repo, ".git"),
+    "linked common Git directory"
+  )
+  eq(linked_identity.git_entry, vim.fs.joinpath(linked_repo, ".git"), "linked-worktree Git entry")
+
+  vim.env.GIT_DIR = vim.fs.joinpath(standard_repo, ".git")
+  vim.env.GIT_WORK_TREE = foreign_worktree
+  local directory_poisoned =
+    assert(identity.resolve({ name = "", buftype = "", cwd = standard_repo }))
+  eq(directory_poisoned.root, standard_repo, "GIT_DIR and GIT_WORK_TREE ignored")
+
+  clear_git_environment()
+  vim.env.GIT_CONFIG_COUNT = "1"
+  vim.env.GIT_CONFIG_KEY_0 = "core.worktree"
+  vim.env.GIT_CONFIG_VALUE_0 = foreign_worktree
+  local config_poisoned = assert(identity.resolve({ name = "", buftype = "", cwd = standard_repo }))
+  eq(config_poisoned.root, standard_repo, "Git config override environment ignored")
+
+  clear_git_environment()
+  local global_config = vim.fs.joinpath(fixture, "poisoned-gitconfig")
+  assert(
+    vim.fn.writefile({ "[core]", "\tworktree = " .. foreign_worktree }, global_config) == 0,
+    "global Git config fixture"
+  )
+  vim.env.GIT_CONFIG_GLOBAL = global_config
+  local global_poisoned = assert(identity.resolve({ name = "", buftype = "", cwd = standard_repo }))
+  eq(global_poisoned.root, standard_repo, "global Git config override ignored")
+
+  clear_git_environment()
+  local redirected_repo = vim.fs.joinpath(fixture, "redirected-repo")
+  run_git({ "init", "--quiet", redirected_repo }, "redirected repository init")
+  run_git(
+    { "-C", redirected_repo, "config", "core.worktree", foreign_worktree },
+    "local core.worktree redirect"
+  )
+  local redirected, redirected_error =
+    identity.resolve({ name = "", buftype = "", cwd = redirected_repo })
+  rejected(
+    redirected,
+    redirected_error,
+    "does not contain query start",
+    "repository-local core.worktree redirect"
+  )
+  eq(
+    redirected_error,
+    "Git root does not contain query start",
+    "bounded core.worktree redirect error"
+  )
 
   local symlink_source = vim.fs.joinpath(fixture, "symlink-source")
   local symlink_target = vim.fs.joinpath(fixture, "symlink-target")
@@ -655,6 +929,11 @@ local function run_filesystem_tests()
       end,
       realpath = vim.uv.fs_realpath,
       stat = vim.uv.fs_stat,
+      lstat = vim.uv.fs_lstat,
+      read_git_entry = function(path)
+        eq(path, vim.fs.joinpath(symlink_target, ".git"), "symlinked buffer Git entry read")
+        return "gitdir: " .. symlink_git_dir .. "\n"
+      end,
       find_git_entry = function()
         return nil
       end,
@@ -925,6 +1204,10 @@ end
 local filesystem_ok, filesystem_error = xpcall(run_filesystem_tests, debug.traceback)
 vim.env.XDG_RUNTIME_DIR = previous_runtime
 vim.env.XDG_STATE_HOME = previous_state
+for _, name in ipairs(git_environment_names) do
+  local previous = previous_git_environment[name]
+  vim.env[name] = previous == vim.NIL and nil or previous
+end
 local cleanup_result = vim.fn.delete(fixture, "rf")
 local cleanup_ok = cleanup_result == 0 or vim.uv.fs_lstat(fixture) == nil
 if not filesystem_ok then

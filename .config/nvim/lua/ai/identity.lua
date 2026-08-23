@@ -1,9 +1,60 @@
 local M = {}
 
 local CONTROL_PATTERN = "[%z\1-\31\127]"
+local MAX_GIT_ENTRY_BYTES = 4096
 
 local function has_control(value)
   return type(value) ~= "string" or value:find(CONTROL_PATTERN) ~= nil
+end
+
+local function path_within(root, path)
+  if root == "/" then
+    return path:sub(1, 1) == "/"
+  end
+  return path == root or path:sub(1, #root + 1) == root .. "/"
+end
+
+local function same_node(left, right)
+  return left
+    and right
+    and left.type == right.type
+    and left.dev ~= nil
+    and right.dev ~= nil
+    and left.dev == right.dev
+    and left.ino ~= nil
+    and right.ino ~= nil
+    and left.ino == right.ino
+end
+
+local function read_git_entry(path, expected, maximum)
+  local fd = vim.uv.fs_open(path, "r", 0)
+  if not fd then
+    return nil
+  end
+  local opened = vim.uv.fs_fstat(fd)
+  if
+    not opened
+    or opened.type ~= "file"
+    or type(opened.size) ~= "number"
+    or opened.size > maximum
+    or not same_node(expected, opened)
+  then
+    vim.uv.fs_close(fd)
+    return nil
+  end
+  local bytes = vim.uv.fs_read(fd, opened.size + 1, 0)
+  local closed = vim.uv.fs_close(fd)
+  local after = vim.uv.fs_lstat(path)
+  if
+    type(bytes) ~= "string"
+    or #bytes ~= opened.size
+    or not closed
+    or not same_node(opened, after)
+    or after.size ~= opened.size
+  then
+    return nil
+  end
+  return bytes
 end
 
 local function valid_pane(value)
@@ -180,6 +231,53 @@ local function new(deps)
     return result
   end
 
+  local function validate_git_entry(start, root, git_dir)
+    if not path_within(root, start) then
+      return nil, "Git root does not contain query start"
+    end
+    local entry = vim.fs.joinpath(root, ".git")
+    local entry_stat = deps.lstat(entry)
+    if not entry_stat or entry_stat.type == "link" then
+      return nil, "Git metadata entry is not a bounded nonsymlink file or directory"
+    end
+    if entry_stat.type == "directory" then
+      local target = physical(entry)
+      local after = deps.lstat(entry)
+      if not target or target ~= git_dir or not same_node(entry_stat, after) then
+        return nil, "Git metadata entry does not match returned Git directory"
+      end
+      return entry
+    end
+    if
+      entry_stat.type ~= "file"
+      or type(entry_stat.size) ~= "number"
+      or entry_stat.size < 1
+      or entry_stat.size > MAX_GIT_ENTRY_BYTES
+    then
+      return nil, "Git metadata entry is not a bounded nonsymlink file or directory"
+    end
+    local bytes = deps.read_git_entry(entry, entry_stat, MAX_GIT_ENTRY_BYTES)
+    if type(bytes) ~= "string" or #bytes > MAX_GIT_ENTRY_BYTES then
+      return nil, "Git metadata entry could not be read safely"
+    end
+    local body = bytes:sub(-1) == "\n" and bytes:sub(1, -2) or bytes
+    if body:find("[\r\n]") or body:sub(1, 8) ~= "gitdir: " then
+      return nil, "Git metadata entry has an invalid shape"
+    end
+    local value = body:sub(9)
+    if value == "" or has_control(value) then
+      return nil, "Git metadata entry has an invalid shape"
+    end
+    local candidate = value:sub(1, 1) == "/" and vim.fs.normalize(value)
+      or vim.fs.normalize(vim.fs.joinpath(root, value))
+    local target = physical(candidate)
+    local after = deps.lstat(entry)
+    if not target or target ~= git_dir or not same_node(entry_stat, after) then
+      return nil, "Git metadata entry does not match returned Git directory"
+    end
+    return entry
+  end
+
   function resolver:resolve(context)
     context = context or {}
     local cwd, raw_cwd_or_error = working_directory(context)
@@ -205,7 +303,7 @@ local function new(deps)
       end
     end
 
-    local root, git_dir, git_common_dir
+    local root, git_dir, git_common_dir, git_entry
     local inside_git = result.code == 0
     if inside_git then
       local lines = split_lines(result.stdout)
@@ -231,9 +329,13 @@ local function new(deps)
       then
         return nil, "Git root query returned a nonphysical path"
       end
+      git_entry, query_error = validate_git_entry(start, root, git_dir)
+      if not git_entry then
+        return nil, query_error
+      end
     else
       if result.code ~= 128 then
-        return nil, "Git root query failed: " .. tostring(result.stderr or "")
+        return nil, "Git root query failed"
       end
       if deps.find_git_entry(start) then
         return nil, "Git metadata exists but its worktree boundary could not be resolved"
@@ -288,7 +390,7 @@ local function new(deps)
       inside_git = inside_git,
       git_dir = git_dir,
       git_common_dir = git_common_dir,
-      git_entry = inside_git and vim.fs.joinpath(root, ".git") or nil,
+      git_entry = git_entry,
       owner_pane = pane,
       tmux_socket = socket,
       namespace = namespace,
@@ -317,6 +419,8 @@ local runtime = new({
   end,
   realpath = vim.uv.fs_realpath,
   stat = vim.uv.fs_stat,
+  lstat = vim.uv.fs_lstat,
+  read_git_entry = read_git_entry,
   find_git_entry = function(start)
     return vim.fs.find(".git", { path = start, upward = true, limit = 1 })[1]
   end,
@@ -335,7 +439,17 @@ local runtime = new({
         "--show-toplevel",
         "--absolute-git-dir",
         "--git-common-dir",
-      }, { text = true })
+      }, {
+        text = true,
+        clear_env = true,
+        env = {
+          LC_ALL = "C",
+          GIT_OPTIONAL_LOCKS = "0",
+          GIT_CONFIG_NOSYSTEM = "1",
+          GIT_CONFIG_GLOBAL = "/dev/null",
+          GIT_CONFIG_COUNT = "0",
+        },
+      })
       :wait(2000)
   end,
 })

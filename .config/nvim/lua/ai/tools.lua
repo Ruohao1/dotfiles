@@ -135,6 +135,13 @@ local function new(deps)
 
   function resolver:resolve_host(options)
     options = options or {}
+    if
+      type(options.shell) ~= "string"
+      or options.shell:sub(1, 1) ~= "/"
+      or has_control(options.shell)
+    then
+      return nil, "configured login shell must be an absolute control-free path"
+    end
     local result = {}
     local required = {
       { field = "git", value = "git" },
