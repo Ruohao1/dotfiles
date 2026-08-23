@@ -16,6 +16,9 @@ local registry_module = require("ai.backends")
 
 eq(registry_module.names(), { "codex", "claude", "opencode" }, "backend order")
 
+local OPENCODE_PERMISSION =
+  '{"*":"ask","read":"allow","edit":"allow","glob":"allow","grep":"allow","list":"allow","lsp":"allow","question":"allow","todowrite":"allow"}'
+
 local identity = {
   key = string.rep("a", 32),
   root = "/work/repo",
@@ -89,7 +92,12 @@ local registry = registry_module._test.new({
   end,
   auth = function(name, executable)
     table.insert(calls.auth, { name, executable })
-    return { code = 0, signal = 0, stdout = "authenticated\n", stderr = "" }
+    local output = {
+      codex = "Logged in using ChatGPT\n",
+      claude = '{"loggedIn":true}\n',
+      opencode = "1 credentials\n",
+    }
+    return { code = 0, signal = 0, stdout = assert(output[name]), stderr = "" }
   end,
   help = function(name, executable, arguments)
     table.insert(calls.help, { name, executable, vim.deepcopy(arguments) })
@@ -241,6 +249,9 @@ eq(opencode_launch.attach_argv, {
   "/work/repo",
 }, "OpenCode attach")
 eq(opencode_launch.env, {
+  OPENCODE_DISABLE_AUTOUPDATE = "true",
+  OPENCODE_DISABLE_LSP_DOWNLOAD = "true",
+  OPENCODE_PERMISSION = OPENCODE_PERMISSION,
   OPENCODE_SERVER_PASSWORD = "0123456789abcdef0123456789abcdef",
   OPENCODE_SERVER_USERNAME = "opencode",
   XDG_CACHE_HOME = "/state/identity/backends/opencode/xdg-cache",
@@ -275,7 +286,8 @@ eq(opencode_launch.protected_paths, {
   "/home/user/.local/share/opencode",
   "/usr/bin/opencode",
 }, "OpenCode protected paths")
-eq(opencode:resume_session(identity, paths, "ses_test123").attach_argv, {
+local opencode_resume = assert(opencode:resume_session(identity, paths, "ses_test123"))
+eq(opencode_resume.attach_argv, {
   "/usr/bin/opencode",
   "attach",
   "http://127.0.0.1:43123",
@@ -284,6 +296,9 @@ eq(opencode:resume_session(identity, paths, "ses_test123").attach_argv, {
   "--session",
   "ses_test123",
 }, "OpenCode exact resume")
+eq(opencode_resume.env.OPENCODE_PERMISSION, OPENCODE_PERMISSION, "OpenCode resume permission")
+eq(opencode_resume.env.OPENCODE_DISABLE_AUTOUPDATE, "true", "OpenCode resume update policy")
+eq(opencode_resume.env.OPENCODE_DISABLE_LSP_DOWNLOAD, "true", "OpenCode resume LSP download policy")
 local invalid_opencode, invalid_opencode_error =
   opencode:resume_session(identity, paths, "../foreign")
 eq(invalid_opencode, nil, "OpenCode rejects invalid session")
@@ -332,6 +347,16 @@ eq(codex:capabilities().approval, false, "capabilities are fresh")
 local first_launch = assert(codex:new_session(identity, paths))
 first_launch.argv[1] = "/changed"
 eq(assert(codex:new_session(identity, paths)).argv[1], "/usr/bin/codex", "launch tables are fresh")
+local opencode_paths = vim.deepcopy(paths)
+opencode_paths.backend_state = "/state/identity/backends/opencode"
+local first_opencode_launch = assert(opencode:new_session(identity, opencode_paths))
+first_opencode_launch.env.OPENCODE_PERMISSION = "changed"
+local fresh_opencode_launch = assert(opencode:new_session(identity, opencode_paths))
+eq(
+  fresh_opencode_launch.env.OPENCODE_PERMISSION,
+  OPENCODE_PERMISSION,
+  "OpenCode permission tables are fresh"
+)
 
 local before_health_revalidations = #calls.revalidate
 for _, name in ipairs(registry_module.names()) do
@@ -352,6 +377,243 @@ eq(calls.help, {
   { "opencode", "/usr/bin/opencode", { "serve", "--help" } },
   { "opencode", "/usr/bin/opencode", { "attach", "--help" } },
 }, "exact compatibility help probes")
+eq(registry_module._test.auth_arguments("codex"), { "login", "status" }, "Codex auth argv")
+eq(
+  registry_module._test.auth_arguments("claude"),
+  { "auth", "status", "--json" },
+  "Claude auth argv"
+)
+eq(registry_module._test.auth_arguments("opencode"), { "auth", "list" }, "OpenCode auth argv")
+local changed_auth_arguments = assert(registry_module._test.auth_arguments("opencode"))
+changed_auth_arguments[1] = "changed"
+eq(registry_module._test.auth_arguments("opencode"), { "auth", "list" }, "fresh auth argv")
+
+local function health_with_auth(name, result)
+  local fixture = registry_module._test.new({
+    executable = function(requested)
+      return "/usr/bin/" .. requested
+    end,
+    revalidate = function()
+      return true
+    end,
+    version = function(requested)
+      return { code = 0, signal = 0, stdout = requested .. " 1.0\n", stderr = "" }
+    end,
+    auth = function(requested)
+      eq(requested, name, "authentication parser backend")
+      return vim.deepcopy(result)
+    end,
+    help = function(requested, _, arguments)
+      return {
+        code = 0,
+        signal = 0,
+        stdout = assert(help_text[requested][table.concat(arguments, "\0")]),
+        stderr = "",
+      }
+    end,
+    stat = function(path)
+      return files[path] and { type = "file", mode = 493, uid = 0 } or nil
+    end,
+    uid = function()
+      return 1000
+    end,
+  })
+  return fixture:health(name)
+end
+
+local auth_cases = {
+  {
+    "codex",
+    { code = 0, signal = 0, stdout = "Logged in using ChatGPT\n", stderr = "" },
+    "authenticated",
+    "Codex explicit login",
+  },
+  {
+    "codex",
+    { code = 0, signal = 0, stdout = "", stderr = "Logged in using ChatGPT\n" },
+    "unknown",
+    "Codex ignores positive marker on stderr",
+  },
+  {
+    "codex",
+    {
+      code = 0,
+      signal = 0,
+      stdout = "Logged in using an API key - redacted-key-sentinel\n",
+      stderr = "",
+    },
+    "authenticated",
+    "Codex API key login",
+  },
+  {
+    "codex",
+    { code = 0, signal = 0, stdout = "Logged in using workload identity\n", stderr = "" },
+    "authenticated",
+    "Codex workload identity login",
+  },
+  {
+    "codex",
+    { code = 0, signal = 0, stdout = "Logged in using access token\n", stderr = "" },
+    "authenticated",
+    "Codex access token login",
+  },
+  {
+    "codex",
+    { code = 0, signal = 0, stdout = "Logged in using personal access token\n", stderr = "" },
+    "authenticated",
+    "Codex personal access token login",
+  },
+  {
+    "codex",
+    { code = 0, signal = 0, stdout = "Logged in using Amazon Bedrock API key\n", stderr = "" },
+    "authenticated",
+    "Codex Bedrock login",
+  },
+  {
+    "codex",
+    { code = 0, signal = 0, stdout = "Logged in using Agent Identity\n", stderr = "" },
+    "authenticated",
+    "Codex legacy agent identity login",
+  },
+  {
+    "codex",
+    { code = 1, signal = 0, stdout = "Not logged in\n", stderr = "" },
+    "unauthenticated",
+    "Codex explicit logout on failure",
+  },
+  {
+    "codex",
+    { code = 1, signal = 0, stdout = "", stderr = "Not logged in\n" },
+    "unauthenticated",
+    "Codex explicit logout on stderr",
+  },
+  {
+    "codex",
+    { code = 0, signal = 0, stdout = "Codex is ready\n", stderr = "" },
+    "unknown",
+    "Codex ambiguous success",
+  },
+  {
+    "codex",
+    { code = 0, signal = 0, stdout = "Logged in using surprise provider\n", stderr = "" },
+    "unknown",
+    "Codex arbitrary login suffix",
+  },
+  {
+    "codex",
+    { code = 0, signal = 0, stdout = "Logged in using ChatGPT extra\n", stderr = "" },
+    "unknown",
+    "Codex known login with extra suffix",
+  },
+  {
+    "claude",
+    { code = 0, signal = 0, stdout = '{"loggedIn":true}\n', stderr = "" },
+    "authenticated",
+    "Claude JSON login",
+  },
+  {
+    "claude",
+    { code = 1, signal = 0, stdout = '{"loggedIn":false}\n', stderr = "" },
+    "unauthenticated",
+    "Claude JSON logout on failure",
+  },
+  {
+    "claude",
+    { code = 1, signal = 0, stdout = "", stderr = '{"loggedIn":false}\n' },
+    "unknown",
+    "Claude ignores JSON-shaped stderr",
+  },
+  {
+    "claude",
+    { code = 0, signal = 0, stdout = '{"loggedIn":"yes"}\n', stderr = "" },
+    "unknown",
+    "Claude ambiguous JSON",
+  },
+  {
+    "claude",
+    { code = 0, signal = 0, stdout = "not json\n", stderr = "" },
+    "unknown",
+    "Claude malformed JSON",
+  },
+  {
+    "opencode",
+    { code = 1, signal = 0, stdout = "No credentials found\n", stderr = "" },
+    "unauthenticated",
+    "OpenCode explicit empty state on failure",
+  },
+  {
+    "opencode",
+    { code = 1, signal = 0, stdout = "", stderr = "No credentials found\n" },
+    "unauthenticated",
+    "OpenCode explicit empty state on stderr",
+  },
+  {
+    "opencode",
+    { code = 0, signal = 0, stdout = "0 credentials\n", stderr = "" },
+    "unauthenticated",
+    "OpenCode zero credential footer",
+  },
+  {
+    "opencode",
+    { code = 0, signal = 0, stdout = "0 credential\n", stderr = "" },
+    "unauthenticated",
+    "OpenCode singular zero credential footer",
+  },
+  {
+    "opencode",
+    { code = 0, signal = 0, stdout = "1 credential\n", stderr = "" },
+    "authenticated",
+    "OpenCode singular positive credential footer",
+  },
+  {
+    "opencode",
+    { code = 0, signal = 0, stdout = "", stderr = "1 credentials\n" },
+    "unknown",
+    "OpenCode ignores positive footer on stderr",
+  },
+  {
+    "opencode",
+    {
+      code = 0,
+      signal = 0,
+      stdout = "private-provider-name oauth\n\27[90m└\27[0m 1 credentials\n",
+      stderr = "",
+    },
+    "authenticated",
+    "OpenCode positive credential footer",
+  },
+  {
+    "opencode",
+    { code = 0, signal = 0, stdout = "Provider catalog loaded\n", stderr = "" },
+    "unknown",
+    "OpenCode ambiguous success",
+  },
+}
+for _, case in ipairs(auth_cases) do
+  local health = health_with_auth(case[1], case[2])
+  eq(health.auth, case[3], case[4])
+  assert(#health.error <= 256, case[4] .. " diagnostic exceeds byte cap")
+  local serialized_health = vim.inspect(health)
+  for _, private_text in ipairs({ "private-provider-name", "redacted-key-sentinel" }) do
+    assert(
+      not serialized_health:find(private_text, 1, true),
+      case[4] .. " leaks authentication detail"
+    )
+  end
+end
+
+local private_failure = health_with_auth("opencode", {
+  code = 2,
+  signal = 0,
+  stdout = "",
+  stderr = "credential-secret-sentinel",
+})
+eq(private_failure.auth, "unknown", "OpenCode failed probe is unknown")
+assert(#private_failure.error > 0 and #private_failure.error <= 256, "bounded auth diagnostic")
+assert(
+  not vim.inspect(private_failure):find("credential-secret-sentinel", 1, true),
+  "auth diagnostic leaks credential detail"
+)
 
 local absent_calls = 0
 local absent = registry_module._test.new({

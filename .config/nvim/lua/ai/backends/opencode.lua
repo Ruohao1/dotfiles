@@ -7,6 +7,9 @@ local CAPABILITIES = {
   exact_session = true,
 }
 
+local PERMISSION_POLICY =
+  '{"*":"ask","read":"allow","edit":"allow","glob":"allow","grep":"allow","list":"allow","lsp":"allow","question":"allow","todowrite":"allow"}'
+
 local HELP_REQUIREMENTS = {
   { arguments = { "--help" }, flags = { "serve", "attach" } },
   {
@@ -119,6 +122,9 @@ function M.new(deps)
       },
       attach_argv = attach_argv,
       env = {
+        OPENCODE_DISABLE_AUTOUPDATE = "true",
+        OPENCODE_DISABLE_LSP_DOWNLOAD = "true",
+        OPENCODE_PERMISSION = PERMISSION_POLICY,
         OPENCODE_SERVER_PASSWORD = password,
         OPENCODE_SERVER_USERNAME = "opencode",
         XDG_DATA_HOME = validated.backend_state .. "/xdg-data",

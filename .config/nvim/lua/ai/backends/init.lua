@@ -8,6 +8,12 @@ local C1_PATTERN = "\194[\128-\159]"
 local GROUP_OR_OTHER_WRITE_BITS = 18
 local MAX_DIAGNOSTIC_BYTES = 256
 local MAX_HELP_BYTES = 65536
+local MAX_AUTH_BYTES = 65536
+local AUTH_ARGUMENTS = {
+  codex = { "login", "status" },
+  claude = { "auth", "status", "--json" },
+  opencode = { "auth", "list" },
+}
 
 local function has_control(value)
   return type(value) ~= "string" or value:find(C0_PATTERN) ~= nil or value:find(C1_PATTERN) ~= nil
@@ -43,6 +49,116 @@ local function diagnostic(result)
     detail = string.format("probe exited with code %s", tostring(result.code))
   end
   return detail
+end
+
+local function auth_arguments(name)
+  local arguments = AUTH_ARGUMENTS[name]
+  return arguments and vim.deepcopy(arguments) or nil
+end
+
+local function auth_output(value)
+  local text = type(value) == "string" and value:sub(1, MAX_AUTH_BYTES) or ""
+  text = text:gsub("\27%[[0-?]*[ -/]*[@-~]", "")
+  text = text:gsub(C1_PATTERN, " ")
+  text = text:gsub("[%z\1-\9\11\12\14-\31\127]", " ")
+  return text
+end
+
+local function auth_lines(value)
+  local lines = {}
+  for line in (auth_output(value):gsub("\r\n", "\n") .. "\n"):gmatch("(.-)\n") do
+    lines[#lines + 1] = line:match("^%s*(.-)%s*$")
+  end
+  return lines
+end
+
+local function parse_codex_auth(result)
+  local positive_lines = {
+    ["logged in using chatgpt"] = true,
+    ["logged in using an api key"] = true,
+    ["logged in using workload identity"] = true,
+    ["logged in using access token"] = true,
+    ["logged in using personal access token"] = true,
+    ["logged in using amazon bedrock api key"] = true,
+    ["logged in using agent identity"] = true,
+  }
+  for _, line in ipairs(auth_lines(result.stdout .. "\n" .. result.stderr)) do
+    local lower = line:lower()
+    if lower:find("not logged in", 1, true) == 1 then
+      return "unauthenticated"
+    end
+  end
+  for _, line in ipairs(auth_lines(result.stdout)) do
+    local lower = line:lower()
+    if positive_lines[lower] or lower:match("^logged in using an api key %- .+$") then
+      return "authenticated"
+    end
+  end
+  return "unknown"
+end
+
+local function parse_claude_auth(result)
+  local ok, decoded = pcall(vim.json.decode, auth_output(result.stdout))
+  if not ok or type(decoded) ~= "table" or type(decoded.loggedIn) ~= "boolean" then
+    return "unknown"
+  end
+  return decoded.loggedIn and "authenticated" or "unauthenticated"
+end
+
+local function parse_opencode_auth(result)
+  for _, line in ipairs(auth_lines(result.stdout .. "\n" .. result.stderr)) do
+    local prefix = line:lower():match("^(.-)no credentials found%s*$")
+    if prefix and not prefix:find("[%w]") then
+      return "unauthenticated"
+    end
+    local count_prefix, count = line:lower():match("^(.-)(%d+) credentials?%s*$")
+    if count and not count_prefix:find("[%w]") then
+      if tonumber(count) == 0 then
+        return "unauthenticated"
+      end
+    end
+  end
+  for _, line in ipairs(auth_lines(result.stdout)) do
+    local count_prefix, count = line:lower():match("^(.-)(%d+) credentials?%s*$")
+    if count and not count_prefix:find("[%w]") and count:sub(1, 1) ~= "0" then
+      return "authenticated"
+    end
+  end
+  return "unknown"
+end
+
+local AUTH_PARSERS = {
+  codex = parse_codex_auth,
+  claude = parse_claude_auth,
+  opencode = parse_opencode_auth,
+}
+
+local function parse_auth(name, result)
+  local parser = AUTH_PARSERS[name]
+  return parser and parser(result) or "unknown"
+end
+
+local function auth_diagnostic(name, result)
+  if type(result) ~= "table" then
+    return clean_text(
+      string.format("authentication status unavailable: %s probe could not run", name),
+      MAX_DIAGNOSTIC_BYTES
+    )
+  end
+  if result.code ~= 0 then
+    return clean_text(
+      string.format(
+        "authentication status unavailable: %s probe exited with code %s",
+        name,
+        tostring(result.code)
+      ),
+      MAX_DIAGNOSTIC_BYTES
+    )
+  end
+  return clean_text(
+    string.format("authentication status unavailable: unrecognized %s status", name),
+    MAX_DIAGNOSTIC_BYTES
+  )
 end
 
 local function canonical_path(value, label, allow_root)
@@ -167,12 +283,7 @@ local function runtime_dependencies()
       return read_only_probe(executable, { "--version" })
     end,
     auth = function(name, executable)
-      local arguments = {
-        codex = { "login", "status" },
-        claude = { "auth", "status", "--json" },
-        opencode = { "providers", "list" },
-      }
-      return read_only_probe(executable, assert(arguments[name]))
+      return read_only_probe(executable, assert(auth_arguments(name)))
     end,
     help = function(_, executable, arguments)
       return read_only_probe(executable, arguments)
@@ -410,34 +521,16 @@ local function new(deps)
       end
     end
 
-    local auth_result, auth_error = probe(executable, deps.auth, name, executable)
+    local auth_result = probe(executable, deps.auth, name, executable)
     local auth = "unknown"
     local health_error = ""
-    if not auth_result or auth_result.code ~= 0 then
-      health_error = clean_text(
-        "authentication status unavailable: " .. (auth_error or diagnostic(auth_result)),
-        MAX_DIAGNOSTIC_BYTES
-      )
+    local parsed_auth = auth_result and parse_auth(name, auth_result) or "unknown"
+    if parsed_auth == "unauthenticated" then
+      auth = "unauthenticated"
+    elseif auth_result and auth_result.code == 0 and parsed_auth == "authenticated" then
+      auth = "authenticated"
     else
-      local auth_text = clean_text(auth_result.stdout .. " " .. auth_result.stderr, 4096):lower()
-      local compact_auth = auth_text:gsub("%s+", "")
-      if
-        auth_text:find("not authenticated", 1, true)
-        or auth_text:find("not logged in", 1, true)
-        or auth_text:find("logged out", 1, true)
-        or compact_auth:find('"authenticated":false', 1, true)
-        or compact_auth:find('"loggedin":false', 1, true)
-      then
-        auth = "unauthenticated"
-      elseif
-        auth_text:find("authenticated", 1, true)
-        or auth_text:find("logged in", 1, true)
-        or compact_auth:find('"authenticated":true', 1, true)
-        or compact_auth:find('"loggedin":true', 1, true)
-        or auth_text ~= ""
-      then
-        auth = "authenticated"
-      end
+      health_error = auth_diagnostic(name, auth_result)
     end
 
     return {
@@ -542,6 +635,7 @@ function M.health(name)
 end
 
 M._test = {
+  auth_arguments = auth_arguments,
   new = new,
   read_only_probe = read_only_probe,
   uuid = uuid_v4,
