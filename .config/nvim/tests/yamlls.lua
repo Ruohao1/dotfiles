@@ -43,7 +43,7 @@ assert(vim.fn.mkdir(fixture_root, "p") == 1, "could not create YAMLLS fixture ro
 
 vim.opt.runtimepath:prepend(nvim_root)
 
-local server_names = { "bashls", "jsonls", "lua_ls", "pyright", "yamlls" }
+local server_names = { "bashls", "jsonls", "lua_ls", "pyright", "taplo", "yamlls" }
 local cleanup_clients = {}
 local cleanup_buffers = {}
 
@@ -117,7 +117,8 @@ local ok, failure = xpcall(function()
   copied_servers[2] = "not_jsonls"
   copied_servers[3] = "not_lua_ls"
   copied_servers[4] = "not_pyright"
-  copied_servers[5] = "not_yamlls"
+  copied_servers[5] = "not_taplo"
+  copied_servers[6] = "not_yamlls"
   eq(registry.servers(), server_names, "server allowlist defensive copy")
 
   local original_enable = vim.lsp.enable
@@ -146,7 +147,7 @@ local ok, failure = xpcall(function()
   for _, name in ipairs(server_names) do
     assert(vim.lsp.is_enabled(name), name .. " must be enabled")
   end
-  for _, name in ipairs({ "bashls", "jsonls", "lua_ls", "pyright" }) do
+  for _, name in ipairs({ "bashls", "jsonls", "lua_ls", "pyright", "taplo" }) do
     assert(
       #vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0,
       "YAMLLS test must not start " .. name
@@ -222,7 +223,7 @@ local ok, failure = xpcall(function()
   )
   eq(formatting_response.result, {}, "disabled YAML formatting returns no edits")
 
-  for _, name in ipairs({ "bashls", "jsonls", "lua_ls", "pyright" }) do
+  for _, name in ipairs({ "bashls", "jsonls", "lua_ls", "pyright", "taplo" }) do
     assert(
       #vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0,
       "YAML buffer must not start " .. name

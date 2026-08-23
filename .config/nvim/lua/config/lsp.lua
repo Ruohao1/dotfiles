@@ -1,6 +1,6 @@
 local M = {}
 
-local enabled_servers = { "bashls", "jsonls", "lua_ls", "pyright", "yamlls" }
+local enabled_servers = { "bashls", "jsonls", "lua_ls", "pyright", "taplo", "yamlls" }
 
 function M.servers()
   return vim.deepcopy(enabled_servers)
