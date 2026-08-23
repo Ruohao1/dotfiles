@@ -204,6 +204,9 @@ local function base_identity_deps(overrides)
       return paths[path]
     end,
     stat = function(path)
+      if path == "/logical/buffer/new.lua" then
+        return nil
+      end
       if path == "/tmp/tmux/default" then
         return { type = "socket", dev = 4, ino = 9 }
       end
@@ -222,20 +225,103 @@ local function base_identity_deps(overrides)
   return vim.tbl_deep_extend("force", deps, overrides or {})
 end
 
-local named_start
+local named_starts = {}
 local named = assert(identity._test
   .new(base_identity_deps({
     buffer_name = function()
       return "/logical/buffer/new.lua"
     end,
     git = function(start)
-      named_start = start
+      table.insert(named_starts, start)
       return { code = 128, signal = 0, stdout = "", stderr = "not a repository" }
     end,
   }))
   :resolve())
-eq(named_start, "/physical/buffer", "named non-Git buffer query start")
+eq(
+  named_starts,
+  { "/physical/buffer", "/physical/cwd" },
+  "named non-Git buffer and cwd query starts"
+)
 eq(named.root, "/physical/cwd", "named non-Git buffer uses physical cwd")
+
+local linked_calls = {}
+local linked_fallback = assert(identity._test
+  .new(base_identity_deps({
+    cwd = function()
+      return "/logical/worktree"
+    end,
+    buffer_name = function()
+      return "/outside/notes.lua"
+    end,
+    realpath = function(path)
+      local paths = {
+        ["/outside/notes.lua"] = "/physical/outside/notes.lua",
+        ["/outside"] = "/physical/outside",
+        ["/logical/worktree"] = "/physical/worktree",
+        ["/logical/git-dir"] = "/physical/git/worktrees/worktree",
+        ["/logical/common"] = "/physical/git",
+      }
+      return paths[path]
+    end,
+    stat = function(path)
+      if path == "/outside/notes.lua" or path == "/physical/outside/notes.lua" then
+        return { type = "file" }
+      end
+      return { type = "directory" }
+    end,
+    git = function(start)
+      table.insert(linked_calls, start)
+      if start == "/physical/outside" then
+        return { code = 128, signal = 0, stdout = "", stderr = "not a repository" }
+      end
+      return {
+        code = 0,
+        signal = 0,
+        stdout = "/logical/worktree\n/logical/git-dir\n/logical/common\n",
+        stderr = "",
+      }
+    end,
+    hash = function()
+      return string.rep("f", 64)
+    end,
+  }))
+  :resolve())
+eq(linked_calls, { "/physical/outside", "/physical/worktree" }, "linked cwd fallback queries")
+eq(linked_fallback, {
+  key = string.rep("f", 32),
+  root = "/physical/worktree",
+  inside_git = true,
+  git_dir = "/physical/git/worktrees/worktree",
+  git_common_dir = "/physical/git",
+  git_entry = "/physical/worktree/.git",
+  owner_pane = nil,
+  tmux_socket = nil,
+  namespace = "nvim:101_202",
+}, "linked cwd fallback identity")
+
+local validation_calls = 0
+local drift_git_calls = 0
+local drifted, drifted_error = identity._test
+  .new(base_identity_deps({
+    buffer_name = function()
+      return "/logical/buffer/new.lua"
+    end,
+    revalidate_git = function()
+      validation_calls = validation_calls + 1
+      if validation_calls == 1 then
+        return true
+      end
+      return nil, "trusted Git metadata changed"
+    end,
+    git = function()
+      drift_git_calls = drift_git_calls + 1
+      return { code = 128, signal = 0, stdout = "", stderr = "not a repository" }
+    end,
+  }))
+  :resolve()
+rejected(drifted, drifted_error, "trusted Git metadata changed", "Git drift during cwd fallback")
+eq(validation_calls, 2, "Git revalidated before every query")
+eq(drift_git_calls, 1, "drifted Git executable not invoked")
 
 local identity_rejections = {
   {
@@ -511,215 +597,321 @@ eq(host_fixture:resolve_host({ shell = "/bin/sh", identity = { tmux_socket = nil
 }, "standalone host tools")
 
 local fixture = vim.fn.tempname()
-assert(vim.fn.mkdir(fixture, "p", 448) == 1, "state fixture")
-local store = assert(state._test.open({
-  identity = plain,
-  runtime_base = vim.fs.joinpath(fixture, "run"),
-  state_base = vim.fs.joinpath(fixture, "state"),
-  uid = vim.uv.getuid(),
-}))
-
-local record = {
-  schema = 1,
-  identity = {
-    key = plain.key,
-    root = plain.root,
-    namespace = plain.namespace,
-    owner_pane = vim.NIL,
-  },
-  active_backend = "claude",
-  sessions = {
-    codex = "last",
-    claude = "00000000-0000-4000-8000-000000000000",
-    opencode = "",
-  },
-  grants = {},
-  review_id = vim.NIL,
-}
-assert(store:write_record(record))
-eq(store:read_record(), record, "durable record round trip")
-local control_token = assert(store:ensure_control_token(function()
-  return string.rep("c", 32)
-end))
-eq(control_token, string.rep("c", 32), "control token creation")
-eq(store:read_control_token(), control_token, "control token read")
-eq(
-  store:ensure_control_token(function()
-    error("must reuse token")
-  end),
-  control_token,
-  "control token reuse"
-)
-
-eq(store:runtime_root(), vim.fs.joinpath(fixture, "run"), "runtime application root")
-eq(store:state_root(), vim.fs.joinpath(fixture, "state"), "state application root")
-for _, path in ipairs({ store:runtime_dir(), store:state_dir() }) do
-  local stat = assert(vim.uv.fs_stat(path), "private directory missing")
-  eq(stat.mode % 512, 448, "private directory mode")
-  eq(stat.uid, vim.uv.getuid(), "private directory owner")
-end
-local record_stat = assert(vim.uv.fs_stat(store:record_path()), "record missing")
-eq(record_stat.mode % 512, 384, "record mode")
-local token_stat = assert(
-  vim.uv.fs_stat(vim.fs.joinpath(store:runtime_dir(), "control-token")),
-  "control token missing"
-)
-eq(token_stat.mode % 512, 384, "control token mode")
-assert(store:remove_control_token())
-eq(store:read_control_token(), nil, "control token removal")
-
-local launch_token = string.rep("e", 32)
-local launch_path = assert(store:write_launch({ schema = 1, token = launch_token }))
-eq(assert(vim.uv.fs_stat(launch_path)).mode % 512, 384, "launch manifest mode")
-assert(store:remove_launch(launch_token))
-eq(vim.uv.fs_lstat(launch_path), nil, "launch manifest removal")
-eq(assert(vim.uv.fs_stat(store:review_dir("review_1"))).mode % 512, 448, "review directory mode")
-
-local context_dir = vim.fs.joinpath(store:runtime_dir(), "contexts")
-assert(vim.fn.mkdir(context_dir, "p", 448) == 1, "context directory fixture")
-local context_file = vim.fs.joinpath(context_dir, "selection.txt")
-assert(vim.fn.writefile({ "secret" }, context_file) == 0, "context file fixture")
-assert(vim.uv.fs_chmod(context_file, 384), "context file mode")
-assert(store:cleanup_contexts())
-eq(vim.uv.fs_lstat(context_dir), nil, "context cleanup")
-
-local unsafe = vim.fs.joinpath(fixture, "unsafe")
-assert(vim.uv.fs_symlink(store:state_dir(), unsafe), "state symlink fixture")
-local unsafe_store, unsafe_error = state._test.open({
-  identity = plain,
-  runtime_base = vim.fs.joinpath(fixture, "run-2"),
-  state_base = unsafe,
-  uid = vim.uv.getuid(),
-})
-rejected(unsafe_store, unsafe_error, "symlink", "symlinked state root rejected")
-
-local control_path_store, control_path_error = state._test.open({
-  identity = plain,
-  runtime_base = vim.fs.joinpath(fixture, "run\nunsafe"),
-  state_base = vim.fs.joinpath(fixture, "state-2"),
-  uid = vim.uv.getuid(),
-})
-rejected(control_path_store, control_path_error, "control", "control-containing state path")
-
-local wrong_mode_base = vim.fs.joinpath(fixture, "wrong-mode")
-assert(vim.fn.mkdir(wrong_mode_base, "p", 493) == 1, "wrong mode fixture")
-assert(vim.uv.fs_chmod(wrong_mode_base, 493), "wrong mode fixture chmod")
-local wrong_mode, wrong_mode_error = state._test.open({
-  identity = plain,
-  runtime_base = vim.fs.joinpath(fixture, "run-3"),
-  state_base = wrong_mode_base,
-  uid = vim.uv.getuid(),
-})
-rejected(wrong_mode, wrong_mode_error, "ownership or mode", "unsafe state mode")
-
-local wrong_owner_base = vim.fs.joinpath(fixture, "wrong-owner")
-assert(vim.fn.mkdir(wrong_owner_base, "p", 448) == 1, "wrong owner fixture")
-local wrong_owner, wrong_owner_error = state._test.open({
-  identity = plain,
-  runtime_base = vim.fs.joinpath(fixture, "run-4"),
-  state_base = wrong_owner_base,
-  uid = vim.uv.getuid(),
-  fs_stat = function(path)
-    local stat = vim.uv.fs_stat(path)
-    if stat and path == wrong_owner_base then
-      stat.uid = vim.uv.getuid() + 1
-    end
-    return stat
-  end,
-})
-rejected(wrong_owner, wrong_owner_error, "ownership or mode", "unsafe state owner")
-
-local xdg_runtime = vim.fs.joinpath(fixture, "xdg-runtime")
-local xdg_state = vim.fs.joinpath(fixture, "xdg-state")
-assert(vim.fn.mkdir(xdg_runtime, "p", 448) == 1, "XDG runtime fixture")
-assert(vim.fn.mkdir(xdg_state, "p", 448) == 1, "XDG state fixture")
-assert(vim.uv.fs_chmod(xdg_state, 511), "unsafe XDG state mode")
 local previous_runtime = vim.env.XDG_RUNTIME_DIR
 local previous_state = vim.env.XDG_STATE_HOME
-vim.env.XDG_RUNTIME_DIR = xdg_runtime
-vim.env.XDG_STATE_HOME = xdg_state
-local unsafe_xdg, unsafe_xdg_error = state.open(plain)
-vim.env.XDG_RUNTIME_DIR = previous_runtime
-vim.env.XDG_STATE_HOME = previous_state
-rejected(unsafe_xdg, unsafe_xdg_error, "XDG state ancestor is unsafe", "unsafe XDG ancestor")
 
-local function new_store(suffix, deps)
-  return assert(state._test.open(vim.tbl_extend("force", {
+local function run_filesystem_tests()
+  assert(vim.fn.mkdir(fixture, "p", 448) == 1, "state fixture")
+
+  local symlink_source = vim.fs.joinpath(fixture, "symlink-source")
+  local symlink_target = vim.fs.joinpath(fixture, "symlink-target")
+  local symlink_git_dir = vim.fs.joinpath(fixture, "git", "worktrees", "symlink-target")
+  local symlink_git_common = vim.fs.joinpath(fixture, "git")
+  assert(vim.fn.mkdir(symlink_source, "p", 448) == 1, "symlink source fixture")
+  assert(vim.fn.mkdir(symlink_target, "p", 448) == 1, "symlink target fixture")
+  assert(vim.fn.mkdir(symlink_git_dir, "p", 448) == 1, "symlink Git directory fixture")
+  local target_file = vim.fs.joinpath(symlink_target, "main.lua")
+  local linked_file = vim.fs.joinpath(symlink_source, "linked.lua")
+  assert(vim.fn.writefile({ "return true" }, target_file) == 0, "symlink target file fixture")
+  assert(
+    vim.fn.writefile({ "gitdir: " .. symlink_git_dir }, vim.fs.joinpath(symlink_target, ".git"))
+      == 0,
+    "linked-worktree Git entry fixture"
+  )
+  assert(vim.uv.fs_symlink(target_file, linked_file), "buffer symlink fixture")
+  local symlink_query_starts = {}
+  local symlink_identity = assert(identity._test
+    .new({
+      env = {},
+      nonce = function()
+        return "symlink_1"
+      end,
+      cwd = function()
+        return symlink_source
+      end,
+      buffer_name = function()
+        return linked_file
+      end,
+      buffer_type = function()
+        return ""
+      end,
+      realpath = vim.uv.fs_realpath,
+      stat = vim.uv.fs_stat,
+      find_git_entry = function()
+        return nil
+      end,
+      revalidate_git = function()
+        return true
+      end,
+      git = function(start)
+        table.insert(symlink_query_starts, start)
+        if start ~= symlink_target then
+          return { code = 128, signal = 0, stdout = "", stderr = "not a repository" }
+        end
+        return {
+          code = 0,
+          signal = 0,
+          stdout = table.concat({ symlink_target, symlink_git_dir, symlink_git_common, "" }, "\n"),
+          stderr = "",
+        }
+      end,
+      hash = function()
+        return string.rep("9", 64)
+      end,
+    })
+    :resolve())
+  eq(symlink_query_starts, { symlink_target }, "symlinked buffer uses target checkout")
+  eq(symlink_identity.root, symlink_target, "symlinked buffer physical root")
+  eq(symlink_identity.git_dir, symlink_git_dir, "symlinked buffer Git directory")
+  eq(symlink_identity.git_entry, vim.fs.joinpath(symlink_target, ".git"), "symlinked Git entry")
+
+  local store = assert(state._test.open({
     identity = plain,
-    runtime_base = vim.fs.joinpath(fixture, "run-" .. suffix),
-    state_base = vim.fs.joinpath(fixture, "state-" .. suffix),
+    runtime_base = vim.fs.joinpath(fixture, "run"),
+    state_base = vim.fs.joinpath(fixture, "state"),
     uid = vim.uv.getuid(),
-  }, deps or {})))
+  }))
+
+  local record = {
+    schema = 1,
+    identity = {
+      key = plain.key,
+      root = plain.root,
+      namespace = plain.namespace,
+      owner_pane = vim.NIL,
+    },
+    active_backend = "claude",
+    sessions = {
+      codex = "last",
+      claude = "00000000-0000-4000-8000-000000000000",
+      opencode = "",
+    },
+    grants = {},
+    review_id = vim.NIL,
+  }
+  assert(store:write_record(record))
+  eq(store:read_record(), record, "durable record round trip")
+  local control_token = assert(store:ensure_control_token(function()
+    return string.rep("c", 32)
+  end))
+  eq(control_token, string.rep("c", 32), "control token creation")
+  eq(store:read_control_token(), control_token, "control token read")
+  eq(
+    store:ensure_control_token(function()
+      error("must reuse token")
+    end),
+    control_token,
+    "control token reuse"
+  )
+
+  eq(store:runtime_root(), vim.fs.joinpath(fixture, "run"), "runtime application root")
+  eq(store:state_root(), vim.fs.joinpath(fixture, "state"), "state application root")
+  for _, path in ipairs({ store:runtime_dir(), store:state_dir() }) do
+    local stat = assert(vim.uv.fs_stat(path), "private directory missing")
+    eq(stat.mode % 512, 448, "private directory mode")
+    eq(stat.uid, vim.uv.getuid(), "private directory owner")
+  end
+  local record_stat = assert(vim.uv.fs_stat(store:record_path()), "record missing")
+  eq(record_stat.mode % 512, 384, "record mode")
+  local token_stat = assert(
+    vim.uv.fs_stat(vim.fs.joinpath(store:runtime_dir(), "control-token")),
+    "control token missing"
+  )
+  eq(token_stat.mode % 512, 384, "control token mode")
+  assert(store:remove_control_token())
+  eq(store:read_control_token(), nil, "control token removal")
+
+  local launch_token = string.rep("e", 32)
+  local launch_path = assert(store:write_launch({ schema = 1, token = launch_token }))
+  eq(assert(vim.uv.fs_stat(launch_path)).mode % 512, 384, "launch manifest mode")
+  assert(store:remove_launch(launch_token))
+  eq(vim.uv.fs_lstat(launch_path), nil, "launch manifest removal")
+  eq(assert(vim.uv.fs_stat(store:review_dir("review_1"))).mode % 512, 448, "review directory mode")
+
+  local context_dir = vim.fs.joinpath(store:runtime_dir(), "contexts")
+  assert(vim.fn.mkdir(context_dir, "p", 448) == 1, "context directory fixture")
+  local context_file = vim.fs.joinpath(context_dir, "selection.txt")
+  assert(vim.fn.writefile({ "secret" }, context_file) == 0, "context file fixture")
+  assert(vim.uv.fs_chmod(context_file, 384), "context file mode")
+  assert(store:cleanup_contexts())
+  eq(vim.uv.fs_lstat(context_dir), nil, "context cleanup")
+
+  local unsafe = vim.fs.joinpath(fixture, "unsafe")
+  assert(vim.uv.fs_symlink(store:state_dir(), unsafe), "state symlink fixture")
+  local unsafe_store, unsafe_error = state._test.open({
+    identity = plain,
+    runtime_base = vim.fs.joinpath(fixture, "run-2"),
+    state_base = unsafe,
+    uid = vim.uv.getuid(),
+  })
+  rejected(unsafe_store, unsafe_error, "symlink", "symlinked state root rejected")
+
+  local control_path_store, control_path_error = state._test.open({
+    identity = plain,
+    runtime_base = vim.fs.joinpath(fixture, "run\nunsafe"),
+    state_base = vim.fs.joinpath(fixture, "state-2"),
+    uid = vim.uv.getuid(),
+  })
+  rejected(control_path_store, control_path_error, "control", "control-containing state path")
+
+  local wrong_mode_base = vim.fs.joinpath(fixture, "wrong-mode")
+  assert(vim.fn.mkdir(wrong_mode_base, "p", 493) == 1, "wrong mode fixture")
+  assert(vim.uv.fs_chmod(wrong_mode_base, 493), "wrong mode fixture chmod")
+  local wrong_mode, wrong_mode_error = state._test.open({
+    identity = plain,
+    runtime_base = vim.fs.joinpath(fixture, "run-3"),
+    state_base = wrong_mode_base,
+    uid = vim.uv.getuid(),
+  })
+  rejected(wrong_mode, wrong_mode_error, "ownership or mode", "unsafe state mode")
+
+  local wrong_owner_base = vim.fs.joinpath(fixture, "wrong-owner")
+  assert(vim.fn.mkdir(wrong_owner_base, "p", 448) == 1, "wrong owner fixture")
+  local wrong_owner, wrong_owner_error = state._test.open({
+    identity = plain,
+    runtime_base = vim.fs.joinpath(fixture, "run-4"),
+    state_base = wrong_owner_base,
+    uid = vim.uv.getuid(),
+    fs_stat = function(path)
+      local stat = vim.uv.fs_stat(path)
+      if stat and path == wrong_owner_base then
+        stat.uid = vim.uv.getuid() + 1
+      end
+      return stat
+    end,
+  })
+  rejected(wrong_owner, wrong_owner_error, "ownership or mode", "unsafe state owner")
+
+  local xdg_runtime = vim.fs.joinpath(fixture, "xdg-runtime")
+  local xdg_state = vim.fs.joinpath(fixture, "xdg-state")
+  assert(vim.fn.mkdir(xdg_runtime, "p", 448) == 1, "XDG runtime fixture")
+  assert(vim.fn.mkdir(xdg_state, "p", 448) == 1, "XDG state fixture")
+  assert(vim.uv.fs_chmod(xdg_state, 511), "unsafe XDG state mode")
+  vim.env.XDG_RUNTIME_DIR = xdg_runtime
+  vim.env.XDG_STATE_HOME = xdg_state
+  local unsafe_xdg, unsafe_xdg_error = state.open(plain)
+  vim.env.XDG_RUNTIME_DIR = previous_runtime
+  vim.env.XDG_STATE_HOME = previous_state
+  rejected(unsafe_xdg, unsafe_xdg_error, "XDG state ancestor is unsafe", "unsafe XDG ancestor")
+
+  local function new_store(suffix, deps)
+    return assert(state._test.open(vim.tbl_extend("force", {
+      identity = plain,
+      runtime_base = vim.fs.joinpath(fixture, "run-" .. suffix),
+      state_base = vim.fs.joinpath(fixture, "state-" .. suffix),
+      uid = vim.uv.getuid(),
+    }, deps or {})))
+  end
+
+  local corrupt_store = new_store("corrupt")
+  assert(vim.fn.writefile({ "{" }, corrupt_store:record_path()) == 0, "corrupt JSON fixture")
+  assert(vim.uv.fs_chmod(corrupt_store:record_path(), 384), "corrupt JSON mode")
+  local corrupt, corrupt_error = corrupt_store:read_record()
+  rejected(corrupt, corrupt_error, "invalid JSON", "corrupt JSON rejected")
+
+  local wrong_file_mode_store = new_store("file-mode")
+  assert(wrong_file_mode_store:write_record(record))
+  assert(vim.uv.fs_chmod(wrong_file_mode_store:record_path(), 420), "wrong record mode fixture")
+  local wrong_file_mode, wrong_file_mode_error = wrong_file_mode_store:read_record()
+  rejected(wrong_file_mode, wrong_file_mode_error, "unsafe ownership or mode", "unsafe record mode")
+
+  local oversized_store = new_store("oversized")
+  assert(
+    vim.fn.writefile({ string.rep("x", 1024 * 1024 + 1) }, oversized_store:record_path(), "b") == 0,
+    "oversized JSON fixture"
+  )
+  assert(vim.uv.fs_chmod(oversized_store:record_path(), 384), "oversized JSON mode")
+  local oversized, oversized_error = oversized_store:read_record()
+  rejected(oversized, oversized_error, "too large", "oversized JSON rejected")
+
+  local partial_once = true
+  local partial_store = new_store("partial", {
+    fs_write = function(fd, bytes, offset)
+      if partial_once then
+        partial_once = false
+        local partial = bytes:sub(1, math.max(1, math.floor(#bytes / 2)))
+        return vim.uv.fs_write(fd, partial, offset)
+      end
+      return nil, "forced partial write"
+    end,
+  })
+  local partial, partial_error = partial_store:write_record(record)
+  rejected(partial, partial_error, "forced partial write", "partial write rejected")
+  eq(vim.uv.fs_lstat(partial_store:record_path()), nil, "partial write not published")
+
+  local parent_open_store = new_store("parent-open", {
+    fs_open = function(path, flags, mode)
+      if flags == "r" then
+        return nil, "forced parent open failure"
+      end
+      return vim.uv.fs_open(path, flags, mode)
+    end,
+  })
+  local unopened, unopened_error, unopened_published = parent_open_store:write_record(record)
+  rejected(unopened, unopened_error, "open state directory", "parent open failure")
+  eq(unopened_published, false, "parent open failure publication marker")
+  eq(vim.uv.fs_lstat(parent_open_store:record_path()), nil, "parent open failure not published")
+
+  local fsync_calls = 0
+  local fsync_store = new_store("fsync", {
+    fs_fsync = function(fd)
+      fsync_calls = fsync_calls + 1
+      if fsync_calls == 2 then
+        return nil, "forced directory fsync"
+      end
+      return vim.uv.fs_fsync(fd)
+    end,
+  })
+  local unsynced, unsynced_error, unsynced_published = fsync_store:write_record(record)
+  rejected(unsynced, unsynced_error, "directory fsync", "directory fsync failure")
+  eq(unsynced_published, true, "directory fsync publication marker")
+  eq(fsync_store:read_record(), record, "directory fsync published record is readable")
+
+  local close_calls = 0
+  local close_store = new_store("parent-close", {
+    fs_close = function(fd)
+      close_calls = close_calls + 1
+      local closed, close_error = vim.uv.fs_close(fd)
+      if close_calls == 2 then
+        return nil, "forced parent close failure"
+      end
+      return closed, close_error
+    end,
+  })
+  local unclosed, unclosed_error, unclosed_published = close_store:write_record(record)
+  rejected(unclosed, unclosed_error, "directory fsync", "parent close failure")
+  eq(unclosed_published, true, "parent close publication marker")
+  eq(close_store:read_record(), record, "parent close published record is readable")
+
+  local race_base = vim.fs.joinpath(fixture, "race-state")
+  local race_checks = 0
+  local race, race_error = state._test.open({
+    identity = plain,
+    runtime_base = vim.fs.joinpath(fixture, "race-run"),
+    state_base = race_base,
+    uid = vim.uv.getuid(),
+    fs_lstat = function(path)
+      local stat = vim.uv.fs_lstat(path)
+      if path == race_base then
+        race_checks = race_checks + 1
+        if race_checks >= 2 then
+          return { type = "link", mode = 448, uid = vim.uv.getuid(), dev = 1, ino = 2 }
+        end
+      end
+      return stat
+    end,
+  })
+  rejected(race, race_error, "symlink", "symlink race rejected")
 end
 
-local corrupt_store = new_store("corrupt")
-assert(vim.fn.writefile({ "{" }, corrupt_store:record_path()) == 0, "corrupt JSON fixture")
-assert(vim.uv.fs_chmod(corrupt_store:record_path(), 384), "corrupt JSON mode")
-local corrupt, corrupt_error = corrupt_store:read_record()
-rejected(corrupt, corrupt_error, "invalid JSON", "corrupt JSON rejected")
-
-local wrong_file_mode_store = new_store("file-mode")
-assert(wrong_file_mode_store:write_record(record))
-assert(vim.uv.fs_chmod(wrong_file_mode_store:record_path(), 420), "wrong record mode fixture")
-local wrong_file_mode, wrong_file_mode_error = wrong_file_mode_store:read_record()
-rejected(wrong_file_mode, wrong_file_mode_error, "unsafe ownership or mode", "unsafe record mode")
-
-local oversized_store = new_store("oversized")
-assert(
-  vim.fn.writefile({ string.rep("x", 1024 * 1024 + 1) }, oversized_store:record_path(), "b") == 0,
-  "oversized JSON fixture"
-)
-assert(vim.uv.fs_chmod(oversized_store:record_path(), 384), "oversized JSON mode")
-local oversized, oversized_error = oversized_store:read_record()
-rejected(oversized, oversized_error, "too large", "oversized JSON rejected")
-
-local partial_once = true
-local partial_store = new_store("partial", {
-  fs_write = function(fd, bytes, offset)
-    if partial_once then
-      partial_once = false
-      local partial = bytes:sub(1, math.max(1, math.floor(#bytes / 2)))
-      return vim.uv.fs_write(fd, partial, offset)
-    end
-    return nil, "forced partial write"
-  end,
-})
-local partial, partial_error = partial_store:write_record(record)
-rejected(partial, partial_error, "forced partial write", "partial write rejected")
-eq(vim.uv.fs_lstat(partial_store:record_path()), nil, "partial write not published")
-
-local fsync_calls = 0
-local fsync_store = new_store("fsync", {
-  fs_fsync = function(fd)
-    fsync_calls = fsync_calls + 1
-    if fsync_calls == 2 then
-      return nil, "forced directory fsync"
-    end
-    return vim.uv.fs_fsync(fd)
-  end,
-})
-local unsynced, unsynced_error = fsync_store:write_record(record)
-rejected(unsynced, unsynced_error, "directory fsync", "directory fsync failure")
-
-local race_base = vim.fs.joinpath(fixture, "race-state")
-local race_checks = 0
-local race, race_error = state._test.open({
-  identity = plain,
-  runtime_base = vim.fs.joinpath(fixture, "race-run"),
-  state_base = race_base,
-  uid = vim.uv.getuid(),
-  fs_lstat = function(path)
-    local stat = vim.uv.fs_lstat(path)
-    if path == race_base then
-      race_checks = race_checks + 1
-      if race_checks >= 2 then
-        return { type = "link", mode = 448, uid = vim.uv.getuid(), dev = 1, ino = 2 }
-      end
-    end
-    return stat
-  end,
-})
-rejected(race, race_error, "symlink", "symlink race rejected")
-
-assert(vim.fn.delete(fixture, "rf") == 0, "state fixture cleanup")
+local filesystem_ok, filesystem_error = xpcall(run_filesystem_tests, debug.traceback)
+vim.env.XDG_RUNTIME_DIR = previous_runtime
+vim.env.XDG_STATE_HOME = previous_state
+local cleanup_result = vim.fn.delete(fixture, "rf")
+local cleanup_ok = cleanup_result == 0 or vim.uv.fs_lstat(fixture) == nil
+if not filesystem_ok then
+  local cleanup_detail = cleanup_ok and "" or "\nfixture cleanup also failed"
+  error(filesystem_error .. cleanup_detail, 0)
+end
+assert(cleanup_ok, "state fixture cleanup")
 print("AI identity and state assertions: ok")

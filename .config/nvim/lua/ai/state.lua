@@ -38,6 +38,14 @@ local function same_file(left, right)
   return left.type == right.type
 end
 
+local function private_directory_metadata_safe(stat, uid)
+  return stat
+    and stat.type == "directory"
+    and type(stat.mode) == "number"
+    and stat.uid == uid
+    and stat.mode % 512 == PRIVATE_DIRECTORY_MODE
+end
+
 local function validate_absolute(path)
   if type(path) ~= "string" or path == "" or path:sub(1, 1) ~= "/" then
     return nil, "private state path must be absolute"
@@ -83,8 +91,7 @@ local function validate_directory(path, uid, create, deps)
     or not stat
     or stat.type ~= "directory"
     or not same_file(after, stat)
-    or stat.uid ~= uid
-    or stat.mode % 512 ~= PRIVATE_DIRECTORY_MODE
+    or not private_directory_metadata_safe(stat, uid)
   then
     return nil, "private state path has unsafe ownership or mode: " .. path
   end
@@ -241,19 +248,19 @@ end
 
 local function write_atomic(path, bytes, uid, deps)
   if type(bytes) ~= "string" or #bytes > MAX_JSON_BYTES then
-    return nil, "private state payload is invalid or too large"
+    return nil, "private state payload is invalid or too large", false
   end
   local parent = vim.fs.dirname(path)
   local parent_path, parent_error = validate_directory(parent, uid, false, deps)
   if not parent_path then
-    return nil, parent_error
+    return nil, parent_error, false
   end
   local destination = deps.fs_lstat(path)
   if destination and destination.type == "link" then
-    return nil, "refusing to replace a symlink: " .. path
+    return nil, "refusing to replace a symlink: " .. path, false
   end
   if destination and not file_metadata_safe(destination, uid) then
-    return nil, "refusing to replace an unsafe state file: " .. path
+    return nil, "refusing to replace an unsafe state file: " .. path, false
   end
 
   local temporary = vim.fs.joinpath(
@@ -262,7 +269,7 @@ local function write_atomic(path, bytes, uid, deps)
   )
   local fd, open_error = deps.fs_open(temporary, "wx", PRIVATE_FILE_MODE)
   if not fd then
-    return nil, tostring(open_error)
+    return nil, tostring(open_error), false
   end
   local offset = 0
   local write_error
@@ -292,20 +299,38 @@ local function write_atomic(path, bytes, uid, deps)
     return nil,
       tostring(
         write_error or sync_error or close_error or "temporary state file has unsafe metadata"
-      )
+      ),
+      false
   end
 
   local parent_before = deps.fs_lstat(parent)
-  local renamed, rename_error = deps.fs_rename(temporary, path)
-  if not renamed then
-    deps.fs_unlink(temporary)
-    return nil, tostring(rename_error)
-  end
   local parent_fd, parent_open_error = deps.fs_open(parent, "r", 0)
   if not parent_fd then
-    return nil, "could not open state directory for fsync: " .. tostring(parent_open_error)
+    deps.fs_unlink(temporary)
+    return nil, "could not open state directory for fsync: " .. tostring(parent_open_error), false
   end
   local parent_opened = deps.fs_fstat(parent_fd)
+  local parent_before_rename = deps.fs_lstat(parent)
+  if
+    not private_directory_metadata_safe(parent_before, uid)
+    or not private_directory_metadata_safe(parent_opened, uid)
+    or not private_directory_metadata_safe(parent_before_rename, uid)
+    or not same_file(parent_before, parent_opened)
+    or not same_file(parent_opened, parent_before_rename)
+  then
+    local _, parent_close_error = deps.fs_close(parent_fd)
+    deps.fs_unlink(temporary)
+    return nil,
+      "state directory changed before publication: " .. tostring(parent_close_error or "unsafe"),
+      false
+  end
+
+  local renamed, rename_error = deps.fs_rename(temporary, path)
+  if not renamed then
+    local _, parent_close_error = deps.fs_close(parent_fd)
+    deps.fs_unlink(temporary)
+    return nil, tostring(rename_error or parent_close_error), false
+  end
   local parent_synced, parent_sync_error = deps.fs_fsync(parent_fd)
   local parent_closed, parent_close_error = deps.fs_close(parent_fd)
   local parent_after = deps.fs_lstat(parent)
@@ -313,13 +338,15 @@ local function write_atomic(path, bytes, uid, deps)
     not parent_synced
     or parent_closed == nil
     or parent_closed == false
+    or not private_directory_metadata_safe(parent_after, uid)
     or not same_file(parent_before, parent_opened)
     or not same_file(parent_opened, parent_after)
   then
     return nil,
       "state directory fsync failed: " .. tostring(
         parent_sync_error or parent_close_error or "directory changed"
-      )
+      ),
+      true
   end
   return true
 end
@@ -537,9 +564,9 @@ local function new_store(options, deps)
     if not ok then
       return nil, "could not encode launch manifest: " .. tostring(encoded)
     end
-    local written, write_error = write_atomic(path, encoded, options.uid, deps)
+    local written, write_error, published = write_atomic(path, encoded, options.uid, deps)
     if not written then
-      return nil, write_error
+      return nil, write_error, published
     end
     return path
   end
@@ -592,9 +619,10 @@ local function new_store(options, deps)
     if type(token) ~= "string" or #token < 32 or #token > 128 or not token:match("^[0-9a-f]+$") then
       return nil, "control token factory returned an invalid token"
     end
-    local written, write_error = write_atomic(control_token_path, token, options.uid, deps)
+    local written, write_error, published =
+      write_atomic(control_token_path, token, options.uid, deps)
     if not written then
-      return nil, write_error
+      return nil, write_error, published
     end
     return token
   end

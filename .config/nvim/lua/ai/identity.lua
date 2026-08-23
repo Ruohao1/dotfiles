@@ -79,8 +79,23 @@ local function new(deps)
     return nil
   end
 
-  local function start_path(context)
-    context = context or {}
+  local function working_directory(context)
+    local path = context.cwd
+    if path == nil then
+      path = deps.cwd()
+    end
+    local resolved = physical(path)
+    if not resolved then
+      return nil, "working directory is not physical"
+    end
+    local stat = deps.stat(resolved)
+    if not stat or stat.type ~= "directory" then
+      return nil, "working directory is not a directory"
+    end
+    return resolved, path
+  end
+
+  local function start_path(context, cwd, raw_cwd)
     local name = context.name
     if name == nil then
       name = deps.buffer_name()
@@ -97,49 +112,61 @@ local function new(deps)
       if name:sub(1, 1) == "/" then
         absolute = vim.fs.normalize(name)
       else
-        local working_directory = context.cwd
-        if working_directory == nil then
-          working_directory = deps.cwd()
-        end
-        if
-          type(working_directory) ~= "string"
-          or working_directory:sub(1, 1) ~= "/"
-          or has_control(working_directory)
-        then
+        if type(raw_cwd) ~= "string" or raw_cwd:sub(1, 1) ~= "/" or has_control(raw_cwd) then
           return nil, "working directory is not physical"
         end
-        absolute = vim.fs.normalize(vim.fs.joinpath(working_directory, name))
+        absolute = vim.fs.normalize(vim.fs.joinpath(raw_cwd, name))
       end
       local stat = deps.stat(absolute)
-      local candidate = stat and stat.type == "directory" and absolute or vim.fs.dirname(absolute)
+      local candidate
+      if stat and stat.type == "file" then
+        local file = physical(absolute)
+        if not file then
+          return nil, "buffer file is not physical"
+        end
+        local file_stat = deps.stat(file)
+        if not file_stat or file_stat.type ~= "file" then
+          return nil, "buffer file is not a physical regular file"
+        end
+        candidate = vim.fs.dirname(file)
+        local parent_stat = deps.stat(candidate)
+        if not parent_stat or parent_stat.type ~= "directory" then
+          return nil, "buffer file parent is not a physical directory"
+        end
+        return candidate
+      elseif stat and stat.type == "directory" then
+        candidate = physical(absolute)
+        if not candidate then
+          return nil, "buffer directory is not physical"
+        end
+        local directory_stat = deps.stat(candidate)
+        if not directory_stat or directory_stat.type ~= "directory" then
+          return nil, "buffer directory is not a physical directory"
+        end
+        return candidate
+      else
+        candidate = vim.fs.dirname(absolute)
+      end
       local resolved = nearest_existing(candidate)
       if resolved then
         return resolved
       end
     end
-    local working_directory = context.cwd
-    if working_directory == nil then
-      working_directory = deps.cwd()
-    end
-    local resolved = physical(working_directory)
-    if not resolved then
-      return nil, "working directory is not physical"
-    end
-    local stat = deps.stat(resolved)
-    if not stat or stat.type ~= "directory" then
-      return nil, "working directory is not a directory"
-    end
-    return resolved
+    return cwd
   end
 
-  function resolver:resolve(context)
-    context = context or {}
-    local start, start_error = start_path(context)
-    if not start then
-      return nil, start_error
+  local function query_git(start)
+    if deps.revalidate_git then
+      local called, valid, validation_error = pcall(deps.revalidate_git)
+      if not called then
+        return nil, "trusted Git executable revalidation failed: " .. tostring(valid)
+      end
+      if not valid then
+        return nil,
+          "trusted Git executable is no longer valid: " .. tostring(validation_error or "changed")
+      end
     end
     local result = deps.git(start)
-    local root, git_dir, git_common_dir
     if
       not result
       or type(result.code) ~= "number"
@@ -149,6 +176,35 @@ local function new(deps)
     then
       return nil, "Git root query did not complete safely"
     end
+    return result
+  end
+
+  function resolver:resolve(context)
+    context = context or {}
+    local cwd, raw_cwd_or_error = working_directory(context)
+    if not cwd then
+      return nil, raw_cwd_or_error
+    end
+    local start, start_error = start_path(context, cwd, raw_cwd_or_error)
+    if not start then
+      return nil, start_error
+    end
+    local result, query_error = query_git(start)
+    if not result then
+      return nil, query_error
+    end
+    if result.code == 128 and start ~= cwd then
+      if deps.find_git_entry(start) then
+        return nil, "Git metadata exists but its worktree boundary could not be resolved"
+      end
+      start = cwd
+      result, query_error = query_git(start)
+      if not result then
+        return nil, query_error
+      end
+    end
+
+    local root, git_dir, git_common_dir
     local inside_git = result.code == 0
     if inside_git then
       local lines = split_lines(result.stdout)
@@ -181,18 +237,7 @@ local function new(deps)
       if deps.find_git_entry(start) then
         return nil, "Git metadata exists but its worktree boundary could not be resolved"
       end
-      local working_directory = context.cwd
-      if working_directory == nil then
-        working_directory = deps.cwd()
-      end
-      root = physical(working_directory)
-      if not root then
-        return nil, "working directory is not physical"
-      end
-      local root_stat = deps.stat(root)
-      if not root_stat or root_stat.type ~= "directory" then
-        return nil, "working directory is not a directory"
-      end
+      root = cwd
     end
 
     local raw_socket = tmux_socket(deps.env.TMUX)
@@ -252,7 +297,8 @@ local function new(deps)
   return resolver
 end
 
-local git_executable = assert(require("ai.tools").resolve("git"))
+local trusted_tools = require("ai.tools")
+local git_executable = assert(trusted_tools.resolve("git"))
 local runtime = new({
   env = vim.env,
   pid = vim.fn.getpid,
@@ -274,6 +320,9 @@ local runtime = new({
     return vim.fs.find(".git", { path = start, upward = true, limit = 1 })[1]
   end,
   hash = vim.fn.sha256,
+  revalidate_git = function()
+    return trusted_tools.revalidate(git_executable)
+  end,
   git = function(start)
     return vim
       .system({
