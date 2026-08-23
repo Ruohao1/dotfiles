@@ -114,6 +114,47 @@ stop_private_server() {
   fi
 }
 
+wait_for_supervisor_lock_owner() {
+  expected_supervisor_pid=$1
+  supervisor_lock_label=$2
+  supervisor_owner_file=$runtime/dotfiles-tmux/supervisor.lock/owner
+  wait_attempt=0
+  while [ "$wait_attempt" -lt 200 ]; do
+    supervisor_owner=$(sed -n '1p' "$supervisor_owner_file" 2>/dev/null || :)
+    supervisor_sleeper_pid=$(
+      ps -eo pid=,ppid=,comm= 2>/dev/null | awk \
+        -v parent="$expected_supervisor_pid" \
+        '$2 == parent && $3 == "sleep" { print $1; exit }'
+    )
+    if [ "$supervisor_owner" = "$expected_supervisor_pid" ] \
+      && [ -n "$supervisor_sleeper_pid" ]; then
+      return 0
+    fi
+    kill -0 "$expected_supervisor_pid" >/dev/null 2>&1 || break
+    sleep 0.01
+    wait_attempt=$((wait_attempt + 1))
+  done
+  fail "$supervisor_lock_label"
+}
+
+write_generation_names() {
+  generation_names_file=$1
+  find "$state/dotfiles/tmux/snapshots" -mindepth 1 -maxdepth 1 -type d \
+    ! -name '.staging-*' -exec basename {} \; | sort >"$generation_names_file"
+}
+
+assert_no_checkpoint_residue() {
+  checkpoint_residue_label=$1
+  [ ! -e "$runtime/dotfiles-tmux/checkpoint.lock" ] \
+    || fail "$checkpoint_residue_label checkpoint lock remained"
+  checkpoint_staging_count=$(
+    find "$state/dotfiles/tmux/snapshots" -mindepth 1 -maxdepth 1 -type d \
+      -name '.staging-*' | wc -l | tr -d '[:space:]'
+  )
+  assert_equal 0 "$checkpoint_staging_count" \
+    "$checkpoint_residue_label staging generation count"
+}
+
 summarize() {
   private_tmux list-sessions \
     -F 's|#{session_name}|#{session_group}|#{session_path}|#{active_window_index}' |
@@ -253,6 +294,8 @@ while [ ! -f "$runtime/dotfiles-tmux/ready" ] && [ "$wait_attempt" -lt 200 ]; do
 done
 [ -f "$runtime/dotfiles-tmux/ready" ] || fail "supervisor ready marker"
 kill -0 "$supervisor_pid" >/dev/null 2>&1 || fail "supervisor exited before ready"
+wait_for_supervisor_lock_owner "$supervisor_pid" \
+  "live-server supervisor lock ownership"
 summarize >"$test_root/ready-summary"
 sleep 2
 summarize >"$test_root/periodic-summary"
@@ -273,7 +316,185 @@ generation_after_stop=$(cat "$state/dotfiles/tmux/current")
 [ ! -e "$runtime/dotfiles-tmux/supervisor.lock" ] \
   || fail "supervisor lock remained after clean stop"
 
+private_tmux set-option -s exit-empty off
+private_tmux kill-session -t '=local-only'
+assert_equal off "$(private_tmux show-options -sv exit-empty)" \
+  "zero-session server exit-empty option"
+assert_equal '' "$(private_tmux list-sessions -F '#{session_id}')" \
+  "reachable zero-session server inventory"
+
+zero_generation_before=$(cat "$state/dotfiles/tmux/current")
+zero_manifest=$state/dotfiles/tmux/snapshots/$zero_generation_before/snapshot.json
+zero_pointer_before=$test_root/zero-current.before
+zero_manifest_before=$test_root/zero-manifest.before
+zero_ready_before=$test_root/zero-ready.before
+zero_generation_names_before=$test_root/zero-generation-names.before
+zero_generation_names_after=$test_root/zero-generation-names.after
+cp "$state/dotfiles/tmux/current" "$zero_pointer_before"
+cp "$zero_manifest" "$zero_manifest_before"
+cp "$runtime/dotfiles-tmux/ready" "$zero_ready_before"
+write_generation_names "$zero_generation_names_before"
+
+zero_supervisor_stdout=$test_root/zero-supervisor.stdout
+zero_supervisor_stderr=$test_root/zero-supervisor.stderr
+HOME=$test_root/home \
+  SHELL=/bin/sh \
+  XDG_STATE_HOME=$state \
+  XDG_RUNTIME_DIR=$runtime \
+  TMUX_WORKSPACE_TESTING=1 \
+  TMUX_WORKSPACE_SOCKET=$socket \
+  TMUX_WORKSPACE_INTERVAL=300 \
+  "$workspace" supervise \
+  >"$zero_supervisor_stdout" \
+  2>"$zero_supervisor_stderr" &
+zero_supervisor_pid=$!
+wait_for_supervisor_lock_owner "$zero_supervisor_pid" \
+  "zero-session supervisor lock ownership"
+kill -0 "$zero_supervisor_pid" >/dev/null 2>&1 \
+  || fail "zero-session supervisor exited before final checkpoint"
+kill -TERM "$zero_supervisor_pid"
+wait "$zero_supervisor_pid"
+
+cmp -s "$zero_pointer_before" "$state/dotfiles/tmux/current" \
+  || fail "zero-session final checkpoint changed current pointer bytes"
+cmp -s "$zero_manifest_before" "$zero_manifest" \
+  || fail "zero-session final checkpoint changed manifest bytes"
+cmp -s "$zero_ready_before" "$runtime/dotfiles-tmux/ready" \
+  || fail "zero-session final checkpoint changed ready marker bytes"
+write_generation_names "$zero_generation_names_after"
+cmp -s "$zero_generation_names_before" "$zero_generation_names_after" \
+  || fail "zero-session final checkpoint changed retained generation names"
+assert_no_checkpoint_residue "zero-session final checkpoint"
+[ ! -e "$runtime/dotfiles-tmux/supervisor.lock" ] \
+  || fail "zero-session supervisor lock remained after stop"
+
 stop_private_server
+run_workspace restore
+assert_equal 0 "$status" "collision fixture restore"
+
+collision_generation=$(cat "$state/dotfiles/tmux/current")
+collision_pointer_before=$test_root/collision-current.before
+collision_ready_before=$test_root/collision-ready.before
+collision_generation_names_before=$test_root/collision-generation-names.before
+collision_generation_names_after=$test_root/collision-generation-names.after
+cp "$state/dotfiles/tmux/current" "$collision_pointer_before"
+cp "$runtime/dotfiles-tmux/ready" "$collision_ready_before"
+write_generation_names "$collision_generation_names_before"
+
+collision_supervisor_stdout=$test_root/collision-supervisor.stdout
+collision_supervisor_stderr=$test_root/collision-supervisor.stderr
+HOME=$test_root/home \
+  SHELL=/bin/sh \
+  XDG_STATE_HOME=$state \
+  XDG_RUNTIME_DIR=$runtime \
+  TMUX_WORKSPACE_TESTING=1 \
+  TMUX_WORKSPACE_SOCKET=$socket \
+  TMUX_WORKSPACE_INTERVAL=300 \
+  TMUX_WORKSPACE_TEST_GENERATION=$collision_generation \
+  "$workspace" supervise \
+  >"$collision_supervisor_stdout" \
+  2>"$collision_supervisor_stderr" &
+collision_supervisor_pid=$!
+wait_for_supervisor_lock_owner "$collision_supervisor_pid" \
+  "collision supervisor lock ownership"
+kill -TERM "$collision_supervisor_pid"
+set +e
+wait "$collision_supervisor_pid"
+collision_supervisor_status=$?
+set -e
+[ "$collision_supervisor_status" -ne 0 ] \
+  || fail "final-save generation collision exited zero"
+assert_contains "snapshot generation already exists: $collision_generation" \
+  "$collision_supervisor_stderr" \
+  "final-save generation collision diagnostic"
+cmp -s "$collision_pointer_before" "$state/dotfiles/tmux/current" \
+  || fail "final-save generation collision changed current pointer bytes"
+cmp -s "$collision_ready_before" "$runtime/dotfiles-tmux/ready" \
+  || fail "final-save generation collision changed ready marker bytes"
+write_generation_names "$collision_generation_names_after"
+cmp -s "$collision_generation_names_before" "$collision_generation_names_after" \
+  || fail "final-save generation collision changed retained generation names"
+assert_no_checkpoint_residue "final-save generation collision"
+[ ! -e "$runtime/dotfiles-tmux/supervisor.lock" ] \
+  || fail "collision supervisor lock remained after failure"
+
+periodic_pointer_before=$test_root/periodic-current.before
+periodic_generation=$(cat "$state/dotfiles/tmux/current")
+periodic_manifest=$state/dotfiles/tmux/snapshots/$periodic_generation/snapshot.json
+periodic_manifest_before=$test_root/periodic-manifest.before
+periodic_ready_before=$test_root/periodic-ready.before
+periodic_generation_names_before=$test_root/periodic-generation-names.before
+periodic_generation_names_after=$test_root/periodic-generation-names.after
+cp "$state/dotfiles/tmux/current" "$periodic_pointer_before"
+cp "$periodic_manifest" "$periodic_manifest_before"
+cp "$runtime/dotfiles-tmux/ready" "$periodic_ready_before"
+write_generation_names "$periodic_generation_names_before"
+periodic_sequence_before=$(sed -n '1p' \
+  "$runtime/dotfiles-tmux/generation-sequence" 2>/dev/null || printf '0')
+
+periodic_supervisor_stdout=$test_root/periodic-supervisor.stdout
+periodic_supervisor_stderr=$test_root/periodic-supervisor.stderr
+HOME=$test_root/home \
+  SHELL=/bin/sh \
+  XDG_STATE_HOME=$state \
+  XDG_RUNTIME_DIR=$runtime \
+  TMUX_WORKSPACE_TESTING=1 \
+  TMUX_WORKSPACE_SOCKET=$socket \
+  TMUX_WORKSPACE_INTERVAL=5 \
+  "$workspace" supervise \
+  >"$periodic_supervisor_stdout" \
+  2>"$periodic_supervisor_stderr" &
+periodic_supervisor_pid=$!
+wait_for_supervisor_lock_owner "$periodic_supervisor_pid" \
+  "periodic supervisor lock ownership"
+stop_private_server
+
+wait_attempt=0
+periodic_sequence_after=$periodic_sequence_before
+while [ "$periodic_sequence_after" = "$periodic_sequence_before" ] \
+  && [ "$wait_attempt" -lt 800 ]; do
+  kill -0 "$periodic_supervisor_pid" >/dev/null 2>&1 || break
+  sleep 0.01
+  periodic_sequence_after=$(sed -n '1p' \
+    "$runtime/dotfiles-tmux/generation-sequence" 2>/dev/null || printf '0')
+  wait_attempt=$((wait_attempt + 1))
+done
+[ "$periodic_sequence_after" != "$periodic_sequence_before" ] \
+  || fail "unavailable-server periodic checkpoint was not attempted"
+wait_attempt=0
+while [ -e "$runtime/dotfiles-tmux/checkpoint.lock" ] \
+  && [ "$wait_attempt" -lt 200 ]; do
+  sleep 0.01
+  wait_attempt=$((wait_attempt + 1))
+done
+kill -0 "$periodic_supervisor_pid" >/dev/null 2>&1 \
+  || fail "unavailable-server supervisor exited after periodic checkpoint"
+cmp -s "$periodic_pointer_before" "$state/dotfiles/tmux/current" \
+  || fail "unavailable-server periodic checkpoint changed current pointer bytes"
+cmp -s "$periodic_manifest_before" "$periodic_manifest" \
+  || fail "unavailable-server periodic checkpoint changed manifest bytes"
+cmp -s "$periodic_ready_before" "$runtime/dotfiles-tmux/ready" \
+  || fail "unavailable-server periodic checkpoint changed ready marker bytes"
+write_generation_names "$periodic_generation_names_after"
+cmp -s "$periodic_generation_names_before" "$periodic_generation_names_after" \
+  || fail "unavailable-server periodic checkpoint changed retained generation names"
+assert_no_checkpoint_residue "unavailable-server periodic checkpoint"
+
+kill -TERM "$periodic_supervisor_pid"
+wait "$periodic_supervisor_pid"
+cmp -s "$periodic_pointer_before" "$state/dotfiles/tmux/current" \
+  || fail "unavailable-server final checkpoint changed current pointer bytes"
+cmp -s "$periodic_manifest_before" "$periodic_manifest" \
+  || fail "unavailable-server final checkpoint changed manifest bytes"
+cmp -s "$periodic_ready_before" "$runtime/dotfiles-tmux/ready" \
+  || fail "unavailable-server final checkpoint changed ready marker bytes"
+write_generation_names "$periodic_generation_names_after"
+cmp -s "$periodic_generation_names_before" "$periodic_generation_names_after" \
+  || fail "unavailable-server final checkpoint changed retained generation names"
+assert_no_checkpoint_residue "unavailable-server final checkpoint"
+[ ! -e "$runtime/dotfiles-tmux/supervisor.lock" ] \
+  || fail "unavailable-server supervisor lock remained after stop"
+
 rm -f "$runtime/dotfiles-tmux/ready"
 set +e
 HOME=$test_root/home SHELL=/bin/sh XDG_STATE_HOME=$state XDG_RUNTIME_DIR=$runtime \

@@ -18,6 +18,8 @@ workspace_runtime=
 lock_path=
 lock_held=0
 staging_dir=
+capture_reached_server=0
+capture_has_sessions=0
 restore_in_progress=0
 restore_committed=0
 restore_created_file=
@@ -385,6 +387,8 @@ checkpoint_nvim() {
 
 capture_snapshot() {
   destination=$1
+  capture_reached_server=0
+  capture_has_sessions=0
   sessions_file=$staging_dir/sessions.ndjson
   windows_file=$staging_dir/windows.ndjson
   panes_file=$staging_dir/panes.ndjson
@@ -401,11 +405,15 @@ capture_snapshot() {
   : >"$links_file"
 
   if tmux_run list-sessions -F '#{session_id}' >"$session_ids_file" 2>/dev/null; then
-    tmux_run list-windows -a -F '#{window_id}' | sort -u >"$window_ids_file"
-    tmux_run list-panes -a -F '#{pane_id}' | sort -u >"$pane_ids_file"
-    tmux_run list-windows -a \
-      -F '#{session_id}|#{window_id}|#{window_index}|#{window_active}|#{window_last_flag}' \
-      >"$links_file"
+    capture_reached_server=1
+    if [ -s "$session_ids_file" ]; then
+      capture_has_sessions=1
+      tmux_run list-windows -a -F '#{window_id}' | sort -u >"$window_ids_file"
+      tmux_run list-panes -a -F '#{pane_id}' | sort -u >"$pane_ids_file"
+      tmux_run list-windows -a \
+        -F '#{session_id}|#{window_id}|#{window_index}|#{window_active}|#{window_last_flag}' \
+        >"$links_file"
+    fi
   fi
 
   while IFS= read -r session_key; do
@@ -712,6 +720,12 @@ publish_generation() {
 }
 
 save_snapshot() {
+  checkpoint_policy=$1
+  case $checkpoint_policy in
+    explicit|automatic) ;;
+    *) die 'invalid checkpoint policy' 2 ;;
+  esac
+
   prepare_roots
   acquire_lock checkpoint || die 'checkpoint already in progress' 1
   generation=$(new_generation)
@@ -722,6 +736,18 @@ save_snapshot() {
   chmod 0700 "$staging_dir"
 
   capture_snapshot "$staging_dir/snapshot.json"
+
+  if [ "$checkpoint_policy" = automatic ] \
+    && { [ "$capture_reached_server" -eq 0 ] \
+      || [ "$capture_has_sessions" -eq 0 ]; }; then
+    case $staging_dir in
+      "$workspace_state"/snapshots/.staging-*) rm -rf "$staging_dir" ;;
+      *) die 'refusing to discard an unsafe staging generation' 1 ;;
+    esac
+    staging_dir=
+    release_lock
+    return 0
+  fi
 
   publish_generation "$generation"
   if tmux_run list-sessions >/dev/null 2>&1; then
@@ -1611,11 +1637,10 @@ supervise_loop() {
     wait "$sleeper" || :
     sleeper=
     if [ "$supervisor_stop" -eq 0 ]; then
-      save_snapshot >/dev/null
+      save_snapshot automatic >/dev/null
     fi
   done
-  save_snapshot >/dev/null \
-    || printf '%s\n' 'tmux-workspace: final checkpoint failed' >&2
+  save_snapshot automatic >/dev/null
   release_supervisor_lock
 }
 
@@ -1649,7 +1674,7 @@ case ${1-} in
     ;;
   save)
     [ "$#" -eq 1 ] || { usage 0; exit 2; }
-    save_snapshot
+    save_snapshot explicit
     ;;
   restore)
     [ "$#" -eq 1 ] || { usage 0; exit 2; }
