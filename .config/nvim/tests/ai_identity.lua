@@ -323,6 +323,24 @@ rejected(drifted, drifted_error, "trusted Git metadata changed", "Git drift duri
 eq(validation_calls, 2, "Git revalidated before every query")
 eq(drift_git_calls, 1, "drifted Git executable not invoked")
 
+local launch_failed, launch_failure_error = identity._test
+  .new(base_identity_deps({
+    git = function()
+      error("sensitive executable launch detail")
+    end,
+  }))
+  :resolve()
+rejected(
+  launch_failed,
+  launch_failure_error,
+  "Git root query did not complete safely",
+  "throwing Git launch"
+)
+assert(
+  not tostring(launch_failure_error):find("sensitive executable launch detail", 1, true),
+  "Git launch detail escaped the identity boundary"
+)
+
 local identity_rejections = {
   {
     label = "unexpected Git exit",

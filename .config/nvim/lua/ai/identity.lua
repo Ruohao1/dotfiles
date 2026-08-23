@@ -166,9 +166,10 @@ local function new(deps)
           "trusted Git executable is no longer valid: " .. tostring(validation_error or "changed")
       end
     end
-    local result = deps.git(start)
+    local invoked, result = pcall(deps.git, start)
     if
-      not result
+      not invoked
+      or not result
       or type(result.code) ~= "number"
       or type(result.signal) ~= "number"
       or result.signal ~= 0
