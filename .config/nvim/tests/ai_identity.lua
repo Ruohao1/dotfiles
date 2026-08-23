@@ -1018,6 +1018,105 @@ local function run_filesystem_tests()
   assert(store:remove_control_token())
   eq(store:read_control_token(), nil, "control token removal")
 
+  local nested_token
+  local elected_token = assert(store:ensure_control_token(function()
+    nested_token = assert(store:ensure_control_token(function()
+      return string.rep("b", 32)
+    end))
+    return string.rep("a", 32)
+  end))
+  eq(elected_token, string.rep("b", 32), "outer token caller returns elected winner")
+  eq(nested_token, elected_token, "nested token caller returns elected winner")
+  eq(store:read_control_token(), elected_token, "disk token matches elected winner")
+  assert(store:remove_control_token())
+
+  local link_failure_store = assert(state._test.open({
+    identity = plain,
+    runtime_base = vim.fs.joinpath(fixture, "run-token-link"),
+    state_base = vim.fs.joinpath(fixture, "state-token-link"),
+    uid = vim.uv.getuid(),
+    fs_link = function()
+      return nil, "forced hard-link failure"
+    end,
+  }))
+  local unlinked_token, link_error, link_published = link_failure_store:ensure_control_token(
+    function()
+      return string.rep("d", 32)
+    end
+  )
+  rejected(unlinked_token, link_error, "forced hard-link failure", "control token link failure")
+  eq(link_published, false, "control token link failure publication marker")
+  eq(link_failure_store:read_control_token(), nil, "control token link failure leaves no token")
+
+  local unlink_fsync_calls = 0
+  local unlink_failure_store = assert(state._test.open({
+    identity = plain,
+    runtime_base = vim.fs.joinpath(fixture, "run-token-unlink"),
+    state_base = vim.fs.joinpath(fixture, "state-token-unlink"),
+    uid = vim.uv.getuid(),
+    fs_fsync = function(fd)
+      unlink_fsync_calls = unlink_fsync_calls + 1
+      return vim.uv.fs_fsync(fd)
+    end,
+    fs_unlink = function(path)
+      local basename = vim.fs.basename(path)
+      if basename:sub(1, #".control-token.once.") == ".control-token.once." then
+        return nil, "forced token temporary unlink failure"
+      end
+      return vim.uv.fs_unlink(path)
+    end,
+  }))
+  local uncleared_token, unlink_error, unlink_published = unlink_failure_store:ensure_control_token(
+    function()
+      return string.rep("e", 32)
+    end
+  )
+  rejected(
+    uncleared_token,
+    unlink_error,
+    "forced token temporary unlink failure",
+    "control token temporary unlink failure"
+  )
+  eq(unlink_published, true, "control token unlink failure publication marker")
+  eq(unlink_fsync_calls, 2, "control token directory fsynced after unlink failure")
+  eq(
+    unlink_failure_store:read_control_token(),
+    string.rep("e", 32),
+    "published token remains readable after unlink failure"
+  )
+
+  local token_fsync_calls = 0
+  local token_fsync_store = assert(state._test.open({
+    identity = plain,
+    runtime_base = vim.fs.joinpath(fixture, "run-token-fsync"),
+    state_base = vim.fs.joinpath(fixture, "state-token-fsync"),
+    uid = vim.uv.getuid(),
+    fs_fsync = function(fd)
+      token_fsync_calls = token_fsync_calls + 1
+      if token_fsync_calls == 2 then
+        return nil, "forced token directory fsync"
+      end
+      return vim.uv.fs_fsync(fd)
+    end,
+  }))
+  local unsynced_token, token_fsync_error, token_fsync_published = token_fsync_store:ensure_control_token(
+    function()
+      return string.rep("f", 32)
+    end
+  )
+  rejected(
+    unsynced_token,
+    token_fsync_error,
+    "forced token directory fsync",
+    "control token directory fsync failure"
+  )
+  eq(token_fsync_published, true, "control token fsync failure publication marker")
+  eq(
+    token_fsync_store:read_control_token(),
+    string.rep("f", 32),
+    "published token remains readable after fsync failure"
+  )
+
   local launch_token = string.rep("e", 32)
   local launch_path = assert(store:write_launch({ schema = 1, token = launch_token }))
   eq(assert(vim.uv.fs_stat(launch_path)).mode % 512, 384, "launch manifest mode")

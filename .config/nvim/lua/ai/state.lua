@@ -351,6 +351,173 @@ local function write_atomic(path, bytes, uid, deps)
   return true
 end
 
+local function error_text(...)
+  local errors = {}
+  for index = 1, select("#", ...) do
+    local value = select(index, ...)
+    if value ~= nil and value ~= false then
+      table.insert(errors, tostring(value))
+    end
+  end
+  if #errors == 0 then
+    return "unknown error"
+  end
+  return table.concat(errors, "; ")
+end
+
+local function create_once(path, bytes, uid, deps)
+  if type(bytes) ~= "string" or #bytes > MAX_JSON_BYTES then
+    return nil, "private state payload is invalid or too large", false
+  end
+  local parent = vim.fs.dirname(path)
+  local parent_path, parent_error = validate_directory(parent, uid, false, deps)
+  if not parent_path then
+    return nil, parent_error, false
+  end
+
+  local temporary = vim.fs.joinpath(
+    parent,
+    string.format(".%s.once.%d.%d", vim.fs.basename(path), deps.pid(), deps.hrtime())
+  )
+  local fd, open_error = deps.fs_open(temporary, "wx", PRIVATE_FILE_MODE)
+  if not fd then
+    return nil, tostring(open_error), false
+  end
+  local offset = 0
+  local write_error
+  while offset < #bytes do
+    local wrote
+    wrote, write_error = deps.fs_write(fd, bytes:sub(offset + 1), offset)
+    if type(wrote) ~= "number" or wrote <= 0 or wrote > #bytes - offset then
+      break
+    end
+    offset = offset + wrote
+  end
+  local synced, sync_error
+  if offset == #bytes then
+    synced, sync_error = deps.fs_fsync(fd)
+  end
+  local temporary_stat = deps.fs_fstat(fd)
+  local closed, close_error = deps.fs_close(fd)
+  if
+    offset ~= #bytes
+    or not synced
+    or not file_metadata_safe(temporary_stat, uid)
+    or temporary_stat.size ~= #bytes
+    or closed == nil
+    or closed == false
+  then
+    local removed, remove_error = deps.fs_unlink(temporary)
+    return nil,
+      error_text(
+        write_error or sync_error or close_error or "temporary state file has unsafe metadata",
+        not removed and remove_error or nil
+      ),
+      false
+  end
+  local temporary_path_stat = deps.fs_lstat(temporary)
+  if
+    not file_metadata_safe(temporary_path_stat, uid)
+    or not same_file(temporary_stat, temporary_path_stat)
+    or temporary_path_stat.size ~= #bytes
+  then
+    local removed, remove_error = deps.fs_unlink(temporary)
+    return nil,
+      error_text(
+        "temporary state file changed before publication",
+        not removed and remove_error or nil
+      ),
+      false
+  end
+
+  local parent_before = deps.fs_lstat(parent)
+  local parent_fd, parent_open_error = deps.fs_open(parent, "r", 0)
+  if not parent_fd then
+    local removed, remove_error = deps.fs_unlink(temporary)
+    return nil,
+      error_text(
+        "could not open state directory for fsync: " .. tostring(parent_open_error),
+        not removed and remove_error or nil
+      ),
+      false
+  end
+  local parent_opened = deps.fs_fstat(parent_fd)
+  local parent_before_link = deps.fs_lstat(parent)
+  if
+    not private_directory_metadata_safe(parent_before, uid)
+    or not private_directory_metadata_safe(parent_opened, uid)
+    or not private_directory_metadata_safe(parent_before_link, uid)
+    or not same_file(parent_before, parent_opened)
+    or not same_file(parent_opened, parent_before_link)
+  then
+    local parent_closed, parent_close_error = deps.fs_close(parent_fd)
+    local removed, remove_error = deps.fs_unlink(temporary)
+    return nil,
+      error_text(
+        "state directory changed before create-once publication",
+        (parent_closed == nil or parent_closed == false) and parent_close_error or nil,
+        not removed and remove_error or nil
+      ),
+      false
+  end
+
+  local linked, link_error, link_code = deps.fs_link(temporary, path)
+  local link_exists = not linked
+    and (
+      tostring(link_error):find("EEXIST", 1, true) ~= nil
+      or tostring(link_code):find("EEXIST", 1, true) ~= nil
+    )
+  local removed, remove_error = deps.fs_unlink(temporary)
+  local parent_synced, parent_sync_error = deps.fs_fsync(parent_fd)
+  local parent_closed, parent_close_error = deps.fs_close(parent_fd)
+  local parent_after = deps.fs_lstat(parent)
+  local published = linked and true or link_exists
+
+  if not linked and not link_exists then
+    return nil,
+      error_text(
+        link_error or link_code or "could not publish private state file",
+        not removed and remove_error or nil,
+        not parent_synced and parent_sync_error or nil,
+        (parent_closed == nil or parent_closed == false) and parent_close_error or nil
+      ),
+      false
+  end
+  if
+    not removed
+    or not parent_synced
+    or parent_closed == nil
+    or parent_closed == false
+    or not private_directory_metadata_safe(parent_after, uid)
+    or not same_file(parent_before, parent_opened)
+    or not same_file(parent_opened, parent_after)
+  then
+    return nil,
+      error_text(
+        not removed and remove_error or nil,
+        not parent_synced and parent_sync_error or nil,
+        (parent_closed == nil or parent_closed == false) and parent_close_error or nil,
+        not private_directory_metadata_safe(parent_after, uid) and "state directory became unsafe"
+          or nil,
+        not same_file(parent_opened, parent_after) and "state directory changed" or nil
+      ),
+      published
+  end
+
+  if linked then
+    local destination = deps.fs_lstat(path)
+    if
+      not file_metadata_safe(destination, uid)
+      or not same_file(temporary_stat, destination)
+      or destination.size ~= #bytes
+    then
+      return nil, "created state file changed during publication: " .. path, true
+    end
+    return "created"
+  end
+  return "exists"
+end
+
 local function nullish(value)
   return value == nil or value == vim.NIL
 end
@@ -619,12 +786,19 @@ local function new_store(options, deps)
     if type(token) ~= "string" or #token < 32 or #token > 128 or not token:match("^[0-9a-f]+$") then
       return nil, "control token factory returned an invalid token"
     end
-    local written, write_error, published =
-      write_atomic(control_token_path, token, options.uid, deps)
-    if not written then
+    local outcome, write_error, published =
+      create_once(control_token_path, token, options.uid, deps)
+    if not outcome then
       return nil, write_error, published
     end
-    return token
+    if outcome == "created" then
+      return token
+    end
+    local winner, winner_error = self:read_control_token()
+    if winner == nil then
+      return nil, winner_error or "control token winner is unavailable", true
+    end
+    return winner
   end
 
   function store:remove_control_token()
@@ -690,6 +864,7 @@ local default_dependencies = {
   fs_write = vim.uv.fs_write,
   fs_fsync = vim.uv.fs_fsync,
   fs_close = vim.uv.fs_close,
+  fs_link = vim.uv.fs_link,
   fs_rename = vim.uv.fs_rename,
   fs_unlink = vim.uv.fs_unlink,
   fs_scandir = vim.uv.fs_scandir,
