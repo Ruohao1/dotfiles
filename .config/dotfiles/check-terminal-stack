@@ -2115,6 +2115,11 @@ nvim_log_has_error() {
   grep -Eq 'Error detected|Error in command line:|Failed to source|E[0-9][0-9][0-9]:' "$1"
 }
 
+taplo_process_snapshot() {
+  LC_ALL=C ps -A -o pid= -o command= 2>/dev/null \
+    | awk '/[t]aplo lsp stdio/ { sub(/^[[:space:]]+/, ""); print }'
+}
+
 run_nvim_focused_test() {
   [ "$#" -eq 3 ] || return 2
   nvim_focused_name=$1
@@ -6424,7 +6429,7 @@ start_configured_nvim() {
   start_state_quoted=$(shell_single_quote "$XDG_STATE_HOME") || return 1
   start_cache_quoted=$(shell_single_quote "$XDG_CACHE_HOME") || return 1
   start_file_quoted=$(shell_single_quote "$start_file") || return 1
-  start_lsp_command='lua local names = { "bashls", "jsonls", "lua_ls", "pyright", "yamlls" }; assert(vim.bo.filetype ~= "bash" and vim.bo.filetype ~= "sh" and vim.bo.filetype ~= "json" and vim.bo.filetype ~= "jsonc" and vim.bo.filetype ~= "lua" and vim.bo.filetype ~= "python" and vim.bo.filetype ~= "yaml" and vim.bo.filetype ~= "yaml.docker-compose" and vim.bo.filetype ~= "yaml.gitlab" and vim.bo.filetype ~= "yaml.helm-values", "checker TUI fixture must start without an LSP-matching buffer"); for _, name in ipairs(names) do assert(vim.lsp.is_enabled(name), name .. " is not enabled before checker TUI fixture"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned before checker TUI fixture"); vim.lsp.enable(name, false); assert(not vim.lsp.is_enabled(name), name .. " remained enabled for checker TUI fixture"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client remained after checker TUI disable") end; vim.cmd.edit(vim.fn.fnameescape(vim.env.DOTFILES_NVIM_START_FILE)); for _, name in ipairs(names) do assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned after checker TUI fixture opened") end'
+  start_lsp_command='lua local names = { "bashls", "jsonls", "lua_ls", "pyright", "taplo", "yamlls" }; assert(vim.bo.filetype ~= "bash" and vim.bo.filetype ~= "sh" and vim.bo.filetype ~= "json" and vim.bo.filetype ~= "jsonc" and vim.bo.filetype ~= "lua" and vim.bo.filetype ~= "python" and vim.bo.filetype ~= "toml" and vim.bo.filetype ~= "yaml" and vim.bo.filetype ~= "yaml.docker-compose" and vim.bo.filetype ~= "yaml.gitlab" and vim.bo.filetype ~= "yaml.helm-values", "checker TUI fixture must start without an LSP-matching buffer"); for _, name in ipairs(names) do assert(vim.lsp.is_enabled(name), name .. " is not enabled before checker TUI fixture"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned before checker TUI fixture"); vim.lsp.enable(name, false); assert(not vim.lsp.is_enabled(name), name .. " remained enabled for checker TUI fixture"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client remained after checker TUI disable") end; vim.cmd.edit(vim.fn.fnameescape(vim.env.DOTFILES_NVIM_START_FILE)); for _, name in ipairs(names) do assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned after checker TUI fixture opened") end'
   start_lsp_command_quoted=$(shell_single_quote "$start_lsp_command") || return 1
   start_command="env -u NVIM_APPNAME XDG_CONFIG_HOME=$start_config_quoted XDG_DATA_HOME=$start_data_quoted XDG_STATE_HOME=$start_state_quoted XDG_CACHE_HOME=$start_cache_quoted DOTFILES_NVIM_START_FILE=$start_file_quoted TERM=tmux-256color $start_nvim_quoted -i NONE -c $start_lsp_command_quoted"
 
@@ -6770,7 +6775,7 @@ printf 'Data root: %s\n\n' "$data_home"
 static_shellcheck_ready=true
 static_stylua_ready=true
 git_security_commands_ready=true
-for required_command in uname awk sed grep cmp mktemp mkfifo wc ps infocmp git env ghostty herdr tmux nvim bash-language-server vscode-json-language-server yaml-language-server lua-language-server pyright-langserver fzf jq shellcheck stylua cksum stat date curl tar tree-sitter uv identify convert; do
+for required_command in uname awk sed grep cmp mktemp mkfifo wc ps infocmp git env ghostty herdr tmux nvim bash-language-server vscode-json-language-server yaml-language-server lua-language-server pyright-langserver taplo fzf jq shellcheck stylua cksum stat date curl tar tree-sitter uv identify convert; do
   if ! require_command "$required_command"; then
     case "$required_command" in
       shellcheck) static_shellcheck_ready=false ;;
@@ -6779,6 +6784,55 @@ for required_command in uname awk sed grep cmp mktemp mkfifo wc ps infocmp git e
     esac
   fi
 done
+
+taplo_version=""
+taplo_executable=""
+taplo_ready=false
+if command -v taplo >/dev/null 2>&1; then
+  taplo_executable=$(command -v taplo)
+  case "$taplo_executable" in
+    /*) ;;
+    *)
+      fail "Taplo executable must resolve to an absolute path; found ${taplo_executable:-unknown}"
+      taplo_executable=""
+      ;;
+  esac
+
+  if [ -n "$taplo_executable" ]; then
+    taplo_version_output="$check_tmp/taplo-version.txt"
+    taplo_version=""
+    if "$taplo_executable" --version > "$taplo_version_output" 2>/dev/null; then
+      taplo_version=$(awk '
+        NR == 1 && $0 ~ /^taplo [0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/ {
+          version = $0
+          sub(/^taplo /, "", version)
+        }
+        END { if (NR == 1 && version != "") print version }
+      ' "$taplo_version_output")
+    fi
+    if [ -n "$taplo_version" ] \
+      && version_at_least "$taplo_version" "0.10.0"; then
+      pass "Taplo version $taplo_version"
+
+      if command -v nvim >/dev/null 2>&1 \
+        && DOTFILES_TAPLO_EXECUTABLE="$taplo_executable" \
+          NVIM_LOG_FILE=/dev/null \
+          nvim --clean --headless -u NONE -i NONE \
+          -c 'lua local result = vim.system({ vim.env.DOTFILES_TAPLO_EXECUTABLE, "lsp", "stdio", "--help" }, { text = true }):wait(5000); assert(result.code == 0, vim.inspect(result))' \
+          -c qa > "$check_tmp/taplo-capability.txt" 2>&1 \
+        && ! nvim_log_has_error "$check_tmp/taplo-capability.txt"; then
+        taplo_ready=true
+        pass "Taplo lsp stdio capability is available"
+      else
+        [ ! -s "$check_tmp/taplo-capability.txt" ] \
+          || sed 's/^/      /' "$check_tmp/taplo-capability.txt" >&2
+        fail "Taplo lsp stdio capability probe failed"
+      fi
+    else
+      fail "Taplo 0.10.0 or newer stable release required; found ${taplo_version:-unknown}"
+    fi
+  fi
+fi
 
 data_query_linux_tools_ready=false
 data_query_timeout=""
@@ -6963,6 +7017,7 @@ for static_lint_file in \
   "$nvim_root/lsp/jsonls.lua" \
   "$nvim_root/lsp/lua_ls.lua" \
   "$nvim_root/lsp/pyright.lua" \
+  "$nvim_root/lsp/taplo.lua" \
   "$nvim_root/lsp/yamlls.lua" \
   "$nvim_root/lua/config/autocmds.lua" \
   "$nvim_root/lua/config/completion.lua" \
@@ -7029,6 +7084,7 @@ for static_lint_file in \
   "$nvim_root/tests/plugin_source.lua" \
   "$nvim_root/tests/platform.lua" \
   "$nvim_root/tests/pyright.lua" \
+  "$nvim_root/tests/taplo.lua" \
   "$nvim_root/tests/yamlls.lua" \
   "$nvim_root/tests/startup.lua" \
   "$nvim_root/tests/statusline.lua" \
@@ -11448,6 +11504,7 @@ for nvim_file in \
   "$nvim_root/lsp/jsonls.lua" \
   "$nvim_root/lsp/lua_ls.lua" \
   "$nvim_root/lsp/pyright.lua" \
+  "$nvim_root/lsp/taplo.lua" \
   "$nvim_root/lsp/yamlls.lua" \
   "$nvim_root/lua/config/options.lua" \
   "$nvim_root/lua/config/keymaps.lua" \
@@ -11514,6 +11571,7 @@ for nvim_file in \
   "$nvim_root/tests/oil_trash.lua" \
   "$nvim_root/tests/plugin_source.lua" \
   "$nvim_root/tests/pyright.lua" \
+  "$nvim_root/tests/taplo.lua" \
   "$nvim_root/tests/yamlls.lua" \
   "$nvim_root/tests/startup.lua" \
   "$nvim_root/tests/statusline.lua" \
@@ -11788,6 +11846,65 @@ if [ "$nvim_config_ready" = true ] \
 fi
 
 if [ "$nvim_config_ready" = true ] \
+  && [ "$taplo_ready" = true ] \
+  && command -v nvim >/dev/null 2>&1; then
+  nvim_taplo_parent="$check_tmp/nvim-taplo"
+  nvim_taplo_output="$check_tmp/nvim-taplo.txt"
+  nvim_taplo_log="$nvim_taplo_parent/nvim.log"
+
+  if (umask 077 && mkdir -p \
+    "$nvim_taplo_parent/home" \
+    "$nvim_taplo_parent/config" \
+    "$nvim_taplo_parent/data" \
+    "$nvim_taplo_parent/state" \
+    "$nvim_taplo_parent/cache" \
+    "$nvim_taplo_parent/runtime" \
+    "$nvim_taplo_parent/tmp"); then
+    : > "$nvim_taplo_log"
+    nvim_taplo_process_before=$(taplo_process_snapshot)
+    nvim_taplo_test_passed=false
+
+    if env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
+      HOME="$nvim_taplo_parent/home" \
+      TMPDIR="$nvim_taplo_parent/tmp" \
+      XDG_CONFIG_HOME="$nvim_taplo_parent/config" \
+      XDG_DATA_HOME="$nvim_taplo_parent/data" \
+      XDG_STATE_HOME="$nvim_taplo_parent/state" \
+      XDG_CACHE_HOME="$nvim_taplo_parent/cache" \
+      XDG_RUNTIME_DIR="$nvim_taplo_parent/runtime" \
+      NVIM_LOG_FILE="$nvim_taplo_log" \
+      DOTFILES_NVIM_ROOT="$nvim_root" \
+      DOTFILES_TAPLO_EXECUTABLE="$taplo_executable" \
+      DOTFILES_TAPLO_TEST_PARENT="$nvim_taplo_parent" \
+      DOTFILES_TAPLO_TEST_ROOT="$nvim_taplo_parent/workspace" \
+      nvim --clean --headless -u NONE -i NONE \
+      -l "$nvim_root/tests/taplo.lua" \
+      > "$nvim_taplo_output" 2>&1 \
+      && ! nvim_log_has_error "$nvim_taplo_output" \
+      && [ ! -s "$nvim_taplo_log" ] \
+      && grep -Fqx 'Native TOML LSP assertions: ok' "$nvim_taplo_output"; then
+      nvim_taplo_test_passed=true
+    fi
+
+    nvim_taplo_process_after=$(taplo_process_snapshot)
+
+    if [ "$nvim_taplo_test_passed" = true ] \
+      && [ "$nvim_taplo_process_after" = "$nvim_taplo_process_before" ] \
+      && [ ! -e "$nvim_taplo_parent/workspace" ]; then
+      pass "native TOML LSP configuration and live attachment assertions pass"
+    else
+      sed 's/^/      /' "$nvim_taplo_output" >&2
+      if [ "$nvim_taplo_process_after" != "$nvim_taplo_process_before" ]; then
+        printf '%s\n' '      Taplo process snapshot changed across the focused test' >&2
+      fi
+      fail "native TOML LSP configuration or live attachment assertions failed"
+    fi
+  else
+    fail "could not create checker-owned Taplo test directories"
+  fi
+fi
+
+if [ "$nvim_config_ready" = true ] \
   && [ "$plugins_trusted" = true ] \
   && command -v nvim >/dev/null 2>&1; then
   nvim_key_helper_output="$check_tmp/nvim-key-helper.txt"
@@ -11821,20 +11938,20 @@ if [ "$nvim_config_ready" = true ] && [ "$plugins_trusted" = true ] && command -
     DOTFILES_NVIM_ROOT="$nvim_root" \
     nvim --headless -i NONE \
     -c 'lua vim.api.nvim_exec_autocmds("User", { pattern = "VeryLazy", modeline = false }); local plugin = assert(require("lazy.core.config").plugins["which-key.nvim"]); assert(plugin._.loaded, "WhichKey did not load on VeryLazy")' \
-    -c 'lua local names = { "bashls", "jsonls", "lua_ls", "pyright", "yamlls" }; assert(vim.bo.filetype ~= "bash" and vim.bo.filetype ~= "sh" and vim.bo.filetype ~= "json" and vim.bo.filetype ~= "jsonc" and vim.bo.filetype ~= "lua" and vim.bo.filetype ~= "python" and vim.bo.filetype ~= "yaml" and vim.bo.filetype ~= "yaml.docker-compose" and vim.bo.filetype ~= "yaml.gitlab" and vim.bo.filetype ~= "yaml.helm-values", "configured startup assertion buffer must not match an enabled LSP"); for _, name in ipairs(names) do assert(vim.lsp.is_enabled(name), name .. " is not enabled during configured startup"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned before a matching buffer opened"); vim.lsp.enable(name, false); assert(not vim.lsp.is_enabled(name), name .. " remained enabled after configured startup disable") end; for _, command in ipairs({ "DataQuery", "DataQueryHealth" }) do assert(vim.fn.exists(":" .. command) == 2, command .. " is unavailable during passive startup") end; assert(package.loaded["data_query.tool"] == nil, "passive startup loaded the query resolver or started a probe"); local parent = vim.fs.joinpath(vim.fn.stdpath("cache"), "dotfiles-data-query"); assert(vim.uv.fs_lstat(parent) == nil, "passive startup created the data-query cache"); for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do local name = vim.api.nvim_buf_get_name(bufnr); assert(name:sub(1, 13) ~= "data-query://", "passive startup created a SQL scratch"); local metadata = vim.b[bufnr].dotfiles_parquet_viewer; assert(type(metadata) ~= "table" or type(metadata.path) ~= "string" or metadata.path:sub(1, #parent + 1) ~= parent .. "/", "passive startup created a query result") end' \
+    -c 'lua local names = { "bashls", "jsonls", "lua_ls", "pyright", "taplo", "yamlls" }; assert(vim.bo.filetype ~= "bash" and vim.bo.filetype ~= "sh" and vim.bo.filetype ~= "json" and vim.bo.filetype ~= "jsonc" and vim.bo.filetype ~= "lua" and vim.bo.filetype ~= "python" and vim.bo.filetype ~= "toml" and vim.bo.filetype ~= "yaml" and vim.bo.filetype ~= "yaml.docker-compose" and vim.bo.filetype ~= "yaml.gitlab" and vim.bo.filetype ~= "yaml.helm-values", "configured startup assertion buffer must not match an enabled LSP"); for _, name in ipairs(names) do assert(vim.lsp.is_enabled(name), name .. " is not enabled during configured startup"); assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned before a matching buffer opened"); vim.lsp.enable(name, false); assert(not vim.lsp.is_enabled(name), name .. " remained enabled after configured startup disable") end; for _, command in ipairs({ "DataQuery", "DataQueryHealth" }) do assert(vim.fn.exists(":" .. command) == 2, command .. " is unavailable during passive startup") end; assert(package.loaded["data_query.tool"] == nil, "passive startup loaded the query resolver or started a probe"); local parent = vim.fs.joinpath(vim.fn.stdpath("cache"), "dotfiles-data-query"); assert(vim.uv.fs_lstat(parent) == nil, "passive startup created the data-query cache"); for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do local name = vim.api.nvim_buf_get_name(bufnr); assert(name:sub(1, 13) ~= "data-query://", "passive startup created a SQL scratch"); local metadata = vim.b[bufnr].dotfiles_parquet_viewer; assert(type(metadata) ~= "table" or type(metadata.path) ~= "string" or metadata.path:sub(1, #parent + 1) ~= parent .. "/", "passive startup created a query result") end' \
     -c 'lua for _, name in ipairs({ "platform", "foundation", "key_helper" }) do dofile(vim.fs.joinpath(vim.env.DOTFILES_NVIM_ROOT, "tests", name .. ".lua")) end' \
     -c "luafile $nvim_root/tests/completion.lua" \
     -c "luafile $nvim_root/tests/editing.lua" \
     -c "luafile $nvim_root/tests/navigation.lua" \
     -c "luafile $nvim_root/tests/statusline.lua" \
     -c "luafile $nvim_root/tests/startup.lua" \
-    -c 'lua for _, name in ipairs({ "bashls", "jsonls", "lua_ls", "pyright", "yamlls" }) do assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned during configured foundation assertions") end' \
+    -c 'lua for _, name in ipairs({ "bashls", "jsonls", "lua_ls", "pyright", "taplo", "yamlls" }) do assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned during configured foundation assertions") end' \
     -c qa > "$check_tmp/nvim-tests.txt" 2>&1 \
     && ! nvim_log_has_error "$check_tmp/nvim-tests.txt" \
     && data_query_processes_absent \
       "$XDG_CACHE_HOME/nvim/dotfiles-data-query" \
       "$check_tmp/nvim-passive-processes.txt"; then
-    pass "Neovim platform, native Bash, JSON, Lua, Python, and YAML LSP startup and completion, navigation, TokyoNight, Treesitter, parser, FzfLua, Oil, MiniIcons, MiniPairs, MiniStarter, MiniSurround, WhichKey, smart-splits, statusline, and startup assertions pass"
+    pass "Neovim platform, native Bash, JSON, Lua, Python, TOML, and YAML LSP startup and completion, navigation, TokyoNight, Treesitter, parser, FzfLua, Oil, MiniIcons, MiniPairs, MiniStarter, MiniSurround, WhichKey, smart-splits, statusline, and startup assertions pass"
   else
     sed 's/^/      /' "$check_tmp/nvim-tests.txt" >&2
     fail "Neovim headless foundation assertions failed"
