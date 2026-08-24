@@ -429,6 +429,7 @@ Create `.config/nvim/scripts/nvim-ai-opencode-profile.py` with only these import
 
 ```python
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -469,7 +470,8 @@ profiles/TOKEN/
 ```
 
 Build it first as `BACKEND_STATE/profiles/.TOKEN.tmp` with mode 0700 directories and mode 0600 files.
-Use exclusive file creation, complete write loops, `fsync` on every file, `fsync` on every directory from leaves to `profiles`, and one final `os.rename` to publish `TOKEN`.
+Use exclusive file creation, complete write loops, `fsync` on every file, and `fsync` on every directory from leaves to `profiles`.
+Publish `TOKEN` with one final Linux `renameat2(RENAME_NOREPLACE)` call through `ctypes`, fail closed when that primitive is unavailable, and never fall back to replacement-capable `os.rename`.
 Refuse an existing staging or destination path instead of replacing it.
 On failure, remove only entries proven to be children of the helper-created staging directory and leave every pre-existing path untouched.
 Reject any unexpected entry when inspecting a published profile and require `empty-home-opencode` to remain empty.
