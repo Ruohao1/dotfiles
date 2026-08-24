@@ -335,6 +335,57 @@ table.insert(hidden_precedence.agents.compaction.permission, 1, {
 })
 assert(managed.validate_compatibility(hidden_precedence), "final hidden denial wins precedence")
 
+local nonmatching_wildcard_controls = {
+  {
+    label = "Lua character class is literal",
+    agent = "plan",
+    rule = { permission = "edit", pattern = "src/nvim_ai_probe[.]lua", action = "allow" },
+  },
+  {
+    label = "Lua end anchor is literal",
+    agent = "plan",
+    rule = { permission = "edit", pattern = "src/nvim_ai_probe.lua$", action = "allow" },
+  },
+  {
+    label = "resource matching is fully anchored",
+    agent = "plan",
+    rule = { permission = "edit", pattern = "nvim_ai_probe.lua", action = "allow" },
+  },
+  {
+    label = "permission matching is fully anchored",
+    agent = "build",
+    rule = { permission = "ash", pattern = "*", action = "allow" },
+  },
+  {
+    label = "permission brackets are literal",
+    agent = "build",
+    rule = { permission = "b[as]h", pattern = "*", action = "allow" },
+  },
+  {
+    label = "question wildcard matches exactly one character",
+    agent = "build",
+    rule = { permission = "b??sh", pattern = "*", action = "allow" },
+  },
+}
+for _, case in ipairs(nonmatching_wildcard_controls) do
+  local report = vim.deepcopy(good)
+  table.insert(report.agents[case.agent].permission, case.rule)
+  assert(managed.validate_compatibility(report), case.label)
+end
+
+local wildcard_precedence = vim.deepcopy(good)
+table.insert(wildcard_precedence.agents.plan.permission, {
+  permission = "edit",
+  pattern = "src/*.lua",
+  action = "allow",
+})
+table.insert(wildcard_precedence.agents.plan.permission, {
+  permission = "edit",
+  pattern = "src/nvim_ai_*.lua",
+  action = "deny",
+})
+assert(managed.validate_compatibility(wildcard_precedence), "last wildcard match wins precedence")
+
 local false_accept_cases = {
   {
     label = "nonempty Build tool map",
@@ -360,6 +411,76 @@ local false_accept_cases = {
       table.insert(report.agents.summary.permission, {
         permission = "bash",
         pattern = "src/nvim_ai_probe.lua",
+        action = "allow",
+      })
+    end,
+  },
+  {
+    label = "Plan wildcard edit allow",
+    change = function(report)
+      table.insert(report.agents.plan.permission, {
+        permission = "edit",
+        pattern = "src/*.lua",
+        action = "allow",
+      })
+    end,
+  },
+  {
+    label = "Plan optional trailing wildcard allow",
+    change = function(report)
+      table.insert(report.agents.plan.permission, {
+        permission = "edit *",
+        pattern = "src/nvim_ai_probe.lua",
+        action = "allow",
+      })
+    end,
+  },
+  {
+    label = "Build web-star risk allow",
+    change = function(report)
+      table.insert(report.agents.build.permission, {
+        permission = "web*",
+        pattern = "*",
+        action = "allow",
+      })
+    end,
+  },
+  {
+    label = "Plan bash-question risk allow",
+    change = function(report)
+      table.insert(report.agents.plan.permission, {
+        permission = "b?sh",
+        pattern = "*",
+        action = "allow",
+      })
+    end,
+  },
+  {
+    label = "hidden permission wildcard allow",
+    change = function(report)
+      table.insert(report.agents.compaction.permission, {
+        permission = "b?sh",
+        pattern = "*",
+        action = "allow",
+      })
+    end,
+  },
+  {
+    label = "hidden resource wildcard allow",
+    change = function(report)
+      table.insert(report.agents.summary.permission, {
+        permission = "*",
+        pattern = "src/*.lua",
+        action = "allow",
+      })
+    end,
+  },
+  {
+    label = "hidden normalized-backslash wildcard allow",
+    change = function(report)
+      table.insert(report.agents.title.permission, {
+        permission = "*",
+        pattern = "src\\*.lua",
         action = "allow",
       })
     end,

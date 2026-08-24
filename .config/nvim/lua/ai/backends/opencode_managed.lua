@@ -184,13 +184,55 @@ local function validate_rules(value, label)
   return true
 end
 
+local CASE_INSENSITIVE_WILDCARDS = package.config:sub(1, 1) == "\\"
+
+local function wildcard_match(input, pattern)
+  input = input:gsub("\\", "/")
+  pattern = pattern:gsub("\\", "/")
+  if CASE_INSENSITIVE_WILDCARDS then
+    input = input:lower()
+    pattern = pattern:lower()
+  end
+  local function matches(candidate)
+    local input_index = 1
+    local pattern_index = 1
+    local star_index
+    local retry_index
+    while input_index <= #input do
+      local wildcard = candidate:sub(pattern_index, pattern_index)
+      if
+        pattern_index <= #candidate
+        and (wildcard == "?" or wildcard == input:sub(input_index, input_index))
+      then
+        input_index = input_index + 1
+        pattern_index = pattern_index + 1
+      elseif wildcard == "*" then
+        star_index = pattern_index
+        retry_index = input_index
+        pattern_index = pattern_index + 1
+      elseif star_index then
+        retry_index = retry_index + 1
+        input_index = retry_index
+        pattern_index = star_index + 1
+      else
+        return false
+      end
+    end
+    while candidate:sub(pattern_index, pattern_index) == "*" do
+      pattern_index = pattern_index + 1
+    end
+    return pattern_index > #candidate
+  end
+  if pattern:sub(-2) == " *" and matches(pattern:sub(1, -3)) then
+    return true
+  end
+  return matches(pattern)
+end
+
 local function resolve_permission(rules, permission)
   local action
   for _, rule in ipairs(rules) do
-    if
-      (rule.permission == permission or rule.permission == "*")
-      and (rule.pattern == "*" or rule.pattern == PROBE_PATH)
-    then
+    if wildcard_match(permission, rule.permission) and wildcard_match(PROBE_PATH, rule.pattern) then
       action = rule.action
     end
   end
