@@ -23,7 +23,9 @@ Neovim activates write access only while an exact review batch exists, and all f
 - Treat the physical root as the only writable project path unless Neovim explicitly approves a temporary grant.
 - Keep linked-worktree `.git`, Git administration, common Git data, and refs read-only.
 - Keep the managed AI pane read-only whenever no exact review batch is active.
-- Keep backend session and cache state identity-specific while mounting only validated existing authentication and configuration inputs read-only.
+- Keep Codex and Claude session and cache state identity-specific while mounting only their validated existing inputs read-only.
+- Run OpenCode `v1.18.18` through the managed-profile contract in `.config/docs/superpowers/specs/2026-08-24-neovim-managed-opencode-profile-design.md`.
+- Reuse only validated OpenCode `api` and `oauth` credentials, never global or project OpenCode configuration, `account.json`, or `mcp-auth.json`.
 - Permit provider connectivity while keeping agent-initiated network and destructive actions under backend approval policy.
 - Transfer visual selections through private files and otherwise transfer only relative path, line, and column.
 - Never submit a prompt or resume a restored agent turn automatically.
@@ -40,6 +42,18 @@ Neovim activates write access only while an exact review batch exists, and all f
 - Write the paused workspace restoration plan only after the active line-pin schema-2 candidate is accepted and integrated.
 - Treat inline completion and ghost-text suggestions as a separate provider-comparison project.
 - Never add an agent co-author trailer to a commit.
+
+## Execution Amendment: Managed OpenCode Profile
+
+Task 1 is complete through commit `596a652`.
+The Task 2 candidate at commits `00e78e0` and `28bf53c` is not approved because its OpenCode environment policy can be overridden by configured agents.
+Commit `6223541` adds the approved managed-profile design amendment.
+
+Before executing any remaining work in this plan, complete `.config/docs/superpowers/plans/2026-08-24-neovim-managed-opencode-profile.md`.
+Tasks 1 through 3 of that plan replace the OpenCode portions of Task 2 below.
+Tasks 4 and 5 of that plan implement every nonconflicting base requirement from Task 3 below and replace its historical OpenCode portions with the managed-profile boundary.
+After its fresh specification and quality reviews pass, resume this plan at Task 4.
+Do not execute any conflicting historical OpenCode instruction in Task 2 or Task 3.
 
 ---
 
@@ -66,12 +80,22 @@ Neovim activates write access only while an exact review batch exists, and all f
   This adapter owns Claude detection, explicit UUID sessions, launch arguments, resume arguments, and hook metadata.
 - Create `.config/nvim/lua/ai/backends/opencode.lua`.
   This adapter owns OpenCode detection, server-and-attach launch metadata, session IDs, event endpoint metadata, and capabilities.
+- Create `.config/nvim/lua/ai/backends/opencode_managed.lua`.
+  This module owns the exact audited OpenCode version, managed policy, profile request, environment, and semantic compatibility contract.
+- Create `.config/nvim/scripts/nvim-ai-opencode-profile.py`.
+  This helper filters credentials, snapshots approved instructions, and atomically publishes an immutable managed OpenCode profile.
 - Create `.config/nvim/lua/ai/sandbox.lua`.
   This module validates grants and emits a versioned launch manifest plus the fixed launcher invocation.
 - Create `.config/nvim/scripts/nvim-ai-launch.py`.
   This executable validates the manifest, constructs Bubblewrap arguments, launches direct or server-and-attach backends, and falls back to a diagnostic shell only after the managed backend exits.
 - Create `.config/nvim/tests/ai_backends.lua`.
   This test owns the exact common contract, backend arguments, state isolation, and capability declarations.
+- Create `.config/nvim/tests/ai_opencode_managed.lua`.
+  This test owns managed OpenCode policy, version, native-agent semantics, and adapter integration.
+- Create `.config/nvim/tests/nvim_ai_opencode_profile.py`.
+  This test owns strict credential filtering, instruction snapshots, atomic profile publication, and secret-free failures.
+- Create `.config/nvim/tests/nvim-ai-opencode-compat.sh`.
+  This real-binary harness proves hostile OpenCode configuration isolation without provider access.
 - Create `.config/nvim/tests/ai_sandbox.lua`.
   This test owns manifest validation, mount ordering, read-only mode, writable-batch mode, Git masks, grants, environment filtering, and launcher invocation.
 - Create `.config/nvim/tests/nvim_ai_launch.py`.
@@ -758,6 +782,9 @@ git commit -m "feat(nvim): define AI companion identity"
 
 ### Task 2: Define backend adapters and capability-aware health
 
+> **Execution amendment:** Codex and Claude in this task are implemented and retained.
+> The historical OpenCode examples in this task are superseded by Tasks 1 through 3 of `.config/docs/superpowers/plans/2026-08-24-neovim-managed-opencode-profile.md` and must not be executed.
+
 **Files:**
 
 - Create: `.config/nvim/lua/ai/backends/init.lua`
@@ -1066,6 +1093,9 @@ git commit -m "feat(nvim): define AI CLI adapters"
 ```
 
 ### Task 3: Build and prove the Bubblewrap launch boundary
+
+> **Execution amendment:** Tasks 4 and 5 of `.config/docs/superpowers/plans/2026-08-24-neovim-managed-opencode-profile.md` are the execution version of this task and require every original confinement invariant plus the managed-profile boundary.
+> After those tasks pass both reviews, continue with Task 4 below.
 
 **Files:**
 
@@ -1498,7 +1528,7 @@ git commit -m "feat(nvim): confine AI CLI processes"
 - Produces: `require("ai.transports.tmux").new(options) -> AiTransport`.
 - Produces: `require("ai.transports.terminal").new(options) -> AiTransport`.
 - Extends `AiTransport` with `tag(pane, metadata) -> boolean, string|nil` and `shutdown() -> nil`.
-- Uses tmux metadata names `@dotfiles_nvim_ai`, `@dotfiles_nvim_ai_key`, `@dotfiles_nvim_ai_owner`, `@dotfiles_nvim_ai_root`, `@dotfiles_nvim_ai_backend`, `@dotfiles_nvim_ai_state`, `@dotfiles_nvim_ai_grants`, and `@dotfiles_nvim_ai_session`.
+- Uses tmux metadata names `@dotfiles_nvim_ai`, `@dotfiles_nvim_ai_key`, `@dotfiles_nvim_ai_owner`, `@dotfiles_nvim_ai_root`, `@dotfiles_nvim_ai_backend`, `@dotfiles_nvim_ai_state`, `@dotfiles_nvim_ai_grants`, `@dotfiles_nvim_ai_session`, `@dotfiles_nvim_ai_opencode_token`, `@dotfiles_nvim_ai_opencode_fingerprint`, and `@dotfiles_nvim_ai_opencode_version`.
 - Represents a terminal fallback handle as `term:<buffer-number>:<job-number>` and never persists that handle.
 
 - [ ] **Step 1: Write the failing transport test**
@@ -1527,7 +1557,7 @@ local identity = {
 
 local calls = {}
 local results = {
-  { code = 0, signal = 0, stdout = "%30\t1\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t%12\t/work/repo\tclaude\topen\t0\t11111111-1111-4111-8111-111111111111\n%31\t1\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t%12\t/work/repo\tclaude\topen\t0\t11111111-1111-4111-8111-111111111111\n", stderr = "" },
+  { code = 0, signal = 0, stdout = "%30\t1\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t%12\t/work/repo\tclaude\topen\t0\t11111111-1111-4111-8111-111111111111\t\t\t\n%31\t1\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t%12\t/work/repo\tclaude\topen\t0\t11111111-1111-4111-8111-111111111111\t\t\t\n", stderr = "" },
   { code = 0, signal = 0, stdout = "%40\n", stderr = "" },
   { code = 0, signal = 0, stdout = "", stderr = "" },
   { code = 0, signal = 0, stdout = "", stderr = "" },
@@ -1551,7 +1581,7 @@ local panes = assert(transport:discover(identity))
 eq(vim.tbl_map(function(item) return item.pane end, panes), { "%30", "%31" }, "duplicates remain visible")
 eq(calls[1].argv, {
   "/usr/bin/tmux", "-S", "/tmp/tmux-1000/default", "list-panes", "-a", "-F",
-  "#{pane_id}\t#{@dotfiles_nvim_ai}\t#{@dotfiles_nvim_ai_key}\t#{@dotfiles_nvim_ai_owner}\t#{@dotfiles_nvim_ai_root}\t#{@dotfiles_nvim_ai_backend}\t#{@dotfiles_nvim_ai_state}\t#{@dotfiles_nvim_ai_grants}\t#{@dotfiles_nvim_ai_session}",
+  "#{pane_id}\t#{@dotfiles_nvim_ai}\t#{@dotfiles_nvim_ai_key}\t#{@dotfiles_nvim_ai_owner}\t#{@dotfiles_nvim_ai_root}\t#{@dotfiles_nvim_ai_backend}\t#{@dotfiles_nvim_ai_state}\t#{@dotfiles_nvim_ai_grants}\t#{@dotfiles_nvim_ai_session}\t#{@dotfiles_nvim_ai_opencode_token}\t#{@dotfiles_nvim_ai_opencode_fingerprint}\t#{@dotfiles_nvim_ai_opencode_version}",
 }, "discovery argv")
 eq(panes[1].grants, "0", "discovery retains grant hash")
 eq(panes[1].session, "11111111-1111-4111-8111-111111111111", "discovery retains session")
@@ -1572,6 +1602,7 @@ eq(calls[4].argv, {
 assert(transport:tag("%40", {
   key = identity.key, owner = "%12", root = "/work/repo", backend = "claude",
   state = "starting", grants = "0", session = "11111111-1111-4111-8111-111111111111",
+  opencode_token = "", opencode_fingerprint = "", opencode_version = "",
 }))
 assert(transport:paste("%40", "Regarding lua/main.lua:7:3: "))
 eq(calls[6].argv, {
@@ -1629,6 +1660,9 @@ local metadata_names = {
   state = "@dotfiles_nvim_ai_state",
   grants = "@dotfiles_nvim_ai_grants",
   session = "@dotfiles_nvim_ai_session",
+  opencode_token = "@dotfiles_nvim_ai_opencode_token",
+  opencode_fingerprint = "@dotfiles_nvim_ai_opencode_fingerprint",
+  opencode_version = "@dotfiles_nvim_ai_opencode_version",
 }
 
 local function valid_pane(value)
@@ -1642,7 +1676,10 @@ local function safe_metadata(name, value)
       return string.format("%%%02X", string.byte(byte))
     end)
   end
-  local limits = { key = 32, owner = 16, root = 1024, backend = 16, state = 32, grants = 16, session = 128 }
+  local limits = {
+    key = 32, owner = 16, root = 1024, backend = 16, state = 32, grants = 16, session = 128,
+    opencode_token = 32, opencode_fingerprint = 64, opencode_version = 16,
+  }
   if value:find("[%z\1-\31\127]") or #value > assert(limits[name]) then
     return nil, "unsafe tmux AI metadata: " .. name
   end
@@ -1669,8 +1706,11 @@ local function split_argv(identity, command, width)
 end
 ```
 
-`discover()` must run `list-panes -a` once, parse exactly the nine tab-separated fields from the focused test, validate and percent-decode the bounded root, retain every exact marker, key, owner, and root match, and return each candidate's validated backend, state, grant hash, and session with the whole matching list.
+`discover()` must run `list-panes -a` once, parse exactly the twelve tab-separated fields from the focused test, validate and percent-decode the bounded root, retain every exact marker, key, owner, and root match, and return each candidate's validated backend, state, grant hash, session, and OpenCode profile reference with the whole matching list.
 It must reject any malformed matching record instead of silently ignoring it.
+Require all three OpenCode fields to be empty for Codex and Claude.
+For OpenCode, require a 32-character lowercase hexadecimal token, a 64-character lowercase hexadecimal fingerprint, and exact version `1.18.18`.
+Add a synthetic OpenCode discovery row and tag call that round-trip those exact values, plus rejection cases for a partial or malformed profile tuple and a non-OpenCode backend carrying any profile value.
 `create()` must split a passive fixed `sleep` holder, validate the returned pane, tag marker, key, owner, root, and `starting` state, then respawn the tagged pane with `invocation.command`.
 It must kill only that newly created pane when initial tagging or launcher respawn fails.
 `tag()` must use one multi-command tmux argv with `set-option -pt` and literal argv elements, never a shell command string.
@@ -1735,7 +1775,9 @@ git commit -m "feat(nvim): add AI companion transports"
 **Files:**
 
 - Create: `.config/nvim/lua/ai/session.lua`
+- Modify: `.config/nvim/lua/ai/state.lua`
 - Modify: `.config/nvim/tests/ai_transport.lua`
+- Modify: `.config/nvim/tests/ai_identity.lua`
 
 **Interfaces:**
 
@@ -1744,6 +1786,7 @@ git commit -m "feat(nvim): add AI companion transports"
 - Produces: `coordinator:attach()`, `coordinator:open(backend)`, `coordinator:switch(backend)`, `coordinator:prepare_review(review_id)`, `coordinator:finish_review(review_id)`, `coordinator:set_grants(grants)`, `coordinator:paste(text)`, `coordinator:close()`, `coordinator:shutdown()`, and `coordinator:snapshot()`.
 - Produces: `coordinator:subscribe(callback) -> unsubscribe` for common state changes.
 - Keeps `sessions.codex`, `sessions.claude`, and `sessions.opencode` in the durable record even when another backend is active.
+- Keeps `opencode_profile` as either JSON null or the exact public `{ token, fingerprint, version }` reference for the active surviving OpenCode process.
 
 - [ ] **Step 1: Add failing coordinator tests**
 
@@ -1760,6 +1803,7 @@ local record = {
   sessions = { codex = "last", claude = "11111111-1111-4111-8111-111111111111", opencode = "" },
   grants = {},
   review_id = vim.NIL,
+  opencode_profile = vim.NIL,
 }
 local fake_transport = fake_transport_for(identity)
 local fake_sandbox_boundary = fake_sandbox()
@@ -1788,10 +1832,14 @@ assert(coordinator:switch("opencode"))
 eq(coordinator:snapshot().backend, "opencode", "backend switched")
 eq(coordinator:snapshot().pane, fake_transport.pane, "backend reuses pane")
 eq(fake_transport.created, 1, "only one pane created")
+eq(coordinator:snapshot().opencode_profile, {
+  token = string.rep("b", 32), fingerprint = string.rep("c", 64), version = "1.18.18",
+}, "managed profile reference retained")
 
 assert(coordinator:finish_review("review_0123456789abcdef"))
 eq(fake_sandbox_boundary.manifests[#fake_sandbox_boundary.manifests].writable, false, "resolved review relaunches read-only")
 eq(coordinator:snapshot().review_id, nil, "review cleared")
+eq(coordinator:snapshot().opencode_profile.fingerprint, string.rep("c", 64), "review relaunch reuses profile")
 
 coordinator:shutdown()
 eq(fake_transport.closed, 0, "Neovim shutdown preserves tmux pane")
@@ -1800,7 +1848,11 @@ eq(fake_transport.closed, 1, "explicit close removes pane")
 eq(coordinator:snapshot().grants, {}, "close revokes grants")
 ```
 
+Configure the fake OpenCode adapter to return a managed launch whose public reference is the token, fingerprint, and version above.
 Add exact cases for a unique discovered pane reconnect, duplicate refusal listing both pane IDs, stale metadata, failed record decode, missing active backend, unavailable backend, startup failure, unexpected exit, failed writable relaunch rollback, a rich `busy` switch requiring confirmation, a common-state switch without confirmation, grant persistence across backend switch, and standalone shutdown closing its terminal.
+Add separate reconnect refusals for a changed pane token, fingerprint, version, durable reference, missing profile generation, changed profile manifest, wrong physical root, and an `inspect-profile` helper failure.
+Assert that every refusal leaves the pane untouched, disables prompt transfer, emits no sensitive path or file contents, and requires explicit restart or close.
+Assert that close after a refused attach requires confirmation, kills only the one exact identity-matching pane, clears the stale profile reference, and lets the next open publish a fresh profile.
 
 - [ ] **Step 2: Run the focused test and verify the coordinator is missing**
 
@@ -1839,30 +1891,50 @@ local transitions = {
 Keep the conflict latch outside this table.
 When `conflicts > 0`, `snapshot().state` remains `conflicted` until the review tracker reports zero conflicts or the batch is abandoned.
 
+Amend the pre-integration schema-1 durable record in `.config/nvim/lua/ai/state.lua` to require the `opencode_profile` field.
+Accept only JSON null or a table with exactly `token`, `fingerprint`, and `version`, where token is 32 lowercase hexadecimal characters, fingerprint is 64 lowercase hexadecimal characters, and version is exactly `1.18.18`.
+Reject a non-null profile unless `active_backend == "opencode"`, while allowing an OpenCode backend with a null profile before its first launch or after explicit close.
+Update every state fixture in `.config/nvim/tests/ai_identity.lua`, test rejection of missing, extra, and malformed profile fields, and retain the existing atomic publication and rollback assertions.
+This is a correction to the not-yet-integrated schema-1 shape, not an on-disk migration.
+
 Use one `launch(backend, mode)` helper for first launch, resume, backend switch, grant change, and review transition.
 The helper must:
 
 1. Resolve the backend-specific durable session reference.
-2. Build backend paths with the current sorted canonical grants, then call `new_session` only when no valid reference exists and otherwise call `resume_session`.
+2. Build backend paths with the current sorted canonical grants, then call `new_session` only when no valid session reference exists and otherwise call `resume_session`.
+   Resolve the original inherited home and optional XDG data root once through canonical current-user-owned directory checks, set `home_agents` to the exact home `AGENTS.md` child, and set `global_opencode_data` to the exact `opencode` child of `${XDG_DATA_HOME:-$HOME/.local/share}`.
+   Pass `paths.opencode_profile` only while relaunching the same already-active OpenCode pane for a review or grant transition.
+   A new activation, backend switch into OpenCode, or explicit close-and-reopen passes no profile reference and therefore creates a fresh generation.
 3. Call `sandbox.prepare` with `writable = review_id ~= nil`, the exact review ID, and the current grants.
    Pass the Task 1 runtime and durable application roots so the launcher re-masks all Neovim-owned state after a writable project bind.
    Pass the canonical Python, Bubblewrap, shell, launcher, review helper, control helper, and event helper paths plus the sorted canonical Git and optional tmux host-tool list so the launcher can validate and protect every future control boundary.
 4. Reuse the pane-stable control token from `store:ensure_control_token()` across backend switches, review relaunches, grants, and ordinary Neovim reopen.
 5. Persist the returned backend session reference before process creation.
+   For OpenCode, derive and validate the exact public profile reference from the prepared launch and persist it in the same durable-record write.
+   For Codex and Claude, require and persist `opencode_profile = vim.NIL`.
 6. Create a pane only when none exists and otherwise call `respawn` on the same pane.
    Pass `adapter:suspend()` for backend switch, review transition, and grant transition; pass `adapter:stop()` for explicit close.
 7. Tag the pane with bounded nonsecret metadata after a successful create or respawn.
+   Tag all three exact OpenCode profile fields for OpenCode and clear all three for Codex and Claude.
+   If tagging fails, stop the just-started managed process before rolling state back and report cleanup failure without adopting the pane.
 8. Roll the durable record and in-memory snapshot back when any step fails.
+   When failure occurs after stopping the prior process, rebuild its prior validated launch, respawn and retag it with the prior profile tuple, and restore durable state only after that recovery succeeds.
+   If process recovery fails, retain a truthful `failed` snapshot and bounded diagnostic instead of claiming rollback.
 9. Let the launcher unlink a successfully validated one-time manifest and remove it from Neovim only when process creation fails before the launcher can read it.
 
 `attach()` must focus neither pane nor window.
 It accepts exactly one discovered pane whose identity metadata and durable record agree.
 It requires the decoded root, backend, and backend-specific session reference to agree with the durable record, validates the bounded state before seeding the snapshot, and reports stale metadata instead of silently overwriting either side.
+For OpenCode, it requires the pane token, fingerprint, and version to equal the durable reference, then calls `adapter:validate_profile()` with the exact identity and physical root to securely re-open and verify that generation before adoption.
+For Codex and Claude, it requires both the durable profile reference and all three pane profile fields to be empty.
+It never rebuilds a profile during attach, so credential or instruction changes take effect only after an explicit OpenCode restart creates and tags a fresh generation.
+A profile mismatch leaves the surviving pane untouched and blocks focus-independent prompt transfer until explicit restart or close.
 It compares the pane's bounded grant hash with the durable grant list and refuses prompt transfer until a mismatch is reconciled by a confirmed sandbox relaunch.
 If a surviving pane's control-token file is missing, reconnect keeps the pane visible but requires an explicit relaunch with a new token before scope requests can work; it never fabricates a token for the already running process.
 It returns an error naming all pane IDs when discovery returns more than one match.
 It does not start or resume a backend during reconnection.
 When discovery proves that no managed pane exists, it clears stale grants and the old control token before creating a new pane.
+It also clears a stale OpenCode profile reference so the following explicit open creates a fresh generation.
 
 `open()` focuses a uniquely attached pane or launches the requested backend.
 `switch()` requests confirmation only when the current adapter has `busy=true` and the current rich state is `busy` or `approval`.
@@ -1873,7 +1945,8 @@ When no pane exists yet, `prepare_review()` persists the ID without launching, a
 When the managed pane is already closed, it clears the resolved review ID and baseline without launching a backend.
 `set_grants()` relaunches with the same review ID and backend and never pastes or submits text.
 `shutdown()` leaves a tmux pane and its backend alone but tears down subscriptions.
-`close()` closes the owned pane, calls `store:cleanup_contexts()`, removes the control token, clears all grants and launch manifests, retains the three session references, and writes `review_id` unchanged when unresolved.
+`close()` closes the owned pane, calls `store:cleanup_contexts()`, removes the control token, clears all grants, launch manifests, and the active OpenCode profile reference, retains the three session references, and writes `review_id` unchanged when unresolved.
+After a refused attach, `close()` may stop and remove exactly one identity-matching pane only after revalidating its pane ID, marker, owner, and physical root and obtaining explicit confirmation; close followed by open is the explicit managed-profile restart path.
 
 - [ ] **Step 4: Run formatting and coordinator tests**
 
@@ -1881,20 +1954,27 @@ Run:
 
 ```sh
 stylua /home/ruohao/.config/nvim/lua/ai/session.lua \
-  /home/ruohao/.config/nvim/tests/ai_transport.lua
+  /home/ruohao/.config/nvim/lua/ai/state.lua \
+  /home/ruohao/.config/nvim/tests/ai_transport.lua \
+  /home/ruohao/.config/nvim/tests/ai_identity.lua
 env -u TMUX -u TMUX_PANE NVIM_LOG_FILE=/dev/null \
   nvim --clean --headless -u NONE -i NONE \
   -c 'set runtimepath^=/home/ruohao/.config/nvim' \
   -l /home/ruohao/.config/nvim/tests/ai_transport.lua
+NVIM_LOG_FILE=/dev/null nvim --clean --headless -u NONE -i NONE \
+  -c 'set runtimepath^=/home/ruohao/.config/nvim' \
+  -l /home/ruohao/.config/nvim/tests/ai_identity.lua
 ```
 
-Expected: the test prints exactly `AI transport assertions: ok` with exit `0`.
+Expected: both focused tests exit `0` and print their exact success lines.
 
 - [ ] **Step 5: Commit the session coordinator**
 
 ```sh
 git add .config/nvim/lua/ai/session.lua \
-  .config/nvim/tests/ai_transport.lua
+  .config/nvim/lua/ai/state.lua \
+  .config/nvim/tests/ai_transport.lua \
+  .config/nvim/tests/ai_identity.lua
 git commit -m "feat(nvim): coordinate AI CLI sessions"
 ```
 
@@ -3406,7 +3486,9 @@ Create a test-owned `tmux` shim in `$test_root/bin` that exits `97` unless argv 
 This makes any accidental default-server call fail without connecting to the default server.
 
 Create test-owned fake `codex`, `claude`, and `opencode` executables in the same bin directory.
-They must support only the exact version and local-auth commands from Task 2 plus the exact launch and resume forms.
+Codex and Claude must support only their exact version and local-auth commands from Task 2 plus their exact launch and resume forms.
+OpenCode must support the audited version, help, agent-list, five-agent debug, and two disabled-agent negative probes plus the exact managed server and attach forms from the managed-profile plan.
+Create one mode-0600 synthetic OpenCode `auth.json` under the harness home and require the generated managed profile to contain only its accepted fake credential record.
 Codex and Claude write one bounded session sentinel into their identity-specific backend-state directory and remain attached to the terminal until signaled.
 For `opencode serve`, start a loopback Python HTTP server on the requested port with an empty event stream.
 For `opencode attach`, remain attached to the native terminal until signaled.
@@ -3439,21 +3521,23 @@ Wait for the Neovim listen socket with a bounded retry loop and fail after five 
 Drive commands with `nvim --server SOCKET --remote-expr 'execute("COMMAND")'` and assert all of these outcomes:
 
 1. `NvimAIBackend codex` creates exactly one right-hand AI pane for owner A.
-2. The AI pane has exact key, owner, root, backend, state, grant-hash, and session options.
+2. The AI pane has exact key, owner, root, backend, state, grant-hash, session, and empty OpenCode profile options.
 3. Its left coordinate is greater than owner A's left coordinate and its width is 40 percent within tmux rounding.
 4. Repeating `NvimAIOpen` focuses the same pane and creates none.
 5. Owner B in the same physical root receives a different identity key and different AI pane.
 6. Exiting owner A's Neovim leaves its AI pane and fake backend alive.
 7. Respawning Neovim in the same dead owner pane reconnects to the same AI pane without another fake-backend launch sentinel.
 8. `NvimAIBackend claude` and then `NvimAIBackend opencode` reuse that pane and retain independent session references.
-9. A visual `NvimAIPrompt` pastes the context reference, creates one review ID, relaunches writable, leaves the prompt unsubmitted, and leaves no tmux paste buffer.
-10. Absence of the fake `turn-started` sentinel proves Neovim did not submit the prepared prompt; the harness then clears the fake TUI input, types `scope $test_root/outside`, and submits that test command explicitly.
-11. The approved scope request canonicalizes `$test_root/outside`, relaunches once, survives a backend switch, and leaves no automatically continued prompt.
-12. Revocation relaunches once and removes the grant.
-13. A manually created duplicate pane with the same exact identity metadata makes `NvimAIOpen` refuse and name both pane IDs.
-14. Removing the duplicate restores normal focus behavior.
-15. `NvimAIClose` removes only the owned AI pane, revokes grants, removes context files, and retains backend session references.
-16. Owner B and its companion remain untouched throughout owner A operations.
+9. The OpenCode pane exposes the exact nonsecret token, fingerprint, and version options, and its managed configuration tree is read-only.
+10. Exiting and respawning owner A's Neovim again adopts that same OpenCode pane and exact profile tuple without another profile publication or fake-backend launch sentinel.
+11. A visual `NvimAIPrompt` pastes the context reference, creates one review ID, relaunches writable with the same profile tuple, leaves the prompt unsubmitted, and leaves no tmux paste buffer.
+12. Absence of the fake `turn-started` sentinel proves Neovim did not submit the prepared prompt; the harness then clears the fake TUI input, types `scope $test_root/outside`, and submits that test command explicitly.
+13. The approved scope request canonicalizes `$test_root/outside`, relaunches once with the same profile tuple, survives a backend switch, and leaves no automatically continued prompt.
+14. Revocation relaunches once and removes the grant.
+15. A manually created duplicate pane with the same exact identity and profile metadata makes `NvimAIOpen` refuse and name both pane IDs.
+16. Removing the duplicate restores normal focus behavior.
+17. `NvimAIClose` removes only the owned AI pane, revokes grants, removes context files, clears the active profile reference, and retains backend session references.
+18. Owner B and its companion remain untouched throughout owner A operations.
 
 Use pane options and fake-backend sentinel files as authoritative evidence.
 Do not scrape TUI text to infer backend state.
