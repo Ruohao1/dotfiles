@@ -761,27 +761,35 @@ def _publish_profile(request, auth_bytes, count, instruction_bytes):
         "instructions_sha256": hashlib.sha256(instruction_bytes).hexdigest(),
     }
     manifest_bytes = _encode_compact(manifest) + b"\n"
-    staging_name = "." + request["token"] + ".tmp"
+    staging_name = ".opencode-profile-" + request["token"] + ".tmp"
     destination_name = request["token"]
 
+    parent_descriptor = None
     backend_descriptor = None
     profiles_descriptor = None
     staging_descriptor = None
     staging_identity = None
     published = False
     try:
-        backend_descriptor, backend_identity = _open_private_directory_path(
-            request["backend_state"]
+        backend_parent = os.path.dirname(request["backend_state"])
+        backend_name = os.path.basename(request["backend_state"])
+        parent_descriptor, parent_identity = _open_private_directory_path(
+            backend_parent
+        )
+        backend_descriptor, backend_identity = _open_private_child(
+            parent_descriptor, backend_name
         )
         profiles_descriptor, profiles_identity = _open_or_create_profiles(
             backend_descriptor
         )
-        if _entry_exists(profiles_descriptor, staging_name):
+        if parent_identity[0] != profiles_identity[0]:
+            raise ValueError("profile staging and destination filesystems differ")
+        if _entry_exists(parent_descriptor, staging_name):
             raise ValueError("profile staging path already exists")
         if _entry_exists(profiles_descriptor, destination_name):
             raise ValueError("profile destination already exists")
         staging_descriptor, staging_identity = _create_private_child(
-            profiles_descriptor, staging_name
+            parent_descriptor, staging_name
         )
 
         credentials_descriptor, _credentials_identity = _create_private_child(
@@ -821,25 +829,35 @@ def _publish_profile(request, auth_bytes, count, instruction_bytes):
         _write_private_file(staging_descriptor, "manifest.json", manifest_bytes)
         os.fsync(staging_descriptor)
         os.fsync(profiles_descriptor)
+        os.fsync(backend_descriptor)
+        os.fsync(parent_descriptor)
 
-        _verify_private_child(profiles_descriptor, staging_name, staging_identity)
+        _verify_private_child(parent_descriptor, staging_name, staging_identity)
         if _entry_exists(profiles_descriptor, destination_name):
             raise ValueError("profile destination already exists")
         _verify_private_child(backend_descriptor, "profiles", profiles_identity)
+        _verify_private_child(parent_descriptor, backend_name, backend_identity)
         _rename_noreplace(
-            profiles_descriptor,
+            parent_descriptor,
             staging_name,
             profiles_descriptor,
             destination_name,
         )
         published = True
         os.fsync(profiles_descriptor)
+        os.fsync(parent_descriptor)
+        if _entry_exists(parent_descriptor, staging_name):
+            raise ValueError("profile staging path remains after publication")
         _verify_private_child(profiles_descriptor, destination_name, staging_identity)
         _verify_private_child(backend_descriptor, "profiles", profiles_identity)
+        _verify_private_child(parent_descriptor, backend_name, backend_identity)
         try:
+            final_parent = os.lstat(backend_parent)
             final_backend = os.lstat(request["backend_state"])
         except OSError:
             raise ValueError("backend state changed during publication") from None
+        if _directory_metadata(final_parent) != parent_identity:
+            raise ValueError("backend state parent changed during publication")
         if _directory_metadata(final_backend) != backend_identity:
             raise ValueError("backend state changed during publication")
     except ValueError:
@@ -849,12 +867,12 @@ def _publish_profile(request, auth_bytes, count, instruction_bytes):
     finally:
         if (
             not published
-            and profiles_descriptor is not None
+            and parent_descriptor is not None
             and staging_descriptor is not None
             and staging_identity is not None
         ):
             _cleanup_staging(
-                profiles_descriptor,
+                parent_descriptor,
                 staging_name,
                 staging_descriptor,
                 staging_identity,
@@ -863,6 +881,7 @@ def _publish_profile(request, auth_bytes, count, instruction_bytes):
             staging_descriptor,
             profiles_descriptor,
             backend_descriptor,
+            parent_descriptor,
         ):
             if descriptor is not None:
                 try:

@@ -890,12 +890,18 @@ class PublicationBoundaryTests(unittest.TestCase):
                     self.assertFalse(fixture.profile_root().exists())
 
     def test_preexisting_staging_or_destination_is_refused_and_untouched(self) -> None:
-        for name in (f".{TOKEN}.tmp", TOKEN):
-            with self.subTest(name=name):
+        for boundary, name in (
+            ("staging", f".opencode-profile-{TOKEN}.tmp"),
+            ("destination", TOKEN),
+        ):
+            with self.subTest(boundary=boundary, name=name):
                 fixture = Fixture(self)
                 profiles = fixture.backend_state / "profiles"
                 profiles.mkdir(mode=0o700)
-                existing = profiles / name
+                parent = (
+                    fixture.backend_state.parent if boundary == "staging" else profiles
+                )
+                existing = parent / name
                 existing.mkdir(mode=0o700)
                 sentinel = existing / "keep"
                 sentinel.write_text("preexisting", encoding="utf-8")
@@ -903,6 +909,175 @@ class PublicationBoundaryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     fixture.prepare()
                 self.assertEqual(sentinel.read_text(encoding="utf-8"), "preexisting")
+
+    def test_unpublished_generation_is_created_as_trusted_backend_state_sibling(
+        self,
+    ) -> None:
+        fixture = Fixture(self)
+        original_create = helper._create_private_child
+        creations: list[tuple[pathlib.Path, str]] = []
+
+        def observe_create(parent_descriptor: int, name: str):
+            if TOKEN in name:
+                parent = pathlib.Path(
+                    os.readlink(f"/proc/self/fd/{parent_descriptor}")
+                ).resolve()
+                creations.append((parent, name))
+            return original_create(parent_descriptor, name)
+
+        with mock.patch.object(
+            helper, "_create_private_child", side_effect=observe_create
+        ):
+            fixture.prepare()
+        self.assertEqual(
+            creations,
+            [
+                (
+                    fixture.backend_state.parent,
+                    f".opencode-profile-{TOKEN}.tmp",
+                )
+            ],
+        )
+
+    def test_publish_moves_from_trusted_parent_into_profiles_with_distinct_dirfds(
+        self,
+    ) -> None:
+        fixture = Fixture(self)
+        original_rename = helper._rename_noreplace
+        calls: list[tuple[pathlib.Path, str, pathlib.Path, str]] = []
+
+        def observe_rename(
+            source_descriptor: int,
+            source_name: str,
+            destination_descriptor: int,
+            destination_name: str,
+        ) -> None:
+            calls.append(
+                (
+                    pathlib.Path(
+                        os.readlink(f"/proc/self/fd/{source_descriptor}")
+                    ).resolve(),
+                    source_name,
+                    pathlib.Path(
+                        os.readlink(f"/proc/self/fd/{destination_descriptor}")
+                    ).resolve(),
+                    destination_name,
+                )
+            )
+            original_rename(
+                source_descriptor,
+                source_name,
+                destination_descriptor,
+                destination_name,
+            )
+
+        with mock.patch.object(helper, "_rename_noreplace", side_effect=observe_rename):
+            fixture.prepare()
+        self.assertEqual(
+            calls,
+            [
+                (
+                    fixture.backend_state.parent,
+                    f".opencode-profile-{TOKEN}.tmp",
+                    fixture.backend_state / "profiles",
+                    TOKEN,
+                )
+            ],
+        )
+
+    def test_trusted_backend_state_parent_mode_is_validated(self) -> None:
+        fixture = Fixture(self)
+        os.chmod(fixture.backend_state.parent, 0o755)
+        with self.assertRaises(ValueError):
+            fixture.prepare()
+        self.assertFalse(fixture.profile_root().exists())
+
+    def test_trusted_parent_rejects_symlink_wrong_owner_and_wrong_kind(self) -> None:
+        for mutation in ("symlink", "owner", "kind"):
+            with self.subTest(mutation=mutation):
+                fixture = Fixture(self)
+                patcher = None
+                if mutation == "symlink":
+                    actual_parent = fixture.base / "actual-backends"
+                    actual_parent.mkdir(mode=0o700)
+                    moved_state = actual_parent / "state"
+                    fixture.backend_state.rename(moved_state)
+                    linked_parent = fixture.base / "linked-backends"
+                    linked_parent.symlink_to(actual_parent, target_is_directory=True)
+                    fixture.backend_state = linked_parent / "state"
+                else:
+                    parent = fixture.backend_state.parent
+                    original_lstat = os.lstat
+
+                    def altered_parent(
+                        path: object,
+                        *args: object,
+                        _mutation: str = mutation,
+                        _parent: pathlib.Path = parent,
+                        _lstat=original_lstat,
+                        **kwargs: object,
+                    ):
+                        result = _lstat(path, *args, **kwargs)
+                        if os.fspath(path) == str(_parent):
+                            if _mutation == "owner":
+                                return StatProxy(result, st_uid=os.getuid() + 1)
+                            return StatProxy(
+                                result,
+                                st_mode=stat.S_IFREG | 0o700,
+                            )
+                        return result
+
+                    patcher = mock.patch.object(
+                        helper.os, "lstat", side_effect=altered_parent
+                    )
+
+                if patcher is None:
+                    with self.assertRaises(ValueError):
+                        fixture.prepare()
+                else:
+                    with patcher, self.assertRaises(ValueError):
+                        fixture.prepare()
+                self.assertFalse(fixture.profile_root().exists())
+
+    def test_parent_and_profiles_must_share_one_filesystem(self) -> None:
+        fixture = Fixture(self)
+        original_open_profiles = helper._open_or_create_profiles
+
+        def report_other_filesystem(backend_descriptor: int):
+            descriptor, identity = original_open_profiles(backend_descriptor)
+            return descriptor, (identity[0] + 1, *identity[1:])
+
+        with mock.patch.object(
+            helper,
+            "_open_or_create_profiles",
+            side_effect=report_other_filesystem,
+        ):
+            with self.assertRaises(ValueError):
+                fixture.prepare()
+        self.assertFalse(fixture.profile_root().exists())
+
+    def test_failed_build_cleans_only_sibling_staging_without_leakage(self) -> None:
+        fixture = Fixture(self)
+        staging = fixture.backend_state.parent / f".opencode-profile-{TOKEN}.tmp"
+        with mock.patch.object(
+            helper, "_write_private_file", side_effect=ValueError("injected")
+        ):
+            with self.assertRaises(ValueError):
+                fixture.prepare()
+        self.assertFalse(staging.exists())
+        profiles = fixture.backend_state / "profiles"
+        self.assertTrue(profiles.is_dir())
+        self.assertEqual(list(profiles.iterdir()), [])
+
+    def test_success_leaves_no_sibling_or_profiles_staging_entry(self) -> None:
+        fixture = Fixture(self)
+        fixture.prepare()
+        self.assertFalse(
+            (fixture.backend_state.parent / f".opencode-profile-{TOKEN}.tmp").exists()
+        )
+        self.assertFalse(
+            (fixture.backend_state / "profiles" / f".{TOKEN}.tmp").exists()
+        )
 
     def test_staging_swap_at_open_boundary_is_refused_without_publish(self) -> None:
         fixture = Fixture(self)
@@ -919,10 +1094,14 @@ class PublicationBoundaryTests(unittest.TestCase):
             dir_fd: int | None = None,
         ):
             nonlocal replacement, stolen
-            if path == f".{TOKEN}.tmp" and dir_fd is not None and replacement is None:
-                profiles = fixture.backend_state / "profiles"
-                staging = profiles / os.fspath(path)
-                stolen = profiles / ".staging-created-by-helper"
+            if (
+                path == f".opencode-profile-{TOKEN}.tmp"
+                and dir_fd is not None
+                and replacement is None
+            ):
+                parent = fixture.backend_state.parent
+                staging = parent / os.fspath(path)
+                stolen = parent / ".staging-created-by-helper"
                 original_rename(staging, stolen)
                 staging.mkdir(mode=0o700)
                 replacement = staging / "attacker-sentinel"
@@ -1008,9 +1187,9 @@ class PublicationBoundaryTests(unittest.TestCase):
             destination_descriptor: int,
             dst: str,
         ) -> None:
-            src_path = fixture.backend_state / "profiles" / os.fspath(src)
+            src_path = fixture.backend_state.parent / os.fspath(src)
             dst_path = fixture.backend_state / "profiles" / os.fspath(dst)
-            self.assertEqual(src_path.name, f".{TOKEN}.tmp")
+            self.assertEqual(src_path.name, f".opencode-profile-{TOKEN}.tmp")
             self.assertEqual(dst_path.name, TOKEN)
             self.assertTrue((src_path / "manifest.json").is_file())
             self.assertTrue((src_path / "credentials/auth.json").is_file())
@@ -1018,7 +1197,7 @@ class PublicationBoundaryTests(unittest.TestCase):
             for path in [src_path, *src_path.rglob("*")]:
                 expected = 0o700 if path.is_dir() else 0o600
                 self.assertEqual(stat.S_IMODE(path.lstat().st_mode), expected)
-            self.assertEqual(source_descriptor, destination_descriptor)
+            self.assertNotEqual(source_descriptor, destination_descriptor)
             observations.append((source_descriptor, src, destination_descriptor, dst))
             original_rename(
                 source_descriptor,
@@ -1033,8 +1212,11 @@ class PublicationBoundaryTests(unittest.TestCase):
             fixture.prepare()
         self.assertEqual(len(observations), 1)
         source_descriptor, source, destination_descriptor, destination = observations[0]
-        self.assertEqual(source_descriptor, destination_descriptor)
-        self.assertEqual((source, destination), (f".{TOKEN}.tmp", TOKEN))
+        self.assertNotEqual(source_descriptor, destination_descriptor)
+        self.assertEqual(
+            (source, destination),
+            (f".opencode-profile-{TOKEN}.tmp", TOKEN),
+        )
         self.assertTrue(fixture.profile_root().is_dir())
 
     def test_every_file_and_directory_is_fsynced_before_or_with_publication(
@@ -1044,6 +1226,7 @@ class PublicationBoundaryTests(unittest.TestCase):
         original_fsync = os.fsync
         original_fstat = os.fstat
         synced = {"file": 0, "directory": 0}
+        synced_directories: set[pathlib.Path] = set()
 
         def observing_fsync(descriptor: int):
             metadata = original_fstat(descriptor)
@@ -1051,12 +1234,22 @@ class PublicationBoundaryTests(unittest.TestCase):
                 synced["file"] += 1
             elif stat.S_ISDIR(metadata.st_mode):
                 synced["directory"] += 1
+                synced_directories.add(
+                    pathlib.Path(os.readlink(f"/proc/self/fd/{descriptor}")).resolve()
+                )
             return original_fsync(descriptor)
 
         with mock.patch.object(helper.os, "fsync", side_effect=observing_fsync):
             fixture.prepare()
         self.assertEqual(synced["file"], 4)
         self.assertGreaterEqual(synced["directory"], 7)
+        self.assertTrue(
+            {
+                fixture.backend_state.parent,
+                fixture.backend_state,
+                fixture.backend_state / "profiles",
+            }.issubset(synced_directories)
+        )
 
     def test_staging_replacement_on_publication_is_not_deleted_or_published(
         self,
@@ -1072,9 +1265,9 @@ class PublicationBoundaryTests(unittest.TestCase):
             _dst: str,
         ) -> None:
             nonlocal replacement
-            profiles = fixture.backend_state / "profiles"
-            staging = profiles / os.fspath(src)
-            stolen = profiles / ".stolen"
+            parent = fixture.backend_state.parent
+            staging = parent / os.fspath(src)
+            stolen = parent / ".stolen"
             original_rename(staging, stolen)
             staging.mkdir(mode=0o700)
             replacement = staging / "attacker-sentinel"
