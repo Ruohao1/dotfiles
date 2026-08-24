@@ -1,6 +1,7 @@
 """Build and inspect private credentials-only OpenCode profiles."""
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -34,6 +35,8 @@ MAX_SNAPSHOT_BYTES = 512 * 1024
 MAX_JSON_BYTES = 1024 * 1024
 MAX_CLI_REPORT_BYTES = 64 * 1024
 MAX_DIAGNOSTIC_BYTES = 256
+
+_RENAME_NOREPLACE = 1
 
 _HEX = frozenset("0123456789abcdef")
 _PREPARE_KEYS = frozenset(
@@ -563,10 +566,20 @@ def _verify_private_child(parent_descriptor, name, identity):
 def _create_private_child(parent_descriptor, name):
     try:
         os.mkdir(name, 0o700, dir_fd=parent_descriptor)
+        created = _entry_lstat(parent_descriptor, name)
+        _validate_private_directory_metadata(created)
         descriptor = os.open(name, _directory_flags(), dir_fd=parent_descriptor)
+        opened = os.fstat(descriptor)
+        _validate_private_directory_metadata(opened)
+        if _directory_metadata(created) != _directory_metadata(opened):
+            raise ValueError("private directory changed during creation")
         os.fchmod(descriptor, 0o700)
         opened = os.fstat(descriptor)
         _validate_private_directory_metadata(opened)
+        final = _entry_lstat(parent_descriptor, name)
+        _validate_private_directory_metadata(final)
+        if _directory_metadata(opened) != _directory_metadata(final):
+            raise ValueError("private directory changed during creation")
     except Exception as error:
         if "descriptor" in locals():
             os.close(descriptor)
@@ -658,6 +671,61 @@ def _cleanup_staging(profiles_descriptor, name, descriptor, identity):
             os.fsync(profiles_descriptor)
         except OSError:
             pass
+
+
+def _rename_noreplace(
+    source_descriptor,
+    source_name,
+    destination_descriptor,
+    destination_name,
+):
+    if sys.platform != "linux":
+        raise ValueError("atomic profile publication is unavailable")
+    if (
+        isinstance(source_descriptor, bool)
+        or not isinstance(source_descriptor, int)
+        or source_descriptor < 0
+        or isinstance(destination_descriptor, bool)
+        or not isinstance(destination_descriptor, int)
+        or destination_descriptor < 0
+    ):
+        raise ValueError("atomic profile publication is unavailable")
+    source_bytes = _utf8_bytes(source_name, "publication source")
+    destination_bytes = _utf8_bytes(destination_name, "publication destination")
+    if (
+        not source_bytes
+        or len(source_bytes) > 255
+        or b"/" in source_bytes
+        or b"\x00" in source_bytes
+        or not destination_bytes
+        or len(destination_bytes) > 255
+        or b"/" in destination_bytes
+        or b"\x00" in destination_bytes
+    ):
+        raise ValueError("atomic profile publication is unavailable")
+    try:
+        library = ctypes.CDLL(None, use_errno=True)
+        renameat2 = library.renameat2
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        result = renameat2(
+            source_descriptor,
+            source_bytes,
+            destination_descriptor,
+            destination_bytes,
+            _RENAME_NOREPLACE,
+        )
+    except (AttributeError, OSError, TypeError, ValueError):
+        raise ValueError("atomic profile publication is unavailable") from None
+    if result != 0:
+        raise ValueError("atomic profile publication failed")
 
 
 def _public_report(request, fingerprint, count):
@@ -758,11 +826,11 @@ def _publish_profile(request, auth_bytes, count, instruction_bytes):
         if _entry_exists(profiles_descriptor, destination_name):
             raise ValueError("profile destination already exists")
         _verify_private_child(backend_descriptor, "profiles", profiles_identity)
-        os.rename(
+        _rename_noreplace(
+            profiles_descriptor,
             staging_name,
+            profiles_descriptor,
             destination_name,
-            src_dir_fd=profiles_descriptor,
-            dst_dir_fd=profiles_descriptor,
         )
         published = True
         os.fsync(profiles_descriptor)

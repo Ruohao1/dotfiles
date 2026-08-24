@@ -171,7 +171,9 @@ class Fixture:
 
 
 class StaticContractTests(unittest.TestCase):
-    def test_helper_uses_only_the_seven_permitted_imports(self) -> None:
+    def test_helper_uses_only_the_eight_permitted_imports_and_no_os_rename(
+        self,
+    ) -> None:
         tree = ast.parse(HELPER_PATH.read_text(encoding="utf-8"))
         imports: set[str] = set()
         for node in ast.walk(tree):
@@ -181,8 +183,26 @@ class StaticContractTests(unittest.TestCase):
                 self.fail(f"from-import is not permitted: {ast.dump(node)}")
         self.assertEqual(
             imports,
-            {"argparse", "hashlib", "json", "os", "pathlib", "stat", "sys"},
+            {
+                "argparse",
+                "ctypes",
+                "hashlib",
+                "json",
+                "os",
+                "pathlib",
+                "stat",
+                "sys",
+            },
         )
+        ordinary_renames = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "os"
+            and node.attr == "rename"
+        ]
+        self.assertEqual(ordinary_renames, [])
 
     def test_audited_constants_and_limits_are_exact(self) -> None:
         self.assertEqual(helper.AUDITED_VERSION, VERSION)
@@ -884,12 +904,110 @@ class PublicationBoundaryTests(unittest.TestCase):
                     fixture.prepare()
                 self.assertEqual(sentinel.read_text(encoding="utf-8"), "preexisting")
 
+    def test_staging_swap_at_open_boundary_is_refused_without_publish(self) -> None:
+        fixture = Fixture(self)
+        original_open = os.open
+        original_rename = os.rename
+        replacement: pathlib.Path | None = None
+        stolen: pathlib.Path | None = None
+
+        def replace_before_open(
+            path: object,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ):
+            nonlocal replacement, stolen
+            if path == f".{TOKEN}.tmp" and dir_fd is not None and replacement is None:
+                profiles = fixture.backend_state / "profiles"
+                staging = profiles / os.fspath(path)
+                stolen = profiles / ".staging-created-by-helper"
+                original_rename(staging, stolen)
+                staging.mkdir(mode=0o700)
+                replacement = staging / "attacker-sentinel"
+                replacement.write_text("foreign", encoding="utf-8")
+                os.chmod(replacement, 0o600)
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch.object(helper.os, "open", side_effect=replace_before_open):
+            with self.assertRaises(ValueError):
+                fixture.prepare()
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.read_text(encoding="utf-8"), "foreign")
+        self.assertIsNotNone(stolen)
+        self.assertTrue(stolen.is_dir())
+        self.assertFalse(fixture.profile_root().exists())
+
+    def test_empty_destination_injected_after_final_precheck_is_not_replaced(
+        self,
+    ) -> None:
+        fixture = Fixture(self)
+        original_entry_exists = helper._entry_exists
+        destination_checks = 0
+
+        def inject_empty_destination(parent_descriptor: int, name: str) -> bool:
+            nonlocal destination_checks
+            exists = original_entry_exists(parent_descriptor, name)
+            if name == TOKEN:
+                destination_checks += 1
+                if destination_checks == 2 and not exists:
+                    fixture.profile_root().mkdir(mode=0o700)
+            return exists
+
+        with mock.patch.object(
+            helper, "_entry_exists", side_effect=inject_empty_destination
+        ):
+            with self.assertRaises(ValueError):
+                fixture.prepare()
+        self.assertEqual(destination_checks, 2)
+        self.assertTrue(fixture.profile_root().is_dir())
+        self.assertEqual(list(fixture.profile_root().iterdir()), [])
+
+    def test_renameat2_wrapper_uses_dirfds_names_and_noreplace(self) -> None:
+        renameat2 = mock.Mock(return_value=0)
+        library = mock.Mock()
+        library.renameat2 = renameat2
+        with mock.patch.object(helper.ctypes, "CDLL", return_value=library) as loader:
+            helper._rename_noreplace(11, ".source", 12, "destination")
+        loader.assert_called_once_with(None, use_errno=True)
+        renameat2.assert_called_once_with(11, b".source", 12, b"destination", 1)
+        self.assertEqual(renameat2.restype, helper.ctypes.c_int)
+        self.assertEqual(
+            renameat2.argtypes,
+            [
+                helper.ctypes.c_int,
+                helper.ctypes.c_char_p,
+                helper.ctypes.c_int,
+                helper.ctypes.c_char_p,
+                helper.ctypes.c_uint,
+            ],
+        )
+
+    def test_renameat2_unavailable_never_falls_back_to_ordinary_rename(self) -> None:
+        unavailable_cases = (
+            mock.patch.object(helper.ctypes, "CDLL", side_effect=OSError("missing")),
+            mock.patch.object(helper.ctypes, "CDLL", return_value=object()),
+        )
+        for unavailable in unavailable_cases:
+            with self.subTest(unavailable=unavailable):
+                with unavailable, mock.patch.object(helper.os, "rename") as fallback:
+                    with self.assertRaises(ValueError) as caught:
+                        helper._rename_noreplace(11, ".source", 11, "destination")
+                fallback.assert_not_called()
+                self.assertLessEqual(len(str(caught.exception).encode("utf-8")), 256)
+
     def test_tree_is_complete_and_private_at_the_single_atomic_rename(self) -> None:
         fixture = Fixture(self)
-        original_rename = os.rename
-        observations: list[tuple[str, str]] = []
+        original_rename = helper._rename_noreplace
+        observations: list[tuple[int, str, int, str]] = []
 
-        def observing_rename(src: object, dst: object, *args: object, **kwargs: object):
+        def observing_rename(
+            source_descriptor: int,
+            src: str,
+            destination_descriptor: int,
+            dst: str,
+        ) -> None:
             src_path = fixture.backend_state / "profiles" / os.fspath(src)
             dst_path = fixture.backend_state / "profiles" / os.fspath(dst)
             self.assertEqual(src_path.name, f".{TOKEN}.tmp")
@@ -900,12 +1018,23 @@ class PublicationBoundaryTests(unittest.TestCase):
             for path in [src_path, *src_path.rglob("*")]:
                 expected = 0o700 if path.is_dir() else 0o600
                 self.assertEqual(stat.S_IMODE(path.lstat().st_mode), expected)
-            observations.append((os.fspath(src), os.fspath(dst)))
-            return original_rename(src, dst, *args, **kwargs)
+            self.assertEqual(source_descriptor, destination_descriptor)
+            observations.append((source_descriptor, src, destination_descriptor, dst))
+            original_rename(
+                source_descriptor,
+                src,
+                destination_descriptor,
+                dst,
+            )
 
-        with mock.patch.object(helper.os, "rename", side_effect=observing_rename):
+        with mock.patch.object(
+            helper, "_rename_noreplace", side_effect=observing_rename
+        ):
             fixture.prepare()
-        self.assertEqual(observations, [(f".{TOKEN}.tmp", TOKEN)])
+        self.assertEqual(len(observations), 1)
+        source_descriptor, source, destination_descriptor, destination = observations[0]
+        self.assertEqual(source_descriptor, destination_descriptor)
+        self.assertEqual((source, destination), (f".{TOKEN}.tmp", TOKEN))
         self.assertTrue(fixture.profile_root().is_dir())
 
     def test_every_file_and_directory_is_fsynced_before_or_with_publication(
@@ -936,7 +1065,12 @@ class PublicationBoundaryTests(unittest.TestCase):
         original_rename = os.rename
         replacement: pathlib.Path | None = None
 
-        def replace_staging(src: object, dst: object, *args: object, **kwargs: object):
+        def replace_staging(
+            _source_descriptor: int,
+            src: str,
+            _destination_descriptor: int,
+            _dst: str,
+        ) -> None:
             nonlocal replacement
             profiles = fixture.backend_state / "profiles"
             staging = profiles / os.fspath(src)
@@ -948,7 +1082,9 @@ class PublicationBoundaryTests(unittest.TestCase):
             os.chmod(replacement, 0o600)
             raise OSError("simulated publication race")
 
-        with mock.patch.object(helper.os, "rename", side_effect=replace_staging):
+        with mock.patch.object(
+            helper, "_rename_noreplace", side_effect=replace_staging
+        ):
             with self.assertRaises(ValueError):
                 fixture.prepare()
         self.assertIsNotNone(replacement)
@@ -957,12 +1093,15 @@ class PublicationBoundaryTests(unittest.TestCase):
 
     def test_destination_replacement_before_rename_is_never_overwritten(self) -> None:
         fixture = Fixture(self)
-        original_rename = os.rename
+        original_rename = helper._rename_noreplace
         sentinel: pathlib.Path | None = None
 
         def replace_destination(
-            src: object, dst: object, *args: object, **kwargs: object
-        ):
+            source_descriptor: int,
+            src: str,
+            destination_descriptor: int,
+            dst: str,
+        ) -> None:
             nonlocal sentinel
             profiles = fixture.backend_state / "profiles"
             destination = profiles / os.fspath(dst)
@@ -970,9 +1109,16 @@ class PublicationBoundaryTests(unittest.TestCase):
             sentinel = destination / "attacker-sentinel"
             sentinel.write_text("foreign", encoding="utf-8")
             os.chmod(sentinel, 0o600)
-            return original_rename(src, dst, *args, **kwargs)
+            original_rename(
+                source_descriptor,
+                src,
+                destination_descriptor,
+                dst,
+            )
 
-        with mock.patch.object(helper.os, "rename", side_effect=replace_destination):
+        with mock.patch.object(
+            helper, "_rename_noreplace", side_effect=replace_destination
+        ):
             with self.assertRaises(ValueError):
                 fixture.prepare()
         self.assertIsNotNone(sentinel)
