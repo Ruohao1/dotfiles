@@ -231,6 +231,59 @@ end, "changed password")
 local good = managed._test.compatibility_fixture()
 eq(good.names, { "build", "compaction", "plan", "summary", "title" }, "audited agent names")
 assert(managed.validate_compatibility(good))
+
+local hidden_precedence = vim.deepcopy(good)
+table.insert(hidden_precedence.agents.compaction.permission, 1, {
+  permission = "bash",
+  pattern = "*",
+  action = "allow",
+})
+assert(managed.validate_compatibility(hidden_precedence), "final hidden denial wins precedence")
+
+local false_accept_cases = {
+  {
+    label = "nonempty Build tool map",
+    change = function(report)
+      report.agents.build.tools.edit = false
+    end,
+  },
+  {
+    label = "unknown actionable Plan tool",
+    change = function(report)
+      report.agents.plan.tools.shell = true
+    end,
+  },
+  {
+    label = "hidden final wildcard allow",
+    change = function(report)
+      report.agents.compaction.permission[1].action = "allow"
+    end,
+  },
+  {
+    label = "hidden later permission allow",
+    change = function(report)
+      table.insert(report.agents.summary.permission, {
+        permission = "bash",
+        pattern = "src/nvim_ai_probe.lua",
+        action = "allow",
+      })
+    end,
+  },
+}
+local false_accepts = {}
+for _, case in ipairs(false_accept_cases) do
+  local report = vim.deepcopy(good)
+  case.change(report)
+  local ok, err = managed.validate_compatibility(report)
+  if ok then
+    false_accepts[#false_accepts + 1] = case.label
+  else
+    assert(type(err) == "string" and err ~= "", case.label .. " returned no diagnostic")
+    assert(#err <= 256, case.label .. " returned an unbounded diagnostic")
+  end
+end
+assert(#false_accepts == 0, "compatibility false accepts: " .. table.concat(false_accepts, ", "))
+
 for _, mutation in ipairs({ "version", "agents", "build_edit", "plan_edit", "risk", "hidden_tools" }) do
   local changed = vim.deepcopy(good)
   managed._test.mutate_compatibility(changed, mutation)

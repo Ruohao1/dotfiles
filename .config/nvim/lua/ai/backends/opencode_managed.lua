@@ -197,20 +197,12 @@ local function resolve_permission(rules, permission)
   return action
 end
 
-local function validate_tool_map(value, label)
+local function validate_empty_tool_map(value, label)
   if type(value) ~= "table" then
     return nil, label .. " tools must be an object"
   end
-  for name, enabled in pairs(value) do
-    if
-      type(name) ~= "string"
-      or name == ""
-      or #name > 128
-      or has_control(name)
-      or type(enabled) ~= "boolean"
-    then
-      return nil, label .. " tools are invalid"
-    end
+  if next(value) ~= nil then
+    return nil, label .. " tools changed"
   end
   return true
 end
@@ -223,7 +215,7 @@ local function validate_primary_agent(agent, label)
   if agent.native ~= true or agent.mode ~= "primary" then
     return nil, label .. " native definition changed"
   end
-  local tools_ok, tools_error = validate_tool_map(agent.tools, label)
+  local tools_ok, tools_error = validate_empty_tool_map(agent.tools, label)
   if not tools_ok then
     return nil, tools_error
   end
@@ -253,7 +245,30 @@ local function validate_hidden_agent(agent, label)
       return nil, label .. " tools changed"
     end
   end
-  return validate_rules(agent.permission, label .. " permissions")
+  local rules_ok, rules_error = validate_rules(agent.permission, label .. " permissions")
+  if not rules_ok then
+    return nil, rules_error
+  end
+  local final_wildcard_action
+  for _, rule in ipairs(agent.permission) do
+    if rule.permission == "*" and rule.pattern == "*" then
+      final_wildcard_action = rule.action
+    end
+  end
+  if final_wildcard_action ~= "deny" or resolve_permission(agent.permission, "*") ~= "deny" then
+    return nil, label .. " final wildcard denial changed"
+  end
+  for _, permission in ipairs(HIDDEN_TOOLS) do
+    if resolve_permission(agent.permission, permission) ~= "deny" then
+      return nil, label .. " permission denial changed"
+    end
+  end
+  for _, permission in ipairs(RISK_PERMISSIONS) do
+    if resolve_permission(agent.permission, permission) ~= "deny" then
+      return nil, label .. " permission denial changed"
+    end
+  end
+  return true
 end
 
 local function primary_rules(edit_action)
