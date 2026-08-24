@@ -55,6 +55,8 @@ Auto-update remains disabled so a running managed session cannot cross the audit
 
 The profile builder consumes the companion identity, canonical physical root, audited compatibility entry, global user instruction path, repository instruction path, and global OpenCode credential path.
 It creates one private profile beneath the identity-specific backend state directory.
+It constructs each unpublished generation as a sibling of the backend state directory beneath the trusted identity-specific `backends` directory, which is outside the exact child made writable to backend sandboxes.
+It atomically moves the completed generation into the backend profile directory without replacement.
 Directories are current-user-owned mode 0700.
 Sensitive files are current-user-owned nonsymlink regular files with mode 0600.
 Publication is atomic and refuses an existing wrong-owner, wrong-mode, wrong-kind, or symlink path.
@@ -183,7 +185,8 @@ The launcher independently validates the profile schema, ownership, modes, finge
 
 The server starts inside Bubblewrap with the managed profile mounted read-only.
 The existing project-root and approved-grant mount policy remains unchanged, and identity-specific backend state is the only additional writable exception.
-Nested read-only profile and credential binds are applied after the writable backend-state bind so the backend cannot replace them.
+The complete `profiles` directory and the nested profile and credential binds are applied read-only after the writable backend-state bind so the backend cannot replace a generation or race construction of another one.
+The identity-specific `backends` parent remains covered only by the trusted application-state read-only bind, so an OpenCode process cannot modify the unpublished sibling staging path.
 The attach client starts through the same launcher with the same profile, environment controls, root, and version entry.
 The native TUI remains responsible for prompt editing, submission, Build and Plan switching, and approval interaction.
 Neovim does not submit, resume, or continue a turn automatically.

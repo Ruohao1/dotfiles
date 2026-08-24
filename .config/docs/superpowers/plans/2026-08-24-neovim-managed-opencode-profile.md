@@ -30,6 +30,7 @@ The planned Bubblewrap launcher independently validates that profile, mounts it 
 - Snapshot `$HOME/AGENTS.md` before `<physical-root>/AGENTS.md`, deduplicate identical files, and inject no other instruction source.
 - Require the inherited `HOME` to resolve to a canonical current-user-owned directory before masking its `.opencode` child.
 - Keep every profile directory mode 0700 and every profile file mode 0600.
+- Construct unpublished OpenCode generations beside the backend state directory beneath the trusted identity-specific `backends` parent, never inside the exact backend-state child exposed writable to OpenCode.
 - Never put real credential contents in argv, environment, diagnostics, logs, tmux options, fingerprints, or tests.
 - Use synthetic credentials only in automated tests and never contact a model provider.
 - Fail closed without falling back to the user's ordinary OpenCode profile.
@@ -409,7 +410,7 @@ class CredentialTests(unittest.TestCase):
 Add profile tests that assert the exact generated tree, directory modes 0700, file modes 0600, broad-to-specific instruction ordering, inode-based deduplication, absent optional instructions, UTF-8 and NUL rejection, 256 KiB per-source limit, 512 KiB combined limit, and atomic directory publication.
 Assert exact instruction bytes using `# User instructions\n\n` and `# Repository instructions\n\n` headings, the deterministic separator rule below, exact accepted source bytes, and an empty file when neither source exists.
 Add race fixtures that replace a source with a symlink between `lstat`, `open`, `fstat`, read, and final `lstat`, and require refusal at every boundary.
-Add output-boundary cases for a symlinked, wrong-owner, wrong-mode, or wrong-kind backend state and `profiles` directory, plus staging or destination replacement before publication.
+Add output-boundary cases for a symlinked, wrong-owner, wrong-mode, or wrong-kind backend state, its trusted parent, and the `profiles` directory, plus staging or destination replacement after descriptor-bound identity capture and before publication.
 Prepare two profiles with distinct supplied tokens and changed credential bytes while leaving configuration and instructions fixed, then assert distinct roots, changed filtered authentication, identical fingerprints, and no credential value in either report.
 Add `inspect-profile` tests that re-open a published generation and reject a changed token, identity, root, version, fingerprint, configuration hash, instruction hash, owner, mode, or symlink component without returning file contents.
 
@@ -469,9 +470,11 @@ profiles/TOKEN/
         └── opencode.json
 ```
 
-Build it first as `BACKEND_STATE/profiles/.TOKEN.tmp` with mode 0700 directories and mode 0600 files.
+Build it first as the mode-0700 sibling `dirname(BACKEND_STATE)/.opencode-profile-TOKEN.tmp`, outside the exact backend-state child made writable inside backend sandboxes.
+Require the canonical backend-state parent to be a current-user-owned mode-0700 nonsymlink directory and require it to share one filesystem with `BACKEND_STATE/profiles`.
+Retain descriptor-bound identities for that trusted parent, the staging generation, the backend state, and the profiles directory through publication.
 Use exclusive file creation, complete write loops, `fsync` on every file, and `fsync` on every directory from leaves to `profiles`.
-Publish `TOKEN` with one final Linux `renameat2(RENAME_NOREPLACE)` call through `ctypes`, fail closed when that primitive is unavailable, and never fall back to replacement-capable `os.rename`.
+Publish `TOKEN` from the trusted sibling parent into `BACKEND_STATE/profiles` with one final Linux `renameat2(RENAME_NOREPLACE)` call through `ctypes`, fail closed when that primitive is unavailable, and never fall back to replacement-capable `os.rename`.
 Refuse an existing staging or destination path instead of replacing it.
 On failure, remove only entries proven to be children of the helper-created staging directory and leave every pre-existing path untouched.
 Reject any unexpected entry when inspecting a published profile and require `empty-home-opencode` to remain empty.
@@ -848,6 +851,7 @@ Reject any inherited or adapter-provided `OPENCODE_*` key outside the exact set 
 After the writable backend-state bind, append these nested read-only overlays in this order:
 
 ```python
+argv += ["--ro-bind", os.path.dirname(profile["profile_root"]), os.path.dirname(profile["profile_root"])]
 argv += ["--ro-bind", profile["profile_root"], profile["profile_root"]]
 argv += ["--ro-bind", profile["config_source"], env["XDG_CONFIG_HOME"]]
 argv += ["--ro-bind", profile["auth_source"], env["XDG_DATA_HOME"] + "/opencode/auth.json"]
@@ -862,6 +866,7 @@ Use the same validated environment and managed profile for the server and attach
 
 Create the full provider-free Bubblewrap harness from the main plan's Task 3 Step 6 and add a synthetic managed profile under its harness-owned backend state.
 Make the fake backend attempt to replace `opencode.json`, `AGENTS.md`, filtered `auth.json`, the profile manifest, and a file below the home `.opencode` mask.
+Make it also attempt to create, rename, and remove entries in the complete `profiles` directory and in the sibling unpublished-generation namespace beneath the identity-specific `backends` parent.
 Require every attempt to fail while backend cache writes and the existing project/grant policy behave exactly as before.
 Pass the expected profile manifest path as fixed fake-backend argv and assert that the fake server and attach modes read the same fingerprint without exposing credential contents.
 
