@@ -228,9 +228,104 @@ rejected(function()
   return managed.environment(managed_profile, string.rep("A", 32))
 end, "changed password")
 
-local good = managed._test.compatibility_fixture()
+local audited_risk_permissions = {
+  "bash",
+  "webfetch",
+  "websearch",
+  "external_directory",
+  "doom_loop",
+}
+local audited_denied_permissions = { "task", "skill" }
+local audited_hidden_tool_map = {
+  invalid = false,
+  question = false,
+  bash = false,
+  read = false,
+  glob = false,
+  grep = false,
+  edit = false,
+  write = false,
+  task = false,
+  webfetch = false,
+  todowrite = false,
+  websearch = false,
+  skill = false,
+}
+
+local function audited_primary_permissions(edit_action)
+  local rules = {
+    {
+      permission = "edit",
+      pattern = "*",
+      action = edit_action == "allow" and "deny" or "allow",
+    },
+    { permission = "edit", pattern = "src/nvim_ai_probe.lua", action = edit_action },
+  }
+  for _, permission in ipairs(audited_risk_permissions) do
+    rules[#rules + 1] = { permission = permission, pattern = "*", action = "allow" }
+    rules[#rules + 1] = {
+      permission = permission,
+      pattern = "src/nvim_ai_probe.lua",
+      action = "ask",
+    }
+  end
+  for _, permission in ipairs(audited_denied_permissions) do
+    rules[#rules + 1] = { permission = permission, pattern = "*", action = "ask" }
+    rules[#rules + 1] = {
+      permission = permission,
+      pattern = "src/nvim_ai_probe.lua",
+      action = "deny",
+    }
+  end
+  return rules
+end
+
+local function audited_hidden_agent()
+  return {
+    native = true,
+    hidden = true,
+    tools = vim.deepcopy(audited_hidden_tool_map),
+    permission = { { permission = "*", pattern = "*", action = "deny" } },
+  }
+end
+
+local function audited_compatibility_report()
+  return {
+    version = "1.18.18",
+    help = {
+      root = { "--pure", "serve", "attach" },
+      serve = { "--hostname", "--port", "OPENCODE_SERVER_PASSWORD" },
+      attach = { "--dir", "--session" },
+    },
+    names = { "build", "compaction", "plan", "summary", "title" },
+    agents = {
+      build = {
+        native = true,
+        mode = "primary",
+        tools = {},
+        permission = audited_primary_permissions("allow"),
+      },
+      plan = {
+        native = true,
+        mode = "primary",
+        tools = {},
+        permission = audited_primary_permissions("deny"),
+      },
+      compaction = audited_hidden_agent(),
+      summary = audited_hidden_agent(),
+      title = audited_hidden_agent(),
+    },
+  }
+end
+
+local good = audited_compatibility_report()
 eq(good.names, { "build", "compaction", "plan", "summary", "title" }, "audited agent names")
 assert(managed.validate_compatibility(good))
+eq(
+  managed._test.compatibility_fixture(),
+  good,
+  "production compatibility helper matches the independent audit"
+)
 
 local hidden_precedence = vim.deepcopy(good)
 table.insert(hidden_precedence.agents.compaction.permission, 1, {
@@ -284,12 +379,65 @@ for _, case in ipairs(false_accept_cases) do
 end
 assert(#false_accepts == 0, "compatibility false accepts: " .. table.concat(false_accepts, ", "))
 
-for _, mutation in ipairs({ "version", "agents", "build_edit", "plan_edit", "risk", "hidden_tools" }) do
+local function change_last_matching_action(report, agent_name, permission, action)
+  local rules = report.agents[agent_name].permission
+  for index = #rules, 1, -1 do
+    local rule = rules[index]
+    if
+      (rule.permission == permission or rule.permission == "*")
+      and (rule.pattern == "*" or rule.pattern == "src/nvim_ai_probe.lua")
+    then
+      rule.action = action
+      return
+    end
+  end
+  error("independent compatibility rule is missing")
+end
+
+local compatibility_mutations = {
+  {
+    label = "version",
+    change = function(report)
+      report.version = "1.18.19"
+    end,
+  },
+  {
+    label = "agents",
+    change = function(report)
+      report.agents.title = nil
+    end,
+  },
+  {
+    label = "build_edit",
+    change = function(report)
+      change_last_matching_action(report, "build", "edit", "deny")
+    end,
+  },
+  {
+    label = "plan_edit",
+    change = function(report)
+      change_last_matching_action(report, "plan", "edit", "allow")
+    end,
+  },
+  {
+    label = "risk",
+    change = function(report)
+      change_last_matching_action(report, "build", "websearch", "allow")
+    end,
+  },
+  {
+    label = "hidden_tools",
+    change = function(report)
+      report.agents.title.tools.websearch = true
+    end,
+  },
+}
+for _, mutation in ipairs(compatibility_mutations) do
   local changed = vim.deepcopy(good)
-  managed._test.mutate_compatibility(changed, mutation)
+  mutation.change(changed)
   rejected(function()
     return managed.validate_compatibility(changed)
-  end, "compatibility mutation: " .. mutation)
+  end, "compatibility mutation: " .. mutation.label)
 end
 
 local invalid_compatibility_cases = {
