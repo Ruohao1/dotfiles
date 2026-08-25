@@ -11,6 +11,43 @@ local MAX_HELP_BYTES = 65536
 local MAX_AUTH_BYTES = 65536
 local MAX_PROFILE_REPORT_BYTES = 65536
 local MAX_COMPATIBILITY_REPORT_BYTES = 1024 * 1024
+local OPENCODE_PROBE_LOCK = "0a009c556ac8352fed53ef8323a3a97270935d30.lock"
+local OPENCODE_PROBE_DB_SHA256 = "40cf07c52bfaa52b334ef341456f970787f6dc701ffe18ad3c572cb5056dbd70"
+local OPENCODE_PROBE_FORBIDDEN_ARTIFACTS = {
+  "node_modules",
+  "package.json",
+  "package-lock.json",
+  "bun.lock",
+  "installing configuration dependenc",
+  "downloading plugin",
+  "loading plugin",
+  "/plugins/",
+  "checking for update",
+  "downloading lsp",
+  "lsp-download",
+  "/lsp/",
+  "network request",
+  "network setup",
+  "http://",
+  "https://",
+  ".opencode",
+  "/tmp/opencode/",
+}
+local OPENCODE_PRIMARY_TOOLS = {
+  invalid = true,
+  question = true,
+  bash = true,
+  read = true,
+  glob = true,
+  grep = true,
+  edit = true,
+  write = true,
+  task = false,
+  webfetch = true,
+  todowrite = true,
+  websearch = true,
+  skill = false,
+}
 local AUTH_ARGUMENTS = {
   codex = { "login", "status" },
   claude = { "auth", "status", "--json" },
@@ -174,12 +211,24 @@ local function uuid_v4(random)
   }, "-")
 end
 
+local function private_directory(path, lstat, getuid)
+  local ok, stat = pcall(lstat, path)
+  return ok
+    and type(stat) == "table"
+    and stat.type == "directory"
+    and stat.uid == getuid()
+    and type(stat.mode) == "number"
+    and bit.band(stat.mode, 511) == 448
+end
+
 local function read_only_probe(executable, arguments, overrides)
   local tools = require("ai.tools")
   local probe = overrides or {}
   local resolve = probe.resolve or tools.resolve
   local revalidate = probe.revalidate or tools.revalidate
   local environ = probe.environ or vim.fn.environ
+  local lstat = probe.lstat or vim.uv.fs_lstat
+  local getuid = probe.getuid or vim.uv.getuid
   local run = probe.run or function(argv, options)
     return vim.system(argv, options):wait()
   end
@@ -235,11 +284,11 @@ local function read_only_probe(executable, arguments, overrides)
     argv[#argv + 1] = "--dir"
     argv[#argv + 1] = working_directory
   end
+  local read_only_mounts = {}
   if probe.read_only_mounts ~= nil then
     if type(probe.read_only_mounts) ~= "table" or not vim.islist(probe.read_only_mounts) then
       return { code = 126, signal = 0, stdout = "", stderr = "probe mounts are invalid" }
     end
-    local mounts = {}
     for _, mount in ipairs(probe.read_only_mounts) do
       if type(mount) ~= "table" then
         return { code = 126, signal = 0, stdout = "", stderr = "probe mount is invalid" }
@@ -255,14 +304,68 @@ local function read_only_probe(executable, arguments, overrides)
           stderr = source_error or destination_error,
         }
       end
-      mounts[#mounts + 1] = { source = source, destination = destination }
+      read_only_mounts[#read_only_mounts + 1] = { source = source, destination = destination }
     end
+  end
+  local writable_mounts = {}
+  if probe.writable_mounts ~= nil then
+    if
+      type(probe.writable_mounts) ~= "table"
+      or not vim.islist(probe.writable_mounts)
+      or #probe.writable_mounts ~= 3
+    then
+      return { code = 126, signal = 0, stdout = "", stderr = "probe writable mounts are invalid" }
+    end
+    local allowed_destinations = {
+      ["/tmp/nvim-ai-probe/xdg-data"] = true,
+      ["/tmp/nvim-ai-probe/xdg-cache"] = true,
+      ["/tmp/nvim-ai-probe/xdg-state"] = true,
+    }
+    local seen_sources = {}
+    local seen_destinations = {}
+    for _, mount in ipairs(probe.writable_mounts) do
+      if type(mount) ~= "table" then
+        return { code = 126, signal = 0, stdout = "", stderr = "probe writable mount is invalid" }
+      end
+      local source, source_error = canonical_path(mount.source, "probe writable source", false)
+      local destination, destination_error =
+        canonical_path(mount.destination, "probe writable destination", false)
+      if
+        not source
+        or not destination
+        or not allowed_destinations[destination]
+        or seen_sources[source]
+        or seen_destinations[destination]
+        or not private_directory(source, lstat, getuid)
+        or not private_directory(vim.fs.dirname(source), lstat, getuid)
+      then
+        return {
+          code = 126,
+          signal = 0,
+          stdout = "",
+          stderr = source_error or destination_error or "probe writable mount is invalid",
+        }
+      end
+      seen_sources[source] = true
+      seen_destinations[destination] = true
+      writable_mounts[#writable_mounts + 1] = { source = source, destination = destination }
+    end
+  end
+  local seen_destinations = {}
+  for _, mounts in ipairs({ read_only_mounts, writable_mounts }) do
     for _, mount in ipairs(mounts) do
+      if seen_destinations[mount.destination] then
+        return { code = 126, signal = 0, stdout = "", stderr = "probe mount is duplicated" }
+      end
+      seen_destinations[mount.destination] = true
       vim.list_extend(argv, { "--dir", mount.destination })
     end
-    for _, mount in ipairs(mounts) do
-      vim.list_extend(argv, { "--ro-bind", mount.source, mount.destination })
-    end
+  end
+  for _, mount in ipairs(read_only_mounts) do
+    vim.list_extend(argv, { "--ro-bind", mount.source, mount.destination })
+  end
+  for _, mount in ipairs(writable_mounts) do
+    vim.list_extend(argv, { "--bind", mount.source, mount.destination })
   end
   if probe.working_directory ~= nil then
     vim.list_extend(argv, { "--chdir", probe.working_directory })
@@ -291,8 +394,22 @@ local function read_only_probe(executable, arguments, overrides)
       env = environment,
     })
   end)
+  if probe.inspect_artifacts ~= nil then
+    if type(probe.inspect_artifacts) ~= "function" then
+      return { code = 126, signal = 0, stdout = "", stderr = "probe artifact inspector is invalid" }
+    end
+    local inspection_ok, accepted = pcall(probe.inspect_artifacts, result)
+    if not inspection_ok or accepted ~= true then
+      return {
+        code = 125,
+        signal = 0,
+        stdout = "",
+        stderr = "managed probe artifact validation failed",
+      }
+    end
+  end
   if not ok then
-    return { code = 126, signal = 0, stdout = "", stderr = tostring(result) }
+    return { code = 126, signal = 0, stdout = "", stderr = "probe execution failed" }
   end
   return result
 end
@@ -328,22 +445,229 @@ local function executable_metadata(stat)
   }, ":")
 end
 
+local function same_probe_file(left, right)
+  return type(left) == "table"
+    and type(right) == "table"
+    and left.type == right.type
+    and left.dev == right.dev
+    and left.ino == right.ino
+    and left.mode == right.mode
+    and left.uid == right.uid
+    and left.size == right.size
+    and type(left.mtime) == "table"
+    and type(right.mtime) == "table"
+    and left.mtime.sec == right.mtime.sec
+    and left.mtime.nsec == right.mtime.nsec
+    and type(left.ctime) == "table"
+    and type(right.ctime) == "table"
+    and left.ctime.sec == right.ctime.sec
+    and left.ctime.nsec == right.ctime.nsec
+end
+
+local function probe_artifact_filesystem(overrides)
+  local filesystem = overrides or {}
+  return {
+    close = filesystem.close or vim.uv.fs_close,
+    fstat = filesystem.fstat or vim.uv.fs_fstat,
+    getuid = filesystem.getuid or vim.uv.getuid,
+    hostname = filesystem.hostname or vim.uv.os_gethostname,
+    lstat = filesystem.lstat or vim.uv.fs_lstat,
+    open = filesystem.open or vim.uv.fs_open,
+    read = filesystem.read or vim.uv.fs_read,
+    scandir = filesystem.scandir or vim.uv.fs_scandir,
+    scandir_next = filesystem.scandir_next or vim.uv.fs_scandir_next,
+    sha256 = filesystem.sha256 or vim.fn.sha256,
+  }
+end
+
+local function read_probe_file(path, maximum, filesystem)
+  local before = filesystem.lstat(path)
+  if
+    type(before) ~= "table"
+    or before.type ~= "file"
+    or before.uid ~= filesystem.getuid()
+    or bit.band(before.mode, 511) ~= 384
+    or type(before.size) ~= "number"
+    or before.size < 0
+    or before.size > maximum
+  then
+    return nil
+  end
+  local descriptor = filesystem.open(path, "r", 0)
+  if not descriptor then
+    return nil
+  end
+  local opened = filesystem.fstat(descriptor)
+  local bytes = before.size == 0 and "" or filesystem.read(descriptor, before.size, 0)
+  local extra = filesystem.read(descriptor, 1, before.size)
+  local after = filesystem.fstat(descriptor)
+  local close_ok, closed = pcall(filesystem.close, descriptor)
+  local final = filesystem.lstat(path)
+  if
+    not same_probe_file(before, opened)
+    or type(bytes) ~= "string"
+    or #bytes ~= before.size
+    or (extra ~= nil and extra ~= "")
+    or not same_probe_file(opened, after)
+    or not close_ok
+    or closed == nil
+    or not same_probe_file(after, final)
+  then
+    return nil
+  end
+  return bytes
+end
+
+local function write_probe_file(path, bytes)
+  local descriptor = vim.uv.fs_open(path, "wx", 384)
+  if not descriptor then
+    return nil
+  end
+  local offset = 0
+  while offset < #bytes do
+    local written = vim.uv.fs_write(descriptor, bytes:sub(offset + 1), offset)
+    if type(written) ~= "number" or written <= 0 or written > #bytes - offset then
+      break
+    end
+    offset = offset + written
+  end
+  local synced = offset == #bytes and vim.uv.fs_fsync(descriptor)
+  local stat = vim.uv.fs_fstat(descriptor)
+  local close_ok, closed = pcall(vim.uv.fs_close, descriptor)
+  return offset == #bytes
+    and synced ~= nil
+    and type(stat) == "table"
+    and stat.type == "file"
+    and stat.uid == vim.uv.getuid()
+    and bit.band(stat.mode, 511) == 384
+    and stat.size == #bytes
+    and close_ok
+    and closed ~= nil
+end
+
+local function directory_entries(path, filesystem)
+  local before = filesystem.lstat(path)
+  if
+    type(before) ~= "table"
+    or before.type ~= "directory"
+    or before.uid ~= filesystem.getuid()
+    or type(before.mode) ~= "number"
+    or bit.band(before.mode, 511) ~= 448
+  then
+    return nil
+  end
+  local descriptor = filesystem.open(path, "r", 0)
+  if not descriptor then
+    return nil
+  end
+  local opened = filesystem.fstat(descriptor)
+  local descriptor_path = "/proc/self/fd/" .. tostring(descriptor)
+  local request = filesystem.scandir(descriptor_path)
+  if not request then
+    pcall(filesystem.close, descriptor)
+    return nil
+  end
+  local entries = {}
+  local invalid = false
+  while true do
+    local name = filesystem.scandir_next(request)
+    if name == nil then
+      break
+    end
+    if
+      name == ""
+      or name == "."
+      or name == ".."
+      or name:find("/", 1, true)
+      or has_control(name)
+    then
+      invalid = true
+      break
+    end
+    entries[#entries + 1] = name
+    if #entries > 32 then
+      invalid = true
+      break
+    end
+  end
+  local after = filesystem.fstat(descriptor)
+  local close_ok, closed = pcall(filesystem.close, descriptor)
+  local final = filesystem.lstat(path)
+  if
+    invalid
+    or not same_probe_file(before, opened)
+    or not same_probe_file(opened, after)
+    or not close_ok
+    or closed == nil
+    or not same_probe_file(after, final)
+  then
+    return nil
+  end
+  table.sort(entries)
+  return entries
+end
+
+local function exact_probe_directory(path, expected, filesystem)
+  local entries = directory_entries(path, filesystem)
+  return entries ~= nil and vim.deep_equal(entries, expected)
+end
+
+local function validate_probe_inputs(tree, filesystem)
+  filesystem = filesystem or probe_artifact_filesystem()
+  local managed = require("ai.backends.opencode_managed")
+  if
+    not exact_probe_directory(tree.home, {}, filesystem)
+    or not exact_probe_directory(tree.config, { "opencode" }, filesystem)
+    or not exact_probe_directory(tree.config_opencode, { ".gitignore" }, filesystem)
+  then
+    return nil
+  end
+  local bootstrap = read_probe_file(tree.bootstrap, 64, filesystem)
+  return bootstrap == managed.bootstrap_gitignore()
+    and filesystem.sha256(bootstrap) == managed.bootstrap_gitignore_sha256()
+end
+
 local function create_opencode_probe_tree()
   local root = vim.fn.tempname()
-  local home = root .. "/home"
-  local config = root .. "/xdg-config"
+  local tree = {
+    root = root,
+    home = root .. "/home",
+    config = root .. "/xdg-config",
+    config_opencode = root .. "/xdg-config/opencode",
+    bootstrap = root .. "/xdg-config/opencode/.gitignore",
+    data = root .. "/xdg-data",
+    cache = root .. "/xdg-cache",
+    state = root .. "/xdg-state",
+  }
   local created = false
   local ok = pcall(function()
     assert(vim.fn.mkdir(root, "p", 448) == 1)
     created = true
-    assert(vim.fn.mkdir(home, "", 448) == 1)
-    assert(vim.fn.mkdir(config, "", 448) == 1)
-    for _, path in ipairs({ root, home, config }) do
-      assert(vim.uv.fs_chmod(path, 448))
-      local stat = assert(vim.uv.fs_lstat(path))
-      assert(stat.type == "directory" and stat.uid == vim.uv.getuid())
-      assert(bit.band(stat.mode, 511) == 448)
+    for _, path in ipairs({
+      tree.home,
+      tree.config,
+      tree.config_opencode,
+      tree.data,
+      tree.cache,
+      tree.state,
+    }) do
+      assert(vim.fn.mkdir(path, "", 448) == 1)
     end
+    for _, path in ipairs({
+      tree.root,
+      tree.home,
+      tree.config,
+      tree.config_opencode,
+      tree.data,
+      tree.cache,
+      tree.state,
+    }) do
+      assert(vim.uv.fs_chmod(path, 448))
+      assert(private_directory(path, vim.uv.fs_lstat, vim.uv.getuid))
+    end
+    local managed = require("ai.backends.opencode_managed")
+    assert(write_probe_file(tree.bootstrap, managed.bootstrap_gitignore()))
+    assert(validate_probe_inputs(tree))
   end)
   if not ok then
     if created then
@@ -351,7 +675,167 @@ local function create_opencode_probe_tree()
     end
     return nil, "managed OpenCode probe directory creation failed"
   end
-  return { root = root, home = home, config = config }
+  return tree
+end
+
+local function forbidden_probe_artifact(bytes)
+  for printable in bytes:gmatch("[ -~]+") do
+    if #printable >= 8 then
+      local lower = printable:lower()
+      for _, evidence in ipairs(OPENCODE_PROBE_FORBIDDEN_ARTIFACTS) do
+        if lower:find(evidence, 1, true) then
+          return true
+        end
+      end
+    end
+  end
+  return false
+end
+
+local function valid_probe_uuid(value)
+  if type(value) ~= "string" or value:find("[^0-9a-f-]") then
+    return false
+  end
+  local first, second, third, fourth, fifth =
+    value:match("^([0-9a-f]+)%-([0-9a-f]+)%-([0-9a-f]+)%-([0-9a-f]+)%-([0-9a-f]+)$")
+  return first ~= nil
+    and #first == 8
+    and #second == 4
+    and #third == 4
+    and third:sub(1, 1) == "4"
+    and #fourth == 4
+    and fourth:sub(1, 1):match("[89ab]") ~= nil
+    and #fifth == 12
+end
+
+local function valid_probe_lock_metadata(bytes, filesystem)
+  local token, pid, hostname, created_at = bytes:match(
+    '^%{\n  "token": "([^"]+)",\n  "pid": ([0-9]+),\n  "hostname": "([^"]+)",\n  "createdAt": "([^"]+)"\n%}$'
+  )
+  local current_hostname = filesystem.hostname()
+  return valid_probe_uuid(token)
+    and pid == "2"
+    and type(current_hostname) == "string"
+    and hostname == current_hostname
+    and #hostname <= 253
+    and hostname:match("^[%w][%w.-]*$") ~= nil
+    and #created_at == 24
+    and created_at:match("^%d%d%d%d%-%d%d%-%d%dT%d%d:%d%d:%d%d%.%d%d%dZ$") ~= nil
+end
+
+local function valid_probe_sqlite_files(database, shared_memory, write_ahead_log, filesystem)
+  local wal_header = string.char(
+    0x37,
+    0x7f,
+    0x06,
+    0x82,
+    0x00,
+    0x2d,
+    0xe2,
+    0x18,
+    0x00,
+    0x00,
+    0x10,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00
+  )
+  if
+    #database ~= 4096
+    or filesystem.sha256(database) ~= OPENCODE_PROBE_DB_SHA256
+    or #shared_memory ~= 32768
+    or shared_memory:sub(1, 4) ~= string.char(0x18, 0xe2, 0x2d, 0x00)
+    or shared_memory:sub(1, 48) ~= shared_memory:sub(49, 96)
+    or #write_ahead_log ~= 259592
+    or write_ahead_log:sub(1, 16) ~= wal_header
+    or write_ahead_log:sub(17, 24) ~= shared_memory:sub(33, 40)
+    or forbidden_probe_artifact(database)
+    or forbidden_probe_artifact(shared_memory)
+    or forbidden_probe_artifact(write_ahead_log)
+  then
+    return false
+  end
+  for _, marker in ipairs({
+    "SQLite format 3\0",
+    "20260127222353_familiar_lady_ursula",
+    "20260622202450_simplify_session_input",
+    "CREATE TABLE `credential`",
+  }) do
+    if not write_ahead_log:find(marker, 1, true) then
+      return false
+    end
+  end
+  local salts = write_ahead_log:sub(17, 24)
+  for offset = 33, #write_ahead_log, 4120 do
+    if
+      offset + 4119 > #write_ahead_log or write_ahead_log:sub(offset + 8, offset + 15) ~= salts
+    then
+      return false
+    end
+  end
+  return true
+end
+
+local function inspect_opencode_probe_artifacts(tree, semantic, overrides)
+  local filesystem = probe_artifact_filesystem(overrides)
+  if not validate_probe_inputs(tree, filesystem) then
+    return nil
+  end
+  if
+    not exact_probe_directory(tree.data, { "opencode" }, filesystem)
+    or not exact_probe_directory(tree.cache, { "opencode" }, filesystem)
+    or not exact_probe_directory(tree.state, { "opencode" }, filesystem)
+  then
+    return nil
+  end
+  local data = tree.data .. "/opencode"
+  local cache = tree.cache .. "/opencode"
+  local state = tree.state .. "/opencode"
+  local data_entries = semantic
+      and { "log", "opencode.db", "opencode.db-shm", "opencode.db-wal", "repos" }
+    or { "log", "repos" }
+  if
+    not exact_probe_directory(data, data_entries, filesystem)
+    or not exact_probe_directory(data .. "/log", semantic and { "opencode.log" } or {}, filesystem)
+    or not exact_probe_directory(data .. "/repos", {}, filesystem)
+    or not exact_probe_directory(cache, { "bin" }, filesystem)
+    or not exact_probe_directory(cache .. "/bin", {}, filesystem)
+    or not exact_probe_directory(state, semantic and { "locks" } or {}, filesystem)
+  then
+    return nil
+  end
+  if not semantic then
+    return true
+  end
+  local lock_root = state .. "/locks"
+  local lock = lock_root .. "/" .. OPENCODE_PROBE_LOCK
+  if
+    not exact_probe_directory(lock_root, { OPENCODE_PROBE_LOCK }, filesystem)
+    or not exact_probe_directory(lock, { "heartbeat", "meta.json" }, filesystem)
+  then
+    return nil
+  end
+  local log = read_probe_file(data .. "/log/opencode.log", 0, filesystem)
+  local heartbeat = read_probe_file(lock .. "/heartbeat", 0, filesystem)
+  local metadata = read_probe_file(lock .. "/meta.json", 512, filesystem)
+  local database = read_probe_file(data .. "/opencode.db", 4096, filesystem)
+  local shared_memory = read_probe_file(data .. "/opencode.db-shm", 32768, filesystem)
+  local write_ahead_log = read_probe_file(data .. "/opencode.db-wal", 259592, filesystem)
+  if
+    log ~= ""
+    or heartbeat ~= ""
+    or not metadata
+    or not database
+    or not shared_memory
+    or not write_ahead_log
+    or not valid_probe_lock_metadata(metadata, filesystem)
+    or not valid_probe_sqlite_files(database, shared_memory, write_ahead_log, filesystem)
+  then
+    return nil
+  end
+  return true
 end
 
 local function valid_probe_result(result)
@@ -401,45 +885,72 @@ local function opencode_compatibility(executable, overrides)
     return vim.deepcopy(cached.report)
   end
 
-  local tree
-  local owns_tree = false
-  if options.probe then
-    tree = options.tree
-      or {
-        home = "/tmp/nvim-ai-opencode-probe-home",
-        config = "/tmp/nvim-ai-opencode-probe-config",
-      }
-  else
-    local tree_error
-    tree, tree_error = create_opencode_probe_tree()
-    if not tree then
-      return nil, tree_error
-    end
-    owns_tree = true
-  end
-  local probe_options = {
-    environment = opencode_probe_environment(),
-    working_directory = "/tmp/nvim-ai-probe",
-    read_only_mounts = {
-      { source = tree.home, destination = "/tmp/nvim-ai-probe/home" },
-      { source = tree.config, destination = "/tmp/nvim-ai-probe/xdg-config" },
-    },
-  }
-  local function run(arguments)
+  local function run(name, arguments)
     local check_ok, check = pcall(revalidate, canonical)
     if not check_ok or not check then
       return nil
     end
+    local tree
+    local owns_tree = false
+    if options.probe then
+      tree = options.tree
+        or {
+          home = "/tmp/nvim-ai-opencode-probe-home",
+          config = "/tmp/nvim-ai-opencode-probe-config",
+          data = "/tmp/nvim-ai-opencode-probe-data",
+          cache = "/tmp/nvim-ai-opencode-probe-cache",
+          state = "/tmp/nvim-ai-opencode-probe-state",
+        }
+    else
+      local tree_error
+      tree, tree_error = create_opencode_probe_tree()
+      if not tree then
+        return nil
+      end
+      owns_tree = true
+    end
+    local probe_options = {
+      environment = opencode_probe_environment(),
+      working_directory = "/tmp/nvim-ai-probe",
+      read_only_mounts = {
+        { source = tree.home, destination = "/tmp/nvim-ai-probe/home" },
+        { source = tree.config, destination = "/tmp/nvim-ai-probe/xdg-config" },
+      },
+      writable_mounts = {
+        { source = tree.data, destination = "/tmp/nvim-ai-probe/xdg-data" },
+        { source = tree.cache, destination = "/tmp/nvim-ai-probe/xdg-cache" },
+        { source = tree.state, destination = "/tmp/nvim-ai-probe/xdg-state" },
+      },
+    }
     local ok, result
     if options.probe then
       ok, result =
         pcall(options.probe, canonical, vim.deepcopy(arguments), vim.deepcopy(probe_options))
+      if options.inspect_artifacts ~= nil then
+        local inspection_ok, accepted =
+          pcall(options.inspect_artifacts, name, vim.deepcopy(tree), result)
+        if not inspection_ok or accepted ~= true then
+          ok = false
+          result = nil
+        end
+      end
     else
+      probe_options.inspect_artifacts = function()
+        local semantic = name ~= "version"
+          and name ~= "root_help"
+          and name ~= "serve_help"
+          and name ~= "attach_help"
+        return inspect_opencode_probe_artifacts(tree, semantic)
+      end
       ok, result = pcall(read_only_probe, canonical, arguments, probe_options)
+    end
+    if owns_tree then
+      pcall(vim.fn.delete, tree.root, "rf")
     end
     if
       not ok
       or not valid_probe_result(result)
+      or result.code == 125
       or #result.stdout > MAX_COMPATIBILITY_REPORT_BYTES
       or #result.stderr > MAX_HELP_BYTES
     then
@@ -478,16 +989,10 @@ local function opencode_compatibility(executable, overrides)
   }
   local results = {}
   for _, name in ipairs(order) do
-    results[name] = run(commands[name])
+    results[name] = run(name, commands[name])
     if not results[name] then
-      if owns_tree then
-        pcall(vim.fn.delete, tree.root, "rf")
-      end
       return nil, "managed OpenCode compatibility probe failed"
     end
-  end
-  if owns_tree then
-    pcall(vim.fn.delete, tree.root, "rf")
   end
 
   local forbidden_evidence = {
@@ -518,16 +1023,19 @@ local function opencode_compatibility(executable, overrides)
 
   local help_requirements = {
     root_help = { "--pure", "serve", "attach" },
-    serve_help = { "--hostname", "--port", "OPENCODE_SERVER_PASSWORD" },
-    attach_help = { "--dir", "--session" },
+    serve_help = { "--hostname", "--port" },
+    attach_help = { "--dir", "--session", "OPENCODE_SERVER_PASSWORD" },
   }
   for name, requirements in pairs(help_requirements) do
     local result = results[name]
-    if result.code ~= 0 or result.stderr ~= "" or #result.stdout > MAX_HELP_BYTES then
+    if result.code ~= 0 or result.stdout ~= "" or result.stderr == "" then
+      return nil, "managed OpenCode command compatibility probe failed"
+    end
+    if #result.stderr > MAX_HELP_BYTES then
       return nil, "managed OpenCode command compatibility probe failed"
     end
     for _, requirement in ipairs(requirements) do
-      if not result.stdout:find(requirement, 1, true) then
+      if not result.stderr:find(requirement, 1, true) then
         return nil, "managed OpenCode command compatibility probe failed"
       end
     end
@@ -570,10 +1078,13 @@ local function opencode_compatibility(executable, overrides)
       return nil, "managed OpenCode agent probe failed"
     end
     if name == "build" or name == "plan" then
+      if not vim.deep_equal(decoded.tools, OPENCODE_PRIMARY_TOOLS) then
+        return nil, "managed OpenCode primary-agent tool probe failed"
+      end
       agents[name] = {
         native = decoded.native,
         mode = decoded.mode,
-        tools = decoded.tools,
+        tools = {},
         permission = decoded.permission,
       }
     else
@@ -587,7 +1098,9 @@ local function opencode_compatibility(executable, overrides)
   end
   for _, name in ipairs({ "general", "explore" }) do
     local result = results[name]
-    local expected = "Agent " .. name .. " not found"
+    local expected = "Agent "
+      .. name
+      .. " not found, run 'opencode agent list' to get an agent list"
     local output = result.stderr ~= "" and result.stderr or result.stdout
     if
       result.code == 0
@@ -602,14 +1115,15 @@ local function opencode_compatibility(executable, overrides)
     version = "1.18.18",
     help = {
       root = { "--pure", "serve", "attach" },
-      serve = { "--hostname", "--port", "OPENCODE_SERVER_PASSWORD" },
-      attach = { "--dir", "--session" },
+      serve = { "--hostname", "--port" },
+      attach = { "--dir", "--session", "OPENCODE_SERVER_PASSWORD" },
     },
     names = names,
     agents = agents,
   }
   local managed = require("ai.backends.opencode_managed")
-  if not managed.validate_compatibility(report) then
+  local compatible = managed.validate_compatibility(report)
+  if not compatible then
     return nil, "managed OpenCode compatibility validation failed"
   end
   local final_ok, final_valid = pcall(revalidate, canonical)
@@ -1308,6 +1822,8 @@ end
 
 M._test = {
   auth_arguments = auth_arguments,
+  create_opencode_probe_tree = create_opencode_probe_tree,
+  inspect_opencode_probe_artifacts = inspect_opencode_probe_artifacts,
   invoke_profile_helper = invoke_profile_helper,
   new = new,
   opencode_compatibility = opencode_compatibility,

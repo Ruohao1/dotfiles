@@ -43,6 +43,16 @@ eq(config.autoupdate, false, "configuration also disables updates")
 eq(config.permission, managed.policy(), "file and environment policies agree")
 eq(managed.config_json(), expected_config_json, "canonical managed configuration")
 eq(vim.json.decode(managed.config_json()), config, "table and JSON configurations agree")
+eq(
+  managed.bootstrap_gitignore(),
+  "node_modules\npackage.json\npackage-lock.json\nbun.lock\n.gitignore",
+  "canonical OpenCode configuration bootstrap"
+)
+eq(
+  managed.bootstrap_gitignore_sha256(),
+  "663a068e76d264d0bc6740f5450b6c4193c7b41ecf5e0dc222485b8a17404d95",
+  "canonical OpenCode configuration bootstrap digest"
+)
 eq(config.agent.general, { disable = true }, "general subagent disabled")
 eq(config.agent.explore, { disable = true }, "explore subagent disabled")
 for _, name in ipairs({ "compaction", "summary", "title" }) do
@@ -252,6 +262,21 @@ local audited_hidden_tool_map = {
   websearch = false,
   skill = false,
 }
+local audited_primary_tool_map = {
+  invalid = true,
+  question = true,
+  bash = true,
+  read = true,
+  glob = true,
+  grep = true,
+  edit = true,
+  write = true,
+  task = false,
+  webfetch = true,
+  todowrite = true,
+  websearch = true,
+  skill = false,
+}
 
 local function audited_primary_permissions(edit_action)
   local rules = {
@@ -295,8 +320,8 @@ local function audited_compatibility_report()
     version = "1.18.18",
     help = {
       root = { "--pure", "serve", "attach" },
-      serve = { "--hostname", "--port", "OPENCODE_SERVER_PASSWORD" },
-      attach = { "--dir", "--session" },
+      serve = { "--hostname", "--port" },
+      attach = { "--dir", "--session", "OPENCODE_SERVER_PASSWORD" },
     },
     names = { "build", "compaction", "plan", "summary", "title" },
     agents = {
@@ -876,12 +901,26 @@ local semantic_probe = registry_module._test.read_only_probe("/usr/bin/opencode"
     assert(path == "/usr/bin/opencode" or path == "/usr/bin/bwrap")
     return true
   end,
+  lstat = function()
+    return { type = "directory", uid = 1000, mode = 448 }
+  end,
+  getuid = function()
+    return 1000
+  end,
   environment = { HOME = "/tmp/nvim-ai-probe/home", OPENCODE_PURE = "true" },
   working_directory = "/tmp/nvim-ai-probe",
   read_only_mounts = {
     { source = "/tmp/probe-home", destination = "/tmp/nvim-ai-probe/home" },
     { source = "/tmp/probe-config", destination = "/tmp/nvim-ai-probe/xdg-config" },
   },
+  writable_mounts = {
+    { source = "/tmp/probe-data", destination = "/tmp/nvim-ai-probe/xdg-data" },
+    { source = "/tmp/probe-cache", destination = "/tmp/nvim-ai-probe/xdg-cache" },
+    { source = "/tmp/probe-state", destination = "/tmp/nvim-ai-probe/xdg-state" },
+  },
+  inspect_artifacts = function()
+    return true
+  end,
   run = function(argv, options)
     semantic_probe_argv = vim.deepcopy(argv)
     semantic_probe_options = vim.deepcopy(options)
@@ -912,12 +951,27 @@ eq(semantic_probe_argv, {
   "/tmp/nvim-ai-probe/home",
   "--dir",
   "/tmp/nvim-ai-probe/xdg-config",
+  "--dir",
+  "/tmp/nvim-ai-probe/xdg-data",
+  "--dir",
+  "/tmp/nvim-ai-probe/xdg-cache",
+  "--dir",
+  "/tmp/nvim-ai-probe/xdg-state",
   "--ro-bind",
   "/tmp/probe-home",
   "/tmp/nvim-ai-probe/home",
   "--ro-bind",
   "/tmp/probe-config",
   "/tmp/nvim-ai-probe/xdg-config",
+  "--bind",
+  "/tmp/probe-data",
+  "/tmp/nvim-ai-probe/xdg-data",
+  "--bind",
+  "/tmp/probe-cache",
+  "/tmp/nvim-ai-probe/xdg-cache",
+  "--bind",
+  "/tmp/probe-state",
+  "/tmp/nvim-ai-probe/xdg-state",
   "--chdir",
   "/tmp/nvim-ai-probe",
   "--",
@@ -930,6 +984,29 @@ eq(semantic_probe_options.env, {
   OPENCODE_PURE = "true",
 }, "semantic probe admits only the exact environment")
 eq(semantic_probe_options.timeout, 2000, "semantic probe command timeout")
+
+local raised_probe_inspected = false
+local raised_probe = registry_module._test.read_only_probe("/usr/bin/opencode", {}, {
+  resolve = function()
+    return "/usr/bin/bwrap"
+  end,
+  revalidate = function()
+    return true
+  end,
+  run = function()
+    error("probe-artifact-secret-canary")
+  end,
+  inspect_artifacts = function(result)
+    raised_probe_inspected = type(result) == "string"
+    return true
+  end,
+})
+assert(raised_probe_inspected, "probe artifacts were not inspected after runner exception")
+eq(raised_probe.code, 126, "runner exception fails the probe boundary")
+assert(
+  not raised_probe.stderr:find("probe-artifact-secret-canary", 1, true),
+  "runner exception leaked through the probe boundary"
+)
 
 local real_probe_root = vim.fn.tempname()
 assert(vim.fn.mkdir(real_probe_root, "p", 448) == 1, "create real probe fixture root")
@@ -976,8 +1053,8 @@ local compatibility_options = {
     local outputs = {
       ["--version"] = "1.18.18\n",
       ["--help"] = "--pure serve attach",
-      ["serve\0--help"] = "--hostname --port OPENCODE_SERVER_PASSWORD",
-      ["attach\0--help"] = "--dir --session",
+      ["serve\0--help"] = "--hostname --port",
+      ["attach\0--help"] = "--dir --session OPENCODE_SERVER_PASSWORD",
       ["--pure\0agent\0list"] = table.concat({
         "build (primary)",
         "compaction (subagent)",
@@ -988,15 +1065,29 @@ local compatibility_options = {
     }
     local agent = key:match("^%-%-pure%zdebug%zagent%z(.+)$")
     if agent == "general" or agent == "explore" then
-      return { code = 1, signal = 0, stdout = "", stderr = "Agent " .. agent .. " not found\n" }
+      return {
+        code = 1,
+        signal = 0,
+        stdout = "",
+        stderr = "Agent "
+          .. agent
+          .. " not found, run 'opencode agent list' to get an agent list\n",
+      }
     end
     if agent then
+      local report = vim.deepcopy(good.agents[agent])
+      if agent == "build" or agent == "plan" then
+        report.tools = vim.deepcopy(audited_primary_tool_map)
+      end
       return {
         code = 0,
         signal = 0,
-        stdout = vim.json.encode(good.agents[agent]) .. "\n",
+        stdout = vim.json.encode(report) .. "\n",
         stderr = "",
       }
+    end
+    if key == "--help" or key == "serve\0--help" or key == "attach\0--help" then
+      return { code = 0, signal = 0, stdout = "", stderr = assert(outputs[key]) }
     end
     return { code = 0, signal = 0, stdout = assert(outputs[key]), stderr = "" }
   end,
@@ -1030,6 +1121,30 @@ for _, call in ipairs(compatibility_calls) do
     XDG_STATE_HOME = "/tmp/nvim-ai-probe/xdg-state",
   }, "exact clear OpenCode probe environment")
   eq(call.options.working_directory, "/tmp/nvim-ai-probe", "fixed OpenCode probe working directory")
+  eq(call.options.read_only_mounts, {
+    {
+      source = "/tmp/nvim-ai-opencode-probe-home",
+      destination = "/tmp/nvim-ai-probe/home",
+    },
+    {
+      source = "/tmp/nvim-ai-opencode-probe-config",
+      destination = "/tmp/nvim-ai-probe/xdg-config",
+    },
+  }, "exact OpenCode probe read-only mounts")
+  eq(call.options.writable_mounts, {
+    {
+      source = "/tmp/nvim-ai-opencode-probe-data",
+      destination = "/tmp/nvim-ai-probe/xdg-data",
+    },
+    {
+      source = "/tmp/nvim-ai-opencode-probe-cache",
+      destination = "/tmp/nvim-ai-probe/xdg-cache",
+    },
+    {
+      source = "/tmp/nvim-ai-opencode-probe-state",
+      destination = "/tmp/nvim-ai-probe/xdg-state",
+    },
+  }, "exact OpenCode probe writable mounts")
 end
 
 assert(registry_module._test.opencode_compatibility("/usr/bin/opencode", compatibility_options))
@@ -1097,5 +1212,323 @@ for _, case in ipairs(probe_failure_cases) do
   )
 end
 compatibility_options.probe = successful_probe
+
+local artifact_failures = {}
+registry_module._test.reset_opencode_compatibility_cache()
+compatibility_metadata = compatibility_metadata + 1
+local injected_artifact_options = vim.tbl_extend("force", {}, compatibility_options, {
+  inspect_artifacts = function()
+    return nil, "probe-artifact-secret-canary"
+  end,
+})
+local injected_artifact_report, injected_artifact_error =
+  registry_module._test.opencode_compatibility("/usr/bin/opencode", injected_artifact_options)
+if injected_artifact_report ~= nil then
+  artifact_failures[#artifact_failures + 1] = "injected forbidden artifact was accepted"
+else
+  assert(
+    type(injected_artifact_error) == "string"
+      and not injected_artifact_error:find("probe-artifact-secret-canary", 1, true),
+    "injected artifact diagnostic leaks raw evidence"
+  )
+end
+
+local sentinel_root = vim.fs.joinpath(
+  assert(vim.env.HOME),
+  ".config",
+  ".nvim-ai-opencode-probe-" .. vim.fn.sha256(vim.fn.tempname()):sub(1, 16)
+)
+assert(vim.fn.mkdir(sentinel_root, "p", 448) == 1, "create sentinel probe root")
+local sentinel_paths = {
+  home = sentinel_root .. "/home",
+  config = sentinel_root .. "/xdg-config",
+  data = sentinel_root .. "/xdg-data",
+  cache = sentinel_root .. "/xdg-cache",
+  state = sentinel_root .. "/xdg-state",
+}
+for _, path in pairs(sentinel_paths) do
+  assert(vim.fn.mkdir(path, "", 448) == 1, "create sentinel probe directory")
+end
+local sentinel_executable = sentinel_root .. "/write-xdg-sentinel"
+vim.fn.writefile({
+  "#!/bin/sh",
+  'mkdir -p "$XDG_CACHE_HOME"',
+  'printf forbidden > "$XDG_CACHE_HOME/forbidden-sentinel"',
+  "exit 0",
+}, sentinel_executable)
+assert(vim.uv.fs_chmod(sentinel_executable, 448))
+local resolved_sentinel = assert(require("ai.tools").resolve(sentinel_executable))
+local sentinel_probe = registry_module._test.read_only_probe(resolved_sentinel, {}, {
+  environment = {
+    HOME = "/tmp/nvim-ai-probe/home",
+    XDG_CACHE_HOME = "/tmp/nvim-ai-probe/xdg-cache",
+    XDG_CONFIG_HOME = "/tmp/nvim-ai-probe/xdg-config",
+    XDG_DATA_HOME = "/tmp/nvim-ai-probe/xdg-data",
+    XDG_STATE_HOME = "/tmp/nvim-ai-probe/xdg-state",
+  },
+  working_directory = "/tmp/nvim-ai-probe",
+  read_only_mounts = {
+    { source = sentinel_paths.home, destination = "/tmp/nvim-ai-probe/home" },
+    { source = sentinel_paths.config, destination = "/tmp/nvim-ai-probe/xdg-config" },
+  },
+  writable_mounts = {
+    { source = sentinel_paths.data, destination = "/tmp/nvim-ai-probe/xdg-data" },
+    { source = sentinel_paths.cache, destination = "/tmp/nvim-ai-probe/xdg-cache" },
+    { source = sentinel_paths.state, destination = "/tmp/nvim-ai-probe/xdg-state" },
+  },
+  inspect_artifacts = function()
+    if vim.uv.fs_lstat(sentinel_paths.cache .. "/forbidden-sentinel") then
+      return nil, "probe-artifact-secret-canary"
+    end
+    return true
+  end,
+})
+vim.fn.delete(sentinel_root, "rf")
+if sentinel_probe.code ~= 125 then
+  artifact_failures[#artifact_failures + 1] = string.format(
+    "real Bubblewrap XDG sentinel was not detected (code=%s, stderr=%s)",
+    tostring(sentinel_probe.code),
+    sentinel_probe.stderr
+  )
+else
+  assert(
+    not sentinel_probe.stderr:find("probe-artifact-secret-canary", 1, true),
+    "real artifact diagnostic leaks raw evidence"
+  )
+end
+
+assert(#artifact_failures == 0, table.concat(artifact_failures, "; "))
+
+local installed_opencode = assert(require("ai.tools").resolve("opencode"))
+local real_artifact_environment = {
+  HOME = "/tmp/nvim-ai-probe/home",
+  OPENCODE_CONFIG_CONTENT = managed.config_json(),
+  OPENCODE_DISABLE_AUTOUPDATE = "true",
+  OPENCODE_DISABLE_CLAUDE_CODE = "true",
+  OPENCODE_DISABLE_EXTERNAL_SKILLS = "true",
+  OPENCODE_DISABLE_LSP_DOWNLOAD = "true",
+  OPENCODE_DISABLE_PROJECT_CONFIG = "true",
+  OPENCODE_PERMISSION = managed.policy_json(),
+  OPENCODE_PURE = "true",
+  XDG_CACHE_HOME = "/tmp/nvim-ai-probe/xdg-cache",
+  XDG_CONFIG_HOME = "/tmp/nvim-ai-probe/xdg-config",
+  XDG_DATA_HOME = "/tmp/nvim-ai-probe/xdg-data",
+  XDG_STATE_HOME = "/tmp/nvim-ai-probe/xdg-state",
+}
+
+local function real_artifact_probe_options(tree)
+  return {
+    environment = vim.deepcopy(real_artifact_environment),
+    working_directory = "/tmp/nvim-ai-probe",
+    read_only_mounts = {
+      { source = tree.home, destination = "/tmp/nvim-ai-probe/home" },
+      { source = tree.config, destination = "/tmp/nvim-ai-probe/xdg-config" },
+    },
+    writable_mounts = {
+      { source = tree.data, destination = "/tmp/nvim-ai-probe/xdg-data" },
+      { source = tree.cache, destination = "/tmp/nvim-ai-probe/xdg-cache" },
+      { source = tree.state, destination = "/tmp/nvim-ai-probe/xdg-state" },
+    },
+    inspect_artifacts = function()
+      return true
+    end,
+  }
+end
+
+local function fixture_read(path)
+  local stat = assert(vim.uv.fs_lstat(path))
+  local descriptor = assert(vim.uv.fs_open(path, "r", 0))
+  local bytes = stat.size == 0 and "" or assert(vim.uv.fs_read(descriptor, stat.size, 0))
+  assert(vim.uv.fs_close(descriptor))
+  return bytes
+end
+
+local function fixture_write(path, bytes)
+  local descriptor = assert(vim.uv.fs_open(path, "w", 384))
+  if #bytes > 0 then
+    eq(vim.uv.fs_write(descriptor, bytes, 0), #bytes, "complete artifact-fixture write")
+  end
+  assert(vim.uv.fs_fsync(descriptor))
+  assert(vim.uv.fs_close(descriptor))
+  assert(vim.uv.fs_chmod(path, 384))
+end
+
+local artifact_trees = {}
+local artifact_summaries = {}
+for index = 1, 2 do
+  local tree = assert(registry_module._test.create_opencode_probe_tree())
+  artifact_trees[index] = tree
+  local result = registry_module._test.read_only_probe(
+    installed_opencode,
+    { "--pure", "agent", "list" },
+    real_artifact_probe_options(tree)
+  )
+  assert(result.code == 0, "clean real OpenCode artifact fixture failed")
+  assert(
+    registry_module._test.inspect_opencode_probe_artifacts(tree, true),
+    "production artifact inspector rejected a clean real OpenCode fixture"
+  )
+  local database = tree.data .. "/opencode/opencode.db"
+  local shared_memory = tree.data .. "/opencode/opencode.db-shm"
+  local write_ahead_log = tree.data .. "/opencode/opencode.db-wal"
+  artifact_summaries[index] = {
+    lock = assert(
+      vim.uv.fs_lstat(tree.state .. "/opencode/locks/0a009c556ac8352fed53ef8323a3a97270935d30.lock")
+    ).type,
+    database_sha256 = vim.fn.sha256(fixture_read(database)),
+    database_size = assert(vim.uv.fs_lstat(database)).size,
+    shared_memory_size = assert(vim.uv.fs_lstat(shared_memory)).size,
+    write_ahead_log_size = assert(vim.uv.fs_lstat(write_ahead_log)).size,
+  }
+end
+local exact_artifact_summary = {
+  lock = "directory",
+  database_sha256 = "40cf07c52bfaa52b334ef341456f970787f6dc701ffe18ad3c572cb5056dbd70",
+  database_size = 4096,
+  shared_memory_size = 32768,
+  write_ahead_log_size = 259592,
+}
+eq(artifact_summaries[1], exact_artifact_summary, "first clean real artifact shape")
+eq(artifact_summaries[2], exact_artifact_summary, "repeated clean real artifact shape")
+
+local mutation_tree = artifact_trees[1]
+local artifact_paths = {
+  bootstrap = mutation_tree.bootstrap,
+  database = mutation_tree.data .. "/opencode/opencode.db",
+  log = mutation_tree.data .. "/opencode/log/opencode.log",
+  metadata = mutation_tree.state
+    .. "/opencode/locks/0a009c556ac8352fed53ef8323a3a97270935d30.lock/meta.json",
+  heartbeat = mutation_tree.state
+    .. "/opencode/locks/0a009c556ac8352fed53ef8323a3a97270935d30.lock/heartbeat",
+  unknown = mutation_tree.cache .. "/opencode/unknown-artifact",
+  write_ahead_log = mutation_tree.data .. "/opencode/opencode.db-wal",
+}
+local function artifacts_rejected(label, overrides)
+  assert(
+    not registry_module._test.inspect_opencode_probe_artifacts(mutation_tree, true, overrides),
+    label .. " was accepted by the production artifact inspector"
+  )
+end
+
+fixture_write(artifact_paths.unknown, "unknown")
+artifacts_rejected("unknown artifact")
+assert(vim.uv.fs_unlink(artifact_paths.unknown))
+
+fixture_write(artifact_paths.log, "forbidden log")
+artifacts_rejected("nonempty probe log")
+fixture_write(artifact_paths.log, "")
+
+local database_bytes = fixture_read(artifact_paths.database)
+fixture_write(artifact_paths.database, "X" .. database_bytes:sub(2))
+artifacts_rejected("altered probe database")
+fixture_write(artifact_paths.database, database_bytes)
+
+local write_ahead_log_bytes = fixture_read(artifact_paths.write_ahead_log)
+fixture_write(artifact_paths.write_ahead_log, write_ahead_log_bytes:sub(1, -2))
+artifacts_rejected("altered probe write-ahead log")
+fixture_write(artifact_paths.write_ahead_log, write_ahead_log_bytes)
+
+local metadata_bytes = fixture_read(artifact_paths.metadata)
+local altered_metadata, replacements = metadata_bytes:gsub('"pid": 2', '"pid": 3', 1)
+eq(replacements, 1, "lock metadata fixture mutation")
+fixture_write(artifact_paths.metadata, altered_metadata)
+artifacts_rejected("altered probe lock metadata")
+fixture_write(artifact_paths.metadata, metadata_bytes)
+
+assert(vim.uv.fs_chmod(artifact_paths.log, 420))
+artifacts_rejected("wrong artifact mode")
+assert(vim.uv.fs_chmod(artifact_paths.log, 384))
+
+artifacts_rejected("wrong artifact owner", {
+  lstat = function(path)
+    local stat = vim.uv.fs_lstat(path)
+    if path == artifact_paths.log and stat then
+      stat = vim.deepcopy(stat)
+      stat.uid = stat.uid + 1
+    end
+    return stat
+  end,
+})
+
+assert(vim.uv.fs_unlink(artifact_paths.heartbeat))
+assert(vim.uv.fs_symlink(artifact_paths.log, artifact_paths.heartbeat))
+artifacts_rejected("artifact symlink")
+assert(vim.uv.fs_unlink(artifact_paths.heartbeat))
+fixture_write(artifact_paths.heartbeat, "")
+
+local replacement_lstat_calls = 0
+artifacts_rejected("artifact replacement", {
+  lstat = function(path)
+    local stat = vim.uv.fs_lstat(path)
+    if path == artifact_paths.database and stat then
+      replacement_lstat_calls = replacement_lstat_calls + 1
+      if replacement_lstat_calls > 1 then
+        stat = vim.deepcopy(stat)
+        stat.ino = stat.ino + 1
+      end
+    end
+    return stat
+  end,
+})
+assert(replacement_lstat_calls > 1, "artifact replacement check did not revalidate identity")
+
+local directory_path = mutation_tree.cache .. "/opencode"
+local directory_lstat_calls = 0
+artifacts_rejected("artifact directory replacement", {
+  lstat = function(path)
+    local stat = vim.uv.fs_lstat(path)
+    if path == directory_path and stat then
+      directory_lstat_calls = directory_lstat_calls + 1
+      if directory_lstat_calls > 1 then
+        stat = vim.deepcopy(stat)
+        stat.ino = stat.ino + 1
+      end
+    end
+    return stat
+  end,
+})
+assert(directory_lstat_calls > 1, "artifact directory replacement was not revalidated")
+
+fixture_write(artifact_paths.unknown, "unknown")
+local parked_directory = mutation_tree.cache .. "/opencode-parked"
+local descriptor_swap_exercised = false
+artifacts_rejected("descriptor-bound directory swap", {
+  scandir = function(path)
+    local target = vim.uv.fs_readlink(path)
+    if not descriptor_swap_exercised and target == directory_path then
+      assert(vim.uv.fs_rename(directory_path, parked_directory))
+      assert(vim.fn.mkdir(directory_path, "", 448) == 1)
+      local request = assert(vim.uv.fs_scandir(path))
+      assert(vim.uv.fs_rmdir(directory_path))
+      assert(vim.uv.fs_rename(parked_directory, directory_path))
+      descriptor_swap_exercised = true
+      return request
+    end
+    return vim.uv.fs_scandir(path)
+  end,
+})
+assert(descriptor_swap_exercised, "artifact enumeration did not use its directory descriptor")
+assert(vim.uv.fs_unlink(artifact_paths.unknown))
+
+local bootstrap_bytes = fixture_read(artifact_paths.bootstrap)
+fixture_write(artifact_paths.bootstrap, bootstrap_bytes .. "\n")
+artifacts_rejected("altered configuration bootstrap")
+fixture_write(artifact_paths.bootstrap, bootstrap_bytes)
+assert(vim.uv.fs_chmod(artifact_paths.bootstrap, 420))
+artifacts_rejected("wrong configuration bootstrap mode")
+assert(vim.uv.fs_chmod(artifact_paths.bootstrap, 384))
+
+for _, tree in ipairs(artifact_trees) do
+  vim.fn.delete(tree.root, "rf")
+end
+
+registry_module._test.reset_opencode_compatibility_cache()
+local installed_compatibility, installed_compatibility_error =
+  registry_module._test.opencode_compatibility(installed_opencode)
+assert(
+  installed_compatibility ~= nil,
+  "real pinned OpenCode compatibility boundary failed: " .. tostring(installed_compatibility_error)
+)
+assert(managed.validate_compatibility(installed_compatibility))
 
 print("AI managed OpenCode assertions: ok")

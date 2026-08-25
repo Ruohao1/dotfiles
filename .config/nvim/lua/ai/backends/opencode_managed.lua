@@ -28,6 +28,9 @@ local POLICY_JSON =
   '{"bash":"ask","doom_loop":"ask","external_directory":"ask","skill":"deny","task":"deny","webfetch":"ask","websearch":"ask"}'
 local CONFIG_JSON =
   '{"$schema":"https://opencode.ai/config.json","autoupdate":false,"permission":{"bash":"ask","doom_loop":"ask","external_directory":"ask","skill":"deny","task":"deny","webfetch":"ask","websearch":"ask"},"agent":{"general":{"disable":true},"explore":{"disable":true},"compaction":{"permission":{"*":"deny"}},"summary":{"permission":{"*":"deny"}},"title":{"permission":{"*":"deny"}}}}'
+local BOOTSTRAP_GITIGNORE = "node_modules\npackage.json\npackage-lock.json\nbun.lock\n.gitignore"
+local BOOTSTRAP_GITIGNORE_SHA256 =
+  "663a068e76d264d0bc6740f5450b6c4193c7b41ecf5e0dc222485b8a17404d95"
 
 local C0_PATTERN = "[%z\1-\31\127]"
 local C1_PATTERN = "\194[\128-\159]"
@@ -36,8 +39,8 @@ local PROBE_PATH = "src/nvim_ai_probe.lua"
 local EXPECTED_NAMES = { "build", "compaction", "plan", "summary", "title" }
 local EXPECTED_HELP = {
   root = { "--pure", "serve", "attach" },
-  serve = { "--hostname", "--port", "OPENCODE_SERVER_PASSWORD" },
-  attach = { "--dir", "--session" },
+  serve = { "--hostname", "--port" },
+  attach = { "--dir", "--session", "OPENCODE_SERVER_PASSWORD" },
 }
 local RISK_PERMISSIONS = { "bash", "webfetch", "websearch", "external_directory", "doom_loop" }
 local DENIED_PERMISSIONS = { "task", "skill" }
@@ -449,6 +452,14 @@ end
 
 function M.config_json()
   return CONFIG_JSON
+end
+
+function M.bootstrap_gitignore()
+  return BOOTSTRAP_GITIGNORE
+end
+
+function M.bootstrap_gitignore_sha256()
+  return BOOTSTRAP_GITIGNORE_SHA256
 end
 
 function M.profile_request(identity, paths, token)
