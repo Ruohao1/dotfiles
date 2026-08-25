@@ -1734,6 +1734,9 @@ def build_bwrap_argv(manifest, launch_argv=None):
         "--tmpfs",
         "/tmp",
     ]
+    for path in _unique_paths(root, manifest["runtime_root"], manifest["state_root"]):
+        if _path_within("/tmp", path):
+            argv += ["--dir", path]
     argv += ["--bind" if manifest["writable"] else "--ro-bind", root, root]
     for grant in manifest["grants"]:
         argv += ["--bind" if manifest["writable"] else "--ro-bind", grant, grant]

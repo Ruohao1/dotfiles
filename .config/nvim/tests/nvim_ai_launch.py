@@ -1013,6 +1013,53 @@ class EnvironmentAndMountTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Claude settings"):
             launcher.build_environment(manifest, {"HOME": str(self.fixture.home)})
 
+    def test_private_tmpfs_destinations_precede_every_host_bind(self) -> None:
+        manifest = self.fixture.manifest()
+        launch = manifest["launch"]
+        assert isinstance(launch, dict)
+        argv = launcher.build_bwrap_argv(manifest, launch["server_argv"])
+        destinations = [
+            str(self.fixture.project),
+            str(self.fixture.runtime_root),
+            str(self.fixture.state_root),
+        ]
+        expected = ["--tmpfs", "/tmp"]
+        for destination in destinations:
+            expected.extend(["--dir", destination])
+        tmpfs = argv.index("--tmpfs")
+        self.assertEqual(argv[tmpfs : tmpfs + len(expected)], expected)
+
+        separator = argv.index("--")
+        namespace = argv[:separator]
+        pairs = windows(namespace, 2)
+        first_host_bind = min(
+            index
+            for index in range(tmpfs + 2, separator)
+            if argv[index] in ("--bind", "--ro-bind")
+        )
+        for destination in destinations:
+            pair = ["--dir", destination]
+            self.assertEqual(pairs.count(pair), 1)
+            self.assertLess(pairs.index(pair), first_host_bind)
+
+        outside = copy.deepcopy(manifest)
+        outside["root"] = "/work/repo"
+        outside["runtime_root"] = "/run/user/1000/nvim-ai"
+        outside["state_root"] = "/state/nvim-ai"
+        outside_launch = outside["launch"]
+        assert isinstance(outside_launch, dict)
+        outside_argv = launcher.build_bwrap_argv(
+            outside, outside_launch["server_argv"]
+        )
+        outside_namespace = outside_argv[: outside_argv.index("--")]
+        outside_pairs = windows(outside_namespace, 2)
+        for destination in (
+            outside["root"],
+            outside["runtime_root"],
+            outside["state_root"],
+        ):
+            self.assertNotIn(["--dir", destination], outside_pairs)
+
     def test_read_only_mount_order_masks_root_git_tmux_and_managed_profile(self) -> None:
         manifest = self.fixture.manifest()
         manifest["tmux_socket"] = str(self.fixture.runtime_root / "tmux.sock")
