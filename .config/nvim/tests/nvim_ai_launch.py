@@ -1055,6 +1055,109 @@ class InheritedBoundaryTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "owner"):
                     self.validate()
 
+    def test_every_trusted_program_and_helper_rejects_a_safe_third_uid(self) -> None:
+        third_uid = os.getuid() + 1000
+
+        def executable(name: str) -> pathlib.Path:
+            path = self.fixture.private_file(
+                self.fixture.base / "trusted-owner" / name,
+                b"#!/bin/sh\nexit 0\n",
+            )
+            os.chmod(path, 0o700)
+            return path
+
+        cases: list[tuple[str, dict[str, object], pathlib.Path]] = []
+        for field in ("python", "bwrap", "shell"):
+            manifest = self.fixture.manifest()
+            path = executable(field)
+            manifest[field] = str(path)
+            cases.append((field, manifest, path))
+
+        for field in (
+            "review_helper",
+            "control_helper",
+            "event_helper",
+            "profile_helper",
+        ):
+            manifest = self.fixture.manifest()
+            path = self.fixture.private_file(
+                self.fixture.base / "trusted-owner" / field,
+                b"helper\n",
+            )
+            manifest[field] = str(path)
+            cases.append((field, manifest, path))
+
+        launcher_manifest = self.fixture.manifest()
+        cases.append(("launcher", launcher_manifest, LAUNCHER_PATH.resolve()))
+
+        host_tool_manifest = self.fixture.manifest()
+        host_tool = executable("host-tools/git")
+        host_tool_manifest["host_tools"] = [str(host_tool)]
+        cases.append(("host tool", host_tool_manifest, host_tool))
+
+        direct_manifest = self.fixture.direct_manifest()
+        direct_launch = direct_manifest["launch"]
+        assert isinstance(direct_launch, dict)
+        direct_backend = executable("direct-backend")
+        direct_launch["argv"][0] = str(direct_backend)
+        direct_launch["protected_paths"] = [str(direct_backend)]
+        cases.append(("direct backend", direct_manifest, direct_backend))
+
+        managed_manifest = self.fixture.manifest()
+        managed_launch = managed_manifest["launch"]
+        assert isinstance(managed_launch, dict)
+        managed_backend = executable("managed-backend")
+        managed_launch["server_argv"][0] = str(managed_backend)
+        managed_launch["attach_argv"][0] = str(managed_backend)
+        managed_launch["protected_paths"] = sorted(
+            [str(managed_backend), str(self.fixture.profile_root)]
+        )
+        cases.append(("managed backend", managed_manifest, managed_backend))
+
+        real_lstat = launcher.os.lstat
+        for label, manifest, target in cases:
+            with self.subTest(label=label):
+                def third_owner(path: str) -> os.stat_result | StatProxy:
+                    metadata = real_lstat(path)
+                    if os.fspath(path) == str(target):
+                        return StatProxy(metadata, st_uid=third_uid)
+                    return metadata
+
+                with mock.patch.object(
+                    launcher.os, "lstat", side_effect=third_owner
+                ):
+                    with mock.patch.object(
+                        launcher, "_safe_nonuser_path", return_value=True
+                    ):
+                        with self.assertRaisesRegex(ValueError, "owner"):
+                            self.validate(manifest)
+
+    def test_trusted_nodes_accept_root_and_current_user_ownership(self) -> None:
+        path = self.fixture.private_file(
+            self.fixture.base / "trusted-owner" / "accepted",
+            b"#!/bin/sh\nexit 0\n",
+        )
+        os.chmod(path, 0o700)
+        real_lstat = launcher.os.lstat
+        for owner, safe_nonuser in ((os.getuid(), False), (0, True)):
+            with self.subTest(owner=owner):
+                def selected_owner(candidate: str) -> os.stat_result | StatProxy:
+                    metadata = real_lstat(candidate)
+                    if os.fspath(candidate) == str(path):
+                        return StatProxy(metadata, st_uid=owner)
+                    return metadata
+
+                with mock.patch.object(
+                    launcher.os, "lstat", side_effect=selected_owner
+                ):
+                    with mock.patch.object(
+                        launcher,
+                        "_safe_nonuser_path",
+                        return_value=safe_nonuser,
+                    ):
+                        launcher._validate_executable(str(path), "trusted executable")
+                        launcher._validate_trusted_file(str(path), "trusted helper")
+
     def test_host_tools_are_exact_sorted_unique_and_safe(self) -> None:
         for tools in (
             [],
@@ -1525,24 +1628,119 @@ class ProcessBoundaryTests(unittest.TestCase):
         launcher._ACTIVE_CHILDREN.clear()
         self.addCleanup(launcher._ACTIVE_CHILDREN.clear)
 
-    def test_server_attach_uses_one_environment_and_always_terminates_server(self) -> None:
+    def test_server_attach_opens_only_after_attach_starts_and_before_its_wait(self) -> None:
         manifest = self.fixture.manifest()
         environment = launcher.build_environment(manifest, dict(os.environ))
         server = FakeProcess()
         attach = FakeProcess(wait_code=0)
+        order: list[str] = []
+
+        def start_child(*_args: object, **_options: object) -> FakeProcess:
+            if not order:
+                order.append("server start")
+                return server
+            order.append("attach start")
+            return attach
+
+        def attach_wait(timeout: float | None = None) -> int:
+            del timeout
+            order.append("attach wait")
+            attach.running = False
+            return 0
+
+        attach.wait = mock.Mock(side_effect=attach_wait)
         descriptors = [os.open(os.devnull, os.O_WRONLY), os.open(os.devnull, os.O_WRONLY)]
         with mock.patch.object(launcher, "_open_server_output", side_effect=descriptors):
-            with mock.patch.object(launcher, "_wait_for_server"):
+            with mock.patch.object(
+                launcher,
+                "_wait_for_server",
+                side_effect=lambda *_args: order.append("readiness"),
+            ):
                 with mock.patch.object(
-                    launcher, "_start_child", side_effect=[server, attach]
+                    launcher, "_start_child", side_effect=start_child
                 ) as start:
-                    with mock.patch.object(launcher, "append_event") as event:
-                        self.assertEqual(launcher.run_backend(manifest, environment), 0)
+                    with mock.patch.object(
+                        launcher,
+                        "append_event",
+                        side_effect=lambda _manifest, state: order.append(
+                            state + " event"
+                        ),
+                    ) as event:
+                        self.assertEqual(
+                            launcher.run_backend(
+                                manifest,
+                                environment,
+                                on_start=lambda: order.append("on_start"),
+                            ),
+                            0,
+                        )
         self.assertEqual(start.call_count, 2)
         self.assertIs(start.call_args_list[0].args[1], environment)
         self.assertIs(start.call_args_list[1].args[1], environment)
         self.assertTrue(server.terminated)
         event.assert_called_once_with(manifest, "open")
+        self.assertEqual(
+            order,
+            [
+                "server start",
+                "on_start",
+                "readiness",
+                "attach start",
+                "open event",
+                "attach wait",
+            ],
+        )
+
+    def test_attach_start_failure_emits_failed_but_never_open(self) -> None:
+        manifest = self.fixture.manifest()
+        environment = launcher.build_environment(manifest, dict(os.environ))
+        server = FakeProcess()
+        order: list[str] = []
+
+        def start_child(*_args: object, **_options: object) -> FakeProcess:
+            if not order:
+                order.append("server start")
+                return server
+            order.append("attach start")
+            raise OSError("attach refused")
+
+        descriptors = [os.open(os.devnull, os.O_WRONLY), os.open(os.devnull, os.O_WRONLY)]
+        with mock.patch.object(launcher, "_open_server_output", side_effect=descriptors):
+            with mock.patch.object(
+                launcher,
+                "_wait_for_server",
+                side_effect=lambda *_args: order.append("readiness"),
+            ):
+                with mock.patch.object(
+                    launcher, "_start_child", side_effect=start_child
+                ):
+                    with mock.patch.object(
+                        launcher,
+                        "append_event",
+                        side_effect=lambda _manifest, state: order.append(
+                            state + " event"
+                        ),
+                    ) as event:
+                        with self.assertRaisesRegex(
+                            ValueError, "server or attach client"
+                        ):
+                            launcher.run_backend(
+                                manifest,
+                                environment,
+                                on_start=lambda: order.append("on_start"),
+                            )
+        self.assertTrue(server.terminated)
+        self.assertEqual(event.call_args_list, [mock.call(manifest, "failed")])
+        self.assertEqual(
+            order,
+            [
+                "server start",
+                "on_start",
+                "readiness",
+                "attach start",
+                "failed event",
+            ],
+        )
 
     def test_forwarded_signals_reach_each_active_child(self) -> None:
         first = FakeProcess()
@@ -1801,6 +1999,31 @@ class ProcessBoundaryTests(unittest.TestCase):
         )
         self.assertFalse(destination.exists())
         self.assertTrue(path.exists())
+
+
+class RealHarnessContractTests(unittest.TestCase):
+    def test_preserved_profile_and_staging_namespaces_cover_all_mutations(self) -> None:
+        harness = (ROOT / "tests" / "nvim-ai-sandbox.sh").read_text(
+            encoding="utf-8"
+        )
+        required = (
+            "HARNESS_PROFILES_PRESERVED=",
+            "HARNESS_PROFILES_EMPTY=",
+            "HARNESS_STAGING_PRESERVED=",
+            "HARNESS_STAGING_EMPTY=",
+            'if mkdir "$profiles_root/hostile"',
+            'if mv "$profiles_preserved"',
+            'if rm "$profiles_preserved/marker"',
+            'if rmdir "$profiles_empty"',
+            'if mkdir "$backends_parent/.opencode-profile-hostile.tmp"',
+            'if mv "$staging_preserved"',
+            'if rm "$staging_preserved/marker"',
+            'if rmdir "$staging_empty"',
+            '$(cat "$HARNESS_PROFILES_PRESERVED/marker")" = profiles-preserved',
+            '$(cat "$HARNESS_STAGING_PRESERVED/marker")" = staging-preserved',
+        )
+        missing = [snippet for snippet in required if snippet not in harness]
+        self.assertEqual(missing, [])
 
 
 class DescriptorAndEventTests(unittest.TestCase):

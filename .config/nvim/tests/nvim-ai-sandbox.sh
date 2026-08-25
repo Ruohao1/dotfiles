@@ -43,6 +43,10 @@ if [ "${1:-}" = "--pure" ]; then
   expected_fingerprint=$4
   expected_home_mask=$5
   shift 5
+  profiles_preserved=$profiles_root/harness-preserved
+  profiles_empty=$profiles_root/harness-preserved-empty
+  staging_preserved=$backends_parent/.opencode-profile-preserved.tmp
+  staging_empty=$backends_parent/.opencode-profile-preserved-empty.tmp
   [ "$#" -eq 11 ] || exit 63
 
   case "$*" in
@@ -78,6 +82,12 @@ if [ "${1:-}" = "--pure" ]; then
   if mv "$profile_root" "$profiles_root/moved" 2>/dev/null; then exit 59; fi
   if rm "$profile_manifest" 2>/dev/null; then exit 60; fi
   if mkdir "$backends_parent/.opencode-profile-hostile.tmp" 2>/dev/null; then exit 61; fi
+  if mv "$profiles_preserved" "$profiles_root/harness-preserved-moved" 2>/dev/null; then exit 64; fi
+  if rm "$profiles_preserved/marker" 2>/dev/null; then exit 65; fi
+  if rmdir "$profiles_empty" 2>/dev/null; then exit 66; fi
+  if mv "$staging_preserved" "$backends_parent/.opencode-profile-preserved-moved.tmp" 2>/dev/null; then exit 67; fi
+  if rm "$staging_preserved/marker" 2>/dev/null; then exit 68; fi
+  if rmdir "$staging_empty" 2>/dev/null; then exit 69; fi
   for trusted_path in "$@"; do
     if printf '%s' hostile >"$trusted_path" 2>/dev/null; then exit 62; fi
   done
@@ -158,6 +168,10 @@ HARNESS_GLOBAL_DATA=$HARNESS_ROOT/global-opencode
 HARNESS_PROFILE_TOKEN=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 HARNESS_PROFILE=$HARNESS_BACKEND/profiles/$HARNESS_PROFILE_TOKEN
 HARNESS_PROFILE_MANIFEST=$HARNESS_PROFILE/manifest.json
+HARNESS_PROFILES_PRESERVED=$HARNESS_BACKEND/profiles/harness-preserved
+HARNESS_PROFILES_EMPTY=$HARNESS_BACKEND/profiles/harness-preserved-empty
+HARNESS_STAGING_PRESERVED=$HARNESS_BACKENDS/.opencode-profile-preserved.tmp
+HARNESS_STAGING_EMPTY=$HARNESS_BACKENDS/.opencode-profile-preserved-empty.tmp
 HARNESS_CONTROL_SOCKET=$HARNESS_RUNTIME/control.sock
 HARNESS_TMUX_SOCKET=$HARNESS_RUNTIME/tmux.sock
 HARNESS_EVENT_FILE=$HARNESS_BACKEND/events.ndjson
@@ -206,6 +220,12 @@ chmod 600 "$PROFILE_REQUEST"
 chmod 600 "$PROFILE_REPORT"
 HARNESS_FINGERPRINT=$("$PYTHON" -I -B -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["fingerprint"])' "$PROFILE_REPORT")
 [ "${#HARNESS_FINGERPRINT}" -eq 64 ] || fail "managed profile fingerprint is invalid"
+mkdir -m 700 "$HARNESS_PROFILES_PRESERVED" "$HARNESS_PROFILES_EMPTY" \
+  "$HARNESS_STAGING_PRESERVED" "$HARNESS_STAGING_EMPTY"
+printf '%s\n' profiles-preserved >"$HARNESS_PROFILES_PRESERVED/marker"
+printf '%s\n' staging-preserved >"$HARNESS_STAGING_PRESERVED/marker"
+chmod 600 "$HARNESS_PROFILES_PRESERVED/marker" \
+  "$HARNESS_STAGING_PRESERVED/marker"
 
 export BWRAP FAKE_BACKEND GIT HARNESS_BACKENDS HARNESS_CONTEXT HARNESS_CONTROL_TOKEN
 export HARNESS_EVENT_FILE HARNESS_FINGERPRINT HARNESS_GIT HARNESS_GIT_DIR
@@ -282,7 +302,15 @@ run_case approved-grant ffffffffffffffffffffffffffffffff allow allow
 [ -f "$HARNESS_PROFILE_MANIFEST" ] || fail "managed profile manifest was removed"
 [ ! -e "$HARNESS_BACKEND/profiles/hostile" ] || fail "profiles directory became writable"
 [ ! -e "$HARNESS_BACKEND/profiles/moved" ] || fail "managed profile was renamed"
+[ -d "$HARNESS_PROFILES_PRESERVED" ] || fail "profiles preserved fixture was removed"
+[ -d "$HARNESS_PROFILES_EMPTY" ] || fail "profiles empty fixture was removed"
+[ ! -e "$HARNESS_BACKEND/profiles/harness-preserved-moved" ] || fail "profiles preserved fixture was renamed"
+[ "$(cat "$HARNESS_PROFILES_PRESERVED/marker")" = profiles-preserved ] || fail "profiles preserved content changed"
 [ ! -e "$HARNESS_BACKENDS/.opencode-profile-hostile.tmp" ] || fail "unpublished generation namespace became writable"
+[ -d "$HARNESS_STAGING_PRESERVED" ] || fail "staging preserved fixture was removed"
+[ -d "$HARNESS_STAGING_EMPTY" ] || fail "staging empty fixture was removed"
+[ ! -e "$HARNESS_BACKENDS/.opencode-profile-preserved-moved.tmp" ] || fail "staging preserved fixture was renamed"
+[ "$(cat "$HARNESS_STAGING_PRESERVED/marker")" = staging-preserved ] || fail "staging preserved content changed"
 [ ! -e "$HARNESS_HOME/.opencode/hostile" ] || fail "host home mask destination was modified"
 [ "$(cat "$HARNESS_HOME/.opencode/host-preserved")" = host-preserved ] || fail "host home configuration changed"
 [ "$(stat -c '%d:%i:%a:%u' "$HARNESS_HOME")" = "$HARNESS_HOME_METADATA" ] || fail "inherited home metadata changed"

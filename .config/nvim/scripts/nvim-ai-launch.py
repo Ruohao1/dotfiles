@@ -313,12 +313,21 @@ def _validate_private_file(path, label):
     return value
 
 
+def _validate_trusted_node(path, label, expected_kind, *, executable=False):
+    value = _validate_owned_node(
+        path, label, expected_kind, executable=executable
+    )
+    if value.st_uid not in (0, _current_uid()):
+        raise ValueError(label + " has an unsafe owner")
+    return value
+
+
 def _validate_executable(path, label):
-    return _validate_owned_node(path, label, "file", executable=True)
+    return _validate_trusted_node(path, label, "file", executable=True)
 
 
 def _validate_trusted_file(path, label):
-    return _validate_owned_node(path, label, "file")
+    return _validate_trusted_node(path, label, "file")
 
 
 def _validate_current_user_socket(path, label):
@@ -2043,8 +2052,8 @@ def run_backend(manifest, environment, on_start=None):
         stderr_descriptor = None
         port = int(launch["server_argv"][6])
         _wait_for_server(server, port)
-        append_event(manifest, "open")
         attach = _start_child(attach_argv, environment)
+        append_event(manifest, "open")
         code = attach.wait()
         _forget_child(attach)
         attach = None
