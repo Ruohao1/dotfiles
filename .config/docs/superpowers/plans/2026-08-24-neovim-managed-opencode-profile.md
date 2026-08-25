@@ -644,7 +644,9 @@ For OpenCode semantic probes, start from an empty environment and pass only `HOM
 ```
 Create one current-user-owned mode-0700 empty probe home and one empty probe XDG configuration tree.
 Mount a private tmpfs at `/tmp`, create the fixed `/tmp/nvim-ai-probe` tree inside that writable namespace, and mount the probe home and XDG configuration sources read-only at `/tmp/nvim-ai-probe/home` and `/tmp/nvim-ai-probe/xdg-config`.
-Keep only XDG data, cache, and state writable beneath that private probe tree, and run every probe through validated Bubblewrap with `--unshare-net`, a read-only `/`, no tmux or Neovim variables, and a two-second timeout per command.
+Back the writable XDG data, cache, and state destinations beneath that private probe tree with separate trusted current-user-owned mode-0700 host directories.
+After every command, securely inspect those bounded host-visible trees before cleanup and accept only the exact audited benign artifact shape for `v1.18.18`; reject every unknown entry or forbidden log, dependency, plugin, update, LSP-download, or network-setup artifact.
+Run every probe through validated Bubblewrap with `--unshare-net`, a read-only `/`, no tmux or Neovim variables, and a two-second timeout per command.
 Never attempt to create a probe destination directly beneath the read-only root bind.
 Reject any probe log or filesystem evidence of configuration dependency installation, plugin loading, update, LSP download, or network setup.
 
