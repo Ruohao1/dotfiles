@@ -1400,6 +1400,7 @@ local artifact_paths = {
     .. "/opencode/locks/0a009c556ac8352fed53ef8323a3a97270935d30.lock/meta.json",
   heartbeat = mutation_tree.state
     .. "/opencode/locks/0a009c556ac8352fed53ef8323a3a97270935d30.lock/heartbeat",
+  shared_memory = mutation_tree.data .. "/opencode/opencode.db-shm",
   unknown = mutation_tree.cache .. "/opencode/unknown-artifact",
   write_ahead_log = mutation_tree.data .. "/opencode/opencode.db-wal",
 }
@@ -1427,6 +1428,192 @@ local write_ahead_log_bytes = fixture_read(artifact_paths.write_ahead_log)
 fixture_write(artifact_paths.write_ahead_log, write_ahead_log_bytes:sub(1, -2))
 artifacts_rejected("altered probe write-ahead log")
 fixture_write(artifact_paths.write_ahead_log, write_ahead_log_bytes)
+
+local function flip_artifact_byte(bytes, offset)
+  return bytes:sub(1, offset - 1)
+    .. string.char(require("bit").bxor(bytes:byte(offset), 1))
+    .. bytes:sub(offset + 1)
+end
+
+local SQLITE_U32_MODULO = 4294967296
+
+local function artifact_u32(bytes, offset, little_endian)
+  local first, second, third, fourth = bytes:byte(offset, offset + 3)
+  assert(fourth, "complete artifact u32")
+  if little_endian then
+    return first + second * 256 + third * 65536 + fourth * 16777216
+  end
+  return first * 16777216 + second * 65536 + third * 256 + fourth
+end
+
+local function artifact_pack_u32(value, little_endian)
+  value = value % SQLITE_U32_MODULO
+  local first = math.floor(value / 16777216) % 256
+  local second = math.floor(value / 65536) % 256
+  local third = math.floor(value / 256) % 256
+  local fourth = value % 256
+  if little_endian then
+    return string.char(fourth, third, second, first)
+  end
+  return string.char(first, second, third, fourth)
+end
+
+local function artifact_replace(bytes, offset, replacement)
+  return bytes:sub(1, offset - 1) .. replacement .. bytes:sub(offset + #replacement)
+end
+
+local function artifact_sqlite_checksum(bytes, offset, length, checksum0, checksum1)
+  for index = offset, offset + length - 1, 8 do
+    local word0 = artifact_u32(bytes, index, true)
+    local word1 = artifact_u32(bytes, index + 4, true)
+    checksum0 = (checksum0 + word0 + checksum1) % SQLITE_U32_MODULO
+    checksum1 = (checksum1 + word1 + checksum0) % SQLITE_U32_MODULO
+  end
+  return checksum0, checksum1
+end
+
+local function rechecksum_artifact_wal(bytes)
+  local checksum0, checksum1 = artifact_sqlite_checksum(bytes, 1, 24, 0, 0)
+  bytes = artifact_replace(
+    bytes,
+    25,
+    artifact_pack_u32(checksum0, false) .. artifact_pack_u32(checksum1, false)
+  )
+  for frame = 0, 62 do
+    local base = 33 + frame * 4120
+    checksum0, checksum1 = artifact_sqlite_checksum(bytes, base, 8, checksum0, checksum1)
+    checksum0, checksum1 = artifact_sqlite_checksum(bytes, base + 24, 4096, checksum0, checksum1)
+    bytes = artifact_replace(
+      bytes,
+      base + 16,
+      artifact_pack_u32(checksum0, false) .. artifact_pack_u32(checksum1, false)
+    )
+  end
+  return bytes
+end
+
+local function link_artifact_shm_to_wal(shared_memory, write_ahead_log)
+  local final_frame = 33 + 62 * 4120
+  local checksum0 = artifact_u32(write_ahead_log, final_frame + 16, false)
+  local checksum1 = artifact_u32(write_ahead_log, final_frame + 20, false)
+  local header = artifact_replace(
+    shared_memory,
+    25,
+    artifact_pack_u32(checksum0, true) .. artifact_pack_u32(checksum1, true)
+  )
+  header = artifact_replace(header, 33, write_ahead_log:sub(17, 24))
+  checksum0, checksum1 = artifact_sqlite_checksum(header, 1, 40, 0, 0)
+  header = artifact_replace(
+    header,
+    41,
+    artifact_pack_u32(checksum0, true) .. artifact_pack_u32(checksum1, true)
+  )
+  return artifact_replace(header, 49, header:sub(1, 48))
+end
+
+local function artifact_u48_be(bytes, offset)
+  local value = 0
+  for index = offset, offset + 5 do
+    value = value * 256 + bytes:byte(index)
+  end
+  return value
+end
+
+local function artifact_pack_u48_be(value)
+  local bytes = {}
+  for index = 6, 1, -1 do
+    bytes[index] = string.char(value % 256)
+    value = math.floor(value / 256)
+  end
+  return table.concat(bytes)
+end
+
+local unchecked_same_size_mutations = {}
+local function require_same_size_mutation_rejection(label)
+  if registry_module._test.inspect_opencode_probe_artifacts(mutation_tree, true) then
+    unchecked_same_size_mutations[#unchecked_same_size_mutations + 1] = label
+  end
+end
+
+fixture_write(
+  artifact_paths.write_ahead_log,
+  flip_artifact_byte(write_ahead_log_bytes, #write_ahead_log_bytes)
+)
+require_same_size_mutation_rejection("same-size WAL final-byte flip")
+fixture_write(artifact_paths.write_ahead_log, write_ahead_log_bytes)
+
+fixture_write(artifact_paths.write_ahead_log, flip_artifact_byte(write_ahead_log_bytes, 1000))
+require_same_size_mutation_rejection("same-size WAL interior-byte flip")
+fixture_write(artifact_paths.write_ahead_log, write_ahead_log_bytes)
+
+fixture_write(artifact_paths.write_ahead_log, flip_artifact_byte(write_ahead_log_bytes, 25))
+require_same_size_mutation_rejection("corrupt WAL header checksum")
+fixture_write(artifact_paths.write_ahead_log, write_ahead_log_bytes)
+
+fixture_write(artifact_paths.write_ahead_log, flip_artifact_byte(write_ahead_log_bytes, 49))
+require_same_size_mutation_rejection("corrupt WAL frame checksum")
+fixture_write(artifact_paths.write_ahead_log, write_ahead_log_bytes)
+
+local shared_memory_bytes = fixture_read(artifact_paths.shared_memory)
+fixture_write(
+  artifact_paths.shared_memory,
+  flip_artifact_byte(shared_memory_bytes, #shared_memory_bytes)
+)
+require_same_size_mutation_rejection("same-size SHM final-byte flip")
+fixture_write(artifact_paths.shared_memory, shared_memory_bytes)
+
+local corrupt_shm_header_checksum = flip_artifact_byte(shared_memory_bytes, 41)
+corrupt_shm_header_checksum = flip_artifact_byte(corrupt_shm_header_checksum, 89)
+fixture_write(artifact_paths.shared_memory, corrupt_shm_header_checksum)
+require_same_size_mutation_rejection("corrupt duplicated SHM header checksum")
+fixture_write(artifact_paths.shared_memory, shared_memory_bytes)
+
+local corrupt_shm_frame_checksum = flip_artifact_byte(shared_memory_bytes, 25)
+corrupt_shm_frame_checksum = flip_artifact_byte(corrupt_shm_frame_checksum, 73)
+fixture_write(artifact_paths.shared_memory, corrupt_shm_frame_checksum)
+require_same_size_mutation_rejection("corrupt duplicated SHM WAL-checksum linkage")
+fixture_write(artifact_paths.shared_memory, shared_memory_bytes)
+
+local rechecksummed_interior_wal =
+  rechecksum_artifact_wal(flip_artifact_byte(write_ahead_log_bytes, 1000))
+local relinked_interior_shm =
+  link_artifact_shm_to_wal(shared_memory_bytes, rechecksummed_interior_wal)
+fixture_write(artifact_paths.write_ahead_log, rechecksummed_interior_wal)
+fixture_write(artifact_paths.shared_memory, relinked_interior_shm)
+require_same_size_mutation_rejection("rechecksummed WAL non-dynamic-byte flip")
+fixture_write(artifact_paths.write_ahead_log, write_ahead_log_bytes)
+fixture_write(artifact_paths.shared_memory, shared_memory_bytes)
+
+local migration_timestamp_offset = 245568
+local migration_timestamp = artifact_u48_be(write_ahead_log_bytes, migration_timestamp_offset)
+local corrupt_timestamp_wal = artifact_replace(
+  write_ahead_log_bytes,
+  migration_timestamp_offset,
+  artifact_pack_u48_be(migration_timestamp + 5000)
+)
+corrupt_timestamp_wal = rechecksum_artifact_wal(corrupt_timestamp_wal)
+local corrupt_timestamp_shm = link_artifact_shm_to_wal(shared_memory_bytes, corrupt_timestamp_wal)
+fixture_write(artifact_paths.write_ahead_log, corrupt_timestamp_wal)
+fixture_write(artifact_paths.shared_memory, corrupt_timestamp_shm)
+require_same_size_mutation_rejection("rechecksummed inconsistent migration timestamp")
+fixture_write(artifact_paths.write_ahead_log, write_ahead_log_bytes)
+fixture_write(artifact_paths.shared_memory, shared_memory_bytes)
+
+assert(
+  #unchecked_same_size_mutations == 0,
+  "production artifact inspector accepted: " .. table.concat(unchecked_same_size_mutations, "; ")
+)
+
+local corrupt_wal_salt = flip_artifact_byte(write_ahead_log_bytes, 41)
+fixture_write(artifact_paths.write_ahead_log, corrupt_wal_salt)
+artifacts_rejected("corrupt WAL frame salt")
+fixture_write(artifact_paths.write_ahead_log, write_ahead_log_bytes)
+
+local corrupt_shm_salt = flip_artifact_byte(shared_memory_bytes, 33)
+corrupt_shm_salt = flip_artifact_byte(corrupt_shm_salt, 81)
+fixture_write(artifact_paths.shared_memory, corrupt_shm_salt)
+artifacts_rejected("corrupt duplicated SHM salt linkage")
+fixture_write(artifact_paths.shared_memory, shared_memory_bytes)
 
 local metadata_bytes = fixture_read(artifact_paths.metadata)
 local altered_metadata, replacements = metadata_bytes:gsub('"pid": 2', '"pid": 3', 1)

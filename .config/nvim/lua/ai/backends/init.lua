@@ -13,6 +13,49 @@ local MAX_PROFILE_REPORT_BYTES = 65536
 local MAX_COMPATIBILITY_REPORT_BYTES = 1024 * 1024
 local OPENCODE_PROBE_LOCK = "0a009c556ac8352fed53ef8323a3a97270935d30.lock"
 local OPENCODE_PROBE_DB_SHA256 = "40cf07c52bfaa52b334ef341456f970787f6dc701ffe18ad3c572cb5056dbd70"
+local OPENCODE_PROBE_SHM_SHA256 = "a2410912adcf2ec5a17f767f110bf3ae6539c697a0a45453c7bb6f832d0245d4"
+local OPENCODE_PROBE_WAL_SHA256 = "acbe27717b5ac59975ae57011fefbcdcd0042f80286466cf318e405c9f5e7005"
+local OPENCODE_PROBE_MIGRATION_TIMESTAMPS = {
+  245568,
+  245616,
+  245672,
+  245718,
+  245756,
+  245792,
+  245841,
+  245895,
+  245948,
+  245995,
+  246040,
+  246098,
+  246158,
+  246207,
+  246249,
+  246290,
+  246339,
+  246381,
+  246427,
+  246466,
+  246510,
+  246550,
+  246586,
+  246628,
+  246668,
+  246715,
+  246756,
+  246796,
+  246828,
+  246876,
+  246919,
+  246965,
+  247003,
+  247053,
+  247088,
+  247135,
+  247181,
+  247227,
+}
+local OPENCODE_PROBE_PROJECT_TIMESTAMPS = { 255459, 255465 }
 local OPENCODE_PROBE_FORBIDDEN_ARTIFACTS = {
   "node_modules",
   "package.json",
@@ -477,6 +520,7 @@ local function probe_artifact_filesystem(overrides)
     scandir = filesystem.scandir or vim.uv.fs_scandir,
     scandir_next = filesystem.scandir_next or vim.uv.fs_scandir_next,
     sha256 = filesystem.sha256 or vim.fn.sha256,
+    time = filesystem.time or os.time,
   }
 end
 
@@ -723,7 +767,115 @@ local function valid_probe_lock_metadata(bytes, filesystem)
     and created_at:match("^%d%d%d%d%-%d%d%-%d%dT%d%d:%d%d:%d%d%.%d%d%dZ$") ~= nil
 end
 
-local function valid_probe_sqlite_files(database, shared_memory, write_ahead_log, filesystem)
+local SQLITE_U32_MODULO = 4294967296
+
+local function probe_u32(bytes, offset, little_endian)
+  local first, second, third, fourth = bytes:byte(offset, offset + 3)
+  if not fourth then
+    return nil
+  end
+  if little_endian then
+    return first + second * 256 + third * 65536 + fourth * 16777216
+  end
+  return first * 16777216 + second * 65536 + third * 256 + fourth
+end
+
+local function probe_u16_little_endian(bytes, offset)
+  local first, second = bytes:byte(offset, offset + 1)
+  return second and first + second * 256 or nil
+end
+
+local function probe_u48_big_endian(bytes, offset)
+  local value = 0
+  for index = offset, offset + 5 do
+    local byte = bytes:byte(index)
+    if not byte then
+      return nil
+    end
+    value = value * 256 + byte
+  end
+  return value
+end
+
+local function probe_sqlite_checksum(bytes, offset, length, checksum0, checksum1)
+  if length % 8 ~= 0 or offset < 1 or offset + length - 1 > #bytes then
+    return nil
+  end
+  for index = offset, offset + length - 1, 8 do
+    local word0 = probe_u32(bytes, index, true)
+    local word1 = probe_u32(bytes, index + 4, true)
+    if not word0 or not word1 then
+      return nil
+    end
+    checksum0 = (checksum0 + word0 + checksum1) % SQLITE_U32_MODULO
+    checksum1 = (checksum1 + word1 + checksum0) % SQLITE_U32_MODULO
+  end
+  return checksum0, checksum1
+end
+
+local function normalize_probe_bytes(bytes, ranges)
+  table.sort(ranges, function(left, right)
+    return left.offset < right.offset
+  end)
+  local chunks = {}
+  local cursor = 1
+  for _, range in ipairs(ranges) do
+    if
+      type(range.offset) ~= "number"
+      or type(range.length) ~= "number"
+      or range.offset < cursor
+      or range.length < 1
+      or range.offset + range.length - 1 > #bytes
+    then
+      return nil
+    end
+    chunks[#chunks + 1] = bytes:sub(cursor, range.offset - 1)
+    chunks[#chunks + 1] = string.rep("\0", range.length)
+    cursor = range.offset + range.length
+  end
+  chunks[#chunks + 1] = bytes:sub(cursor)
+  return table.concat(chunks)
+end
+
+local function valid_probe_wal_timestamps(write_ahead_log, filesystem)
+  local now = filesystem.time()
+  if type(now) ~= "number" or now <= 0 then
+    return false
+  end
+  local now_milliseconds = math.floor(now * 1000)
+  local lower_bound = now_milliseconds - 60000
+  local upper_bound = now_milliseconds + 5000
+  local previous
+  local minimum
+  local maximum
+  for _, offset in ipairs(OPENCODE_PROBE_MIGRATION_TIMESTAMPS) do
+    local value = probe_u48_big_endian(write_ahead_log, offset)
+    if
+      not value
+      or value < lower_bound
+      or value > upper_bound
+      or (previous and value > previous)
+    then
+      return false
+    end
+    previous = value
+    minimum = minimum and math.min(minimum, value) or value
+    maximum = maximum and math.max(maximum, value) or value
+  end
+  if not minimum or maximum - minimum > 1000 then
+    return false
+  end
+  local created = probe_u48_big_endian(write_ahead_log, OPENCODE_PROBE_PROJECT_TIMESTAMPS[1])
+  local updated = probe_u48_big_endian(write_ahead_log, OPENCODE_PROBE_PROJECT_TIMESTAMPS[2])
+  return created ~= nil
+    and created == updated
+    and created >= maximum
+    and created - maximum <= 5000
+    and created >= lower_bound
+    and created <= upper_bound
+end
+
+local function valid_probe_wal(write_ahead_log, filesystem)
   local wal_header = string.char(
     0x37,
     0x7f,
@@ -742,15 +894,122 @@ local function valid_probe_sqlite_files(database, shared_memory, write_ahead_log
     0x00,
     0x00
   )
+  if #write_ahead_log ~= 259592 or write_ahead_log:sub(1, 16) ~= wal_header then
+    return nil
+  end
+  local checksum0, checksum1 = probe_sqlite_checksum(write_ahead_log, 1, 24, 0, 0)
+  if
+    not checksum0
+    or checksum0 ~= probe_u32(write_ahead_log, 25, false)
+    or checksum1 ~= probe_u32(write_ahead_log, 29, false)
+  then
+    return nil
+  end
+  local salt = write_ahead_log:sub(17, 24)
+  if salt == string.rep("\0", 8) then
+    return nil
+  end
+  local page_numbers = {}
+  local normalized_ranges = { { offset = 17, length = 16 } }
+  for frame = 0, 62 do
+    local base = 33 + frame * 4120
+    if write_ahead_log:sub(base + 8, base + 15) ~= salt then
+      return nil
+    end
+    checksum0, checksum1 = probe_sqlite_checksum(write_ahead_log, base, 8, checksum0, checksum1)
+    if not checksum0 then
+      return nil
+    end
+    checksum0, checksum1 =
+      probe_sqlite_checksum(write_ahead_log, base + 24, 4096, checksum0, checksum1)
+    if
+      not checksum0
+      or checksum0 ~= probe_u32(write_ahead_log, base + 16, false)
+      or checksum1 ~= probe_u32(write_ahead_log, base + 20, false)
+    then
+      return nil
+    end
+    local page_number = probe_u32(write_ahead_log, base, false)
+    if not page_number or page_number == 0 then
+      return nil
+    end
+    page_numbers[#page_numbers + 1] = page_number
+    normalized_ranges[#normalized_ranges + 1] = { offset = base + 8, length = 16 }
+  end
+  if not valid_probe_wal_timestamps(write_ahead_log, filesystem) then
+    return nil
+  end
+  for _, offset in ipairs(OPENCODE_PROBE_MIGRATION_TIMESTAMPS) do
+    normalized_ranges[#normalized_ranges + 1] = { offset = offset, length = 6 }
+  end
+  for _, offset in ipairs(OPENCODE_PROBE_PROJECT_TIMESTAMPS) do
+    normalized_ranges[#normalized_ranges + 1] = { offset = offset, length = 6 }
+  end
+  local normalized = normalize_probe_bytes(write_ahead_log, normalized_ranges)
+  if not normalized or filesystem.sha256(normalized) ~= OPENCODE_PROBE_WAL_SHA256 then
+    return nil
+  end
+  return {
+    checksum0 = checksum0,
+    checksum1 = checksum1,
+    page_numbers = page_numbers,
+    salt = salt,
+  }
+end
+
+local function valid_probe_shm(shared_memory, wal, filesystem)
+  if
+    #shared_memory ~= 32768
+    or shared_memory:sub(1, 48) ~= shared_memory:sub(49, 96)
+    or probe_u32(shared_memory, 1, true) ~= 3007000
+    or probe_u32(shared_memory, 5, true) ~= 0
+    or probe_u32(shared_memory, 9, true) ~= 2
+    or shared_memory:byte(13) ~= 1
+    or shared_memory:byte(14) ~= 0
+    or probe_u16_little_endian(shared_memory, 15) ~= 4096
+    or probe_u32(shared_memory, 17, true) ~= 63
+    or probe_u32(shared_memory, 21, true) ~= 61
+    or probe_u32(shared_memory, 25, true) ~= wal.checksum0
+    or probe_u32(shared_memory, 29, true) ~= wal.checksum1
+    or shared_memory:sub(33, 40) ~= wal.salt
+  then
+    return false
+  end
+  local checksum0, checksum1 = probe_sqlite_checksum(shared_memory, 1, 40, 0, 0)
+  if
+    not checksum0
+    or checksum0 ~= probe_u32(shared_memory, 41, true)
+    or checksum1 ~= probe_u32(shared_memory, 45, true)
+    or probe_u32(shared_memory, 97, true) ~= 0
+    or probe_u32(shared_memory, 101, true) ~= 0
+    or probe_u32(shared_memory, 105, true) ~= 63
+    or probe_u32(shared_memory, 109, true) ~= 0xffffffff
+    or probe_u32(shared_memory, 113, true) ~= 0xffffffff
+    or probe_u32(shared_memory, 117, true) ~= 0xffffffff
+    or shared_memory:sub(121, 128) ~= string.rep("\0", 8)
+    or probe_u32(shared_memory, 129, true) ~= 0
+    or probe_u32(shared_memory, 133, true) ~= 0
+  then
+    return false
+  end
+  for index = 1, 4062 do
+    local page_number = probe_u32(shared_memory, 137 + (index - 1) * 4, true)
+    local expected = index <= 63 and wal.page_numbers[index] or 0
+    if page_number ~= expected then
+      return false
+    end
+  end
+  local normalized = normalize_probe_bytes(shared_memory, {
+    { offset = 25, length = 24 },
+    { offset = 73, length = 24 },
+  })
+  return normalized ~= nil and filesystem.sha256(normalized) == OPENCODE_PROBE_SHM_SHA256
+end
+
+local function valid_probe_sqlite_files(database, shared_memory, write_ahead_log, filesystem)
   if
     #database ~= 4096
     or filesystem.sha256(database) ~= OPENCODE_PROBE_DB_SHA256
-    or #shared_memory ~= 32768
-    or shared_memory:sub(1, 4) ~= string.char(0x18, 0xe2, 0x2d, 0x00)
-    or shared_memory:sub(1, 48) ~= shared_memory:sub(49, 96)
-    or #write_ahead_log ~= 259592
-    or write_ahead_log:sub(1, 16) ~= wal_header
-    or write_ahead_log:sub(17, 24) ~= shared_memory:sub(33, 40)
     or forbidden_probe_artifact(database)
     or forbidden_probe_artifact(shared_memory)
     or forbidden_probe_artifact(write_ahead_log)
@@ -767,15 +1026,8 @@ local function valid_probe_sqlite_files(database, shared_memory, write_ahead_log
       return false
     end
   end
-  local salts = write_ahead_log:sub(17, 24)
-  for offset = 33, #write_ahead_log, 4120 do
-    if
-      offset + 4119 > #write_ahead_log or write_ahead_log:sub(offset + 8, offset + 15) ~= salts
-    then
-      return false
-    end
-  end
-  return true
+  local wal = valid_probe_wal(write_ahead_log, filesystem)
+  return wal ~= nil and valid_probe_shm(shared_memory, wal, filesystem)
 end
 
 local function inspect_opencode_probe_artifacts(tree, semantic, overrides)
