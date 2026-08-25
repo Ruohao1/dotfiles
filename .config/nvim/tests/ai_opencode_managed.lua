@@ -2066,6 +2066,155 @@ else
   end
 end
 
+(function()
+  local original_mkdir = vim.fn.mkdir
+  local original_lstat = vim.uv.fs_lstat
+  for _, case in ipairs({
+    {
+      label = "partial-create delete exception",
+      remove = function()
+        error("partial-create-secret-canary")
+      end,
+      lstat = original_lstat,
+      expected_error = "managed OpenCode probe directory cleanup failed",
+    },
+    {
+      label = "partial-create delete failure status",
+      remove = function()
+        return -1
+      end,
+      lstat = original_lstat,
+      expected_error = "managed OpenCode probe directory cleanup failed",
+    },
+    {
+      label = "partial-create root remains",
+      remove = function()
+        return 0
+      end,
+      lstat = original_lstat,
+      expected_error = "managed OpenCode probe directory cleanup failed",
+    },
+    {
+      label = "partial-create ambiguous root lookup",
+      remove = function()
+        return 0
+      end,
+      lstat = function()
+        return nil
+      end,
+      expected_error = "managed OpenCode probe directory cleanup failed",
+    },
+    {
+      label = "partial-create verified root absence",
+      remove = function(path, flags)
+        return original_delete(path, flags)
+      end,
+      lstat = original_lstat,
+      expected_error = "managed OpenCode probe directory creation failed",
+    },
+  }) do
+    local partial_root
+    local mkdir_calls = 0
+    vim.fn.mkdir = function(path, flags, mode)
+      mkdir_calls = mkdir_calls + 1
+      if mkdir_calls == 1 then
+        partial_root = path
+        local status = original_mkdir(path, flags, mode)
+        local stat = assert(original_lstat(path))
+        assert(status == 1, "partial-create fixture root was not created")
+        assert(stat.uid == vim.uv.getuid(), "partial-create fixture root has wrong owner")
+        assert(
+          require("bit").band(stat.mode, 511) == 448,
+          "partial-create fixture root has wrong mode"
+        )
+        return status
+      end
+      return 0
+    end
+    vim.fn.delete = case.remove
+    vim.uv.fs_lstat = case.lstat
+    local call_ok, tree, create_error = pcall(registry_module._test.create_opencode_probe_tree)
+    vim.fn.mkdir = original_mkdir
+    vim.fn.delete = original_delete
+    vim.uv.fs_lstat = original_lstat
+
+    if not call_ok then
+      subprocess_boundary_failures[#subprocess_boundary_failures + 1] = case.label
+        .. " raised through the creation boundary"
+    end
+    if tree ~= nil then
+      subprocess_boundary_failures[#subprocess_boundary_failures + 1] = case.label
+        .. " returned a partial tree"
+    end
+    if
+      create_error ~= case.expected_error
+      or type(create_error) ~= "string"
+      or #create_error > 256
+      or create_error:find("partial-create-secret-canary", 1, true)
+    then
+      subprocess_boundary_failures[#subprocess_boundary_failures + 1] = case.label
+        .. " returned the wrong bounded category"
+    end
+    if partial_root and original_lstat(partial_root) then
+      assert(original_delete(partial_root, "rf") == 0, "clean partial-create fixture root")
+      assert(original_lstat(partial_root) == nil, "partial-create fixture root residue remains")
+    end
+  end
+
+  registry_module._test.reset_opencode_compatibility_cache()
+  local partial_cache_roots = {}
+  local partial_cache_attempts = 0
+  vim.fn.mkdir = function(path, flags, mode)
+    if flags == "p" then
+      partial_cache_attempts = partial_cache_attempts + 1
+      partial_cache_roots[#partial_cache_roots + 1] = path
+      return original_mkdir(path, flags, mode)
+    end
+    return 0
+  end
+  vim.fn.delete = function()
+    return 0
+  end
+  vim.uv.fs_lstat = original_lstat
+  local partial_cache_call_ok, partial_cache_call_error = pcall(function()
+    for attempt = 1, 2 do
+      local report, report_error = registry_module._test.opencode_compatibility(installed_opencode)
+      if report ~= nil then
+        subprocess_boundary_failures[#subprocess_boundary_failures + 1] = "partial-create cleanup failure attempt "
+          .. attempt
+          .. " was accepted"
+      end
+      if
+        type(report_error) ~= "string"
+        or report_error == ""
+        or report_error:find("partial-create-secret-canary", 1, true)
+      then
+        subprocess_boundary_failures[#subprocess_boundary_failures + 1] =
+          "partial-create cleanup failure returned a non-generic compatibility diagnostic"
+      end
+    end
+  end)
+  vim.fn.mkdir = original_mkdir
+  vim.fn.delete = original_delete
+  vim.uv.fs_lstat = original_lstat
+  if not partial_cache_call_ok then
+    subprocess_boundary_failures[#subprocess_boundary_failures + 1] =
+      "partial-create cleanup failure raised through compatibility"
+    assert(partial_cache_call_error ~= nil)
+  end
+  if partial_cache_attempts ~= 2 then
+    subprocess_boundary_failures[#subprocess_boundary_failures + 1] =
+      "partial-create cleanup failure was cached"
+  end
+  for _, root in ipairs(partial_cache_roots) do
+    if original_lstat(root) then
+      assert(original_delete(root, "rf") == 0, "clean partial-create cache fixture root")
+      assert(original_lstat(root) == nil, "partial-create cache fixture residue remains")
+    end
+  end
+  registry_module._test.reset_opencode_compatibility_cache()
+end)()
+
 assert(#subprocess_boundary_failures == 0, table.concat(subprocess_boundary_failures, "; "))
 
 local real_artifact_environment = {

@@ -836,6 +836,23 @@ local function validate_probe_inputs(tree, filesystem)
     and filesystem.sha256(bootstrap) == managed.bootstrap_gitignore_sha256()
 end
 
+local function cleanup_owned_probe_tree(root, remove, lstat)
+  if
+    type(root) ~= "string"
+    or root == ""
+    or type(remove) ~= "function"
+    or type(lstat) ~= "function"
+  then
+    return false
+  end
+  local remove_ok, status = pcall(remove, root, "rf")
+  if not remove_ok or status ~= 0 then
+    return false
+  end
+  local lstat_ok, stat, _, code = pcall(lstat, root)
+  return lstat_ok and stat == nil and code == "ENOENT"
+end
+
 local function create_opencode_probe_tree()
   local root = vim.fn.tempname()
   local tree = {
@@ -879,29 +896,12 @@ local function create_opencode_probe_tree()
     assert(validate_probe_inputs(tree))
   end)
   if not ok then
-    if created then
-      pcall(vim.fn.delete, root, "rf")
+    if created and not cleanup_owned_probe_tree(root, vim.fn.delete, vim.uv.fs_lstat) then
+      return nil, "managed OpenCode probe directory cleanup failed"
     end
     return nil, "managed OpenCode probe directory creation failed"
   end
   return tree
-end
-
-local function cleanup_owned_probe_tree(root, remove, lstat)
-  if
-    type(root) ~= "string"
-    or root == ""
-    or type(remove) ~= "function"
-    or type(lstat) ~= "function"
-  then
-    return false
-  end
-  local remove_ok, status = pcall(remove, root, "rf")
-  if not remove_ok or status ~= 0 then
-    return false
-  end
-  local lstat_ok, stat, _, code = pcall(lstat, root)
-  return lstat_ok and stat == nil and code == "ENOENT"
 end
 
 local function forbidden_probe_artifact(bytes)
