@@ -64,6 +64,7 @@ Publication is atomic and refuses an existing wrong-owner, wrong-mode, wrong-kin
 The profile contains only these generated artifacts:
 
 - A managed `opencode.json` containing the fixed policy, built-in subagent disablement, and hidden-agent permission hardening.
+- The fixed OpenCode `v1.18.18` configuration-bootstrap `.gitignore` required before that complete configuration tree can remain read-only.
 - A combined `AGENTS.md` instruction snapshot.
 - A filtered `auth.json` containing compatible credential records only.
 - A bounded metadata manifest containing the audited version and non-secret profile fingerprint inputs.
@@ -107,6 +108,7 @@ A disagreement between them is a profile validation failure.
 
 OpenCode receives identity-specific XDG configuration, data, cache, and state directories.
 The generated configuration is mounted at `$XDG_CONFIG_HOME/opencode/opencode.json`.
+The exact audited bootstrap file is mounted at `$XDG_CONFIG_HOME/opencode/.gitignore` with no writable configuration fallback.
 The generated instruction snapshot is mounted at `$XDG_CONFIG_HOME/opencode/AGENTS.md`.
 The filtered credentials are mounted at `$XDG_DATA_HOME/opencode/auth.json`.
 The complete isolated XDG configuration tree is mounted read-only.

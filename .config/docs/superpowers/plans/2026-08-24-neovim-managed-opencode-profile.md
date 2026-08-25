@@ -30,6 +30,7 @@ The planned Bubblewrap launcher independently validates that profile, mounts it 
 - Snapshot `$HOME/AGENTS.md` before `<physical-root>/AGENTS.md`, deduplicate identical files, and inject no other instruction source.
 - Require the inherited `HOME` to resolve to a canonical current-user-owned directory before masking its `.opencode` child.
 - Keep every profile directory mode 0700 and every profile file mode 0600.
+- Include the exact fixed 63-byte OpenCode `v1.18.18` bootstrap `.gitignore` so the complete managed configuration tree can remain read-only.
 - Construct unpublished OpenCode generations beside the backend state directory beneath the trusted identity-specific `backends` parent, never inside the exact backend-state child exposed writable to OpenCode.
 - Never put real credential contents in argv, environment, diagnostics, logs, tmux options, fingerprints, or tests.
 - Use synthetic credentials only in automated tests and never contact a model provider.
@@ -466,6 +467,7 @@ profiles/TOKEN/
 ├── manifest.json
 └── xdg-config/
     └── opencode/
+        ├── .gitignore
         ├── AGENTS.md
         └── opencode.json
 ```
@@ -481,6 +483,8 @@ When identity capture fails after a successful `mkdir`, fail closed and leave th
 Treat the no-replace rename as tentative until both source and destination parents are synced and every final identity check succeeds.
 If a later step fails, scrub through the retained generation descriptor and remove the destination only when it still matches the captured generation identity.
 Reject any unexpected entry when inspecting a published profile and require `empty-home-opencode` to remain empty.
+Write `xdg-config/opencode/.gitignore` as the exact bytes `node_modules\npackage.json\npackage-lock.json\nbun.lock\n.gitignore` with no final line feed and require SHA-256 `663a068e76d264d0bc6740f5450b6c4193c7b41ecf5e0dc222485b8a17404d95` when reopening a profile.
+Treat this fixed audited version artifact as implied by the profile schema and version rather than another fingerprint input.
 Build the instruction snapshot by considering the user file first and repository file second, deduplicating the second only when its stable device and inode equal the first.
 For each present source, append its fixed heading and exact accepted source bytes, append one line feed when those bytes do not already end in one, then append one separator line feed.
 When neither source exists, write an empty `AGENTS.md`.
@@ -643,6 +647,7 @@ For OpenCode semantic probes, start from an empty environment and pass only `HOM
 }
 ```
 Create one current-user-owned mode-0700 empty probe home and one empty probe XDG configuration tree.
+Preseed the probe configuration tree with the managed contract's exact fixed bootstrap `.gitignore` before mounting it read-only, and reject any changed bytes or mode.
 Mount a private tmpfs at `/tmp`, create the fixed `/tmp/nvim-ai-probe` tree inside that writable namespace, and mount the probe home and XDG configuration sources read-only at `/tmp/nvim-ai-probe/home` and `/tmp/nvim-ai-probe/xdg-config`.
 Back the writable XDG data, cache, and state destinations beneath that private probe tree with separate trusted current-user-owned mode-0700 host directories.
 After every command, securely inspect those bounded host-visible trees before cleanup and accept only the exact audited benign artifact shape for `v1.18.18`; reject every unknown entry or forbidden log, dependency, plugin, update, LSP-download, or network-setup artifact.
@@ -823,7 +828,8 @@ Before building Bubblewrap argv, additionally open and validate every component 
 Require inherited `HOME` to be an absolute canonical current-user-owned directory before constructing the `.opencode` mask destination.
 Require every directory in that private subtree to be current-user-owned mode 0700 and every profile file to be current-user-owned mode 0600.
 Require the exact published tree and an empty `empty-home-opencode` directory, with no extra entry at any level.
-Read at most 1 MiB from `manifest.json`, `xdg-config/opencode/opencode.json`, `xdg-config/opencode/AGENTS.md`, and `credentials/auth.json` through descriptor-stable bounded reads.
+Read at most 1 MiB from `manifest.json`, `xdg-config/opencode/opencode.json`, `xdg-config/opencode/.gitignore`, `xdg-config/opencode/AGENTS.md`, and `credentials/auth.json` through descriptor-stable bounded reads.
+Require the bootstrap `.gitignore` to have the exact audited 63 bytes and hash before either child starts.
 Recompute the configuration hash, instruction hash, and public fingerprint from the manifest values and reject every mismatch.
 Strictly decode configuration and authentication JSON with duplicate-key rejection.
 Require the exact configuration object and at least one accepted `api` or `oauth` credential.
@@ -872,7 +878,7 @@ Use the same validated environment and managed profile for the server and attach
 - [ ] **Step 6: Extend the real Bubblewrap filesystem harness**
 
 Create the full provider-free Bubblewrap harness from the main plan's Task 3 Step 6 and add a synthetic managed profile under its harness-owned backend state.
-Make the fake backend attempt to replace `opencode.json`, `AGENTS.md`, filtered `auth.json`, the profile manifest, and a file below the home `.opencode` mask.
+Make the fake backend attempt to replace `opencode.json`, the bootstrap `.gitignore`, `AGENTS.md`, filtered `auth.json`, the profile manifest, and a file below the home `.opencode` mask.
 Make it also attempt to create, rename, and remove entries in the complete `profiles` directory and in the sibling unpublished-generation namespace beneath the identity-specific `backends` parent.
 Require every attempt to fail while backend cache writes and the existing project/grant policy behave exactly as before.
 Pass the expected profile manifest path as fixed fake-backend argv and assert that the fake server and attach modes read the same fingerprint without exposing credential contents.
