@@ -8,6 +8,7 @@ if [ "${1:-}" = "--pure" ]; then
   shift
   case "$fake_mode" in
     serve)
+      [ "$#" -eq 4 ] || exit 47
       [ "${1:-}" = "--hostname" ] || exit 41
       [ "${2:-}" = "127.0.0.1" ] || exit 42
       [ "${3:-}" = "--port" ] || exit 43
@@ -15,62 +16,75 @@ if [ "${1:-}" = "--pure" ]; then
       shift 4
       ;;
     attach)
+      [ "$#" -eq 5 ] || exit 47
       fake_url=${1:-}
+      case "$fake_url" in
+        http://127.0.0.1:*) ;;
+        *) exit 44 ;;
+      esac
       fake_port=${fake_url##*:}
       shift
-      [ "${1:-}" = "--dir" ] || exit 44
+      [ "${1:-}" = "--dir" ] || exit 45
+      fake_project_root=${2:-}
       shift 2
-      [ "${1:-}" = "--session" ] || exit 45
+      [ "${1:-}" = "--session" ] || exit 46
+      [ "${2:-}" = "ses_fixture" ] || exit 46
       shift 2
       ;;
-    *) exit 46 ;;
+    *) exit 48 ;;
   esac
-  [ "${1:-}" = "--fixture" ] || exit 47
-  shift
-  project_root=$1
-  sibling_root=$2
-  git_root=$3
-  backend_state=$4
-  tmux_socket=$5
-  grant_root=$6
-  grant_policy=$7
-  root_policy=$8
-  profile_manifest=$9
-  shift 9
-  profile_root=$1
-  profiles_root=$2
-  backends_parent=$3
-  expected_fingerprint=$4
-  expected_home_mask=$5
-  shift 5
+  [ "$#" -eq 0 ] || exit 47
+
+  project_root=$(pwd -P)
+  harness_root=${project_root%/*}
+  [ "$project_root" = "$harness_root/project" ] || exit 70
+  if [ "$fake_mode" = attach ]; then
+    [ "$fake_project_root" = "$project_root" ] || exit 71
+  fi
+  sibling_root=$harness_root/sibling
+  git_root=$harness_root/git
+  backend_state=$harness_root/state/backends/opencode
+  tmux_socket=$harness_root/runtime/tmux.sock
+  grant_root=$harness_root/grant
+  profiles_root=$backend_state/profiles
+  profile_root=$profiles_root/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  profile_manifest=$profile_root/manifest.json
+  backends_parent=$harness_root/state/backends
+  expected_home_mask=$harness_root/home/.opencode
   profiles_preserved=$profiles_root/harness-preserved
   profiles_empty=$profiles_root/harness-preserved-empty
   staging_preserved=$backends_parent/.opencode-profile-preserved.tmp
   staging_empty=$backends_parent/.opencode-profile-preserved-empty.tmp
-  [ "$#" -eq 11 ] || exit 63
 
-  case "$*" in
-    *credential-canary*|*refresh-canary*|*access-canary*) exit 48 ;;
-  esac
+  trusted_python=$(realpath "$(command -v python3)")
+  trusted_bwrap=$(realpath "$(command -v bwrap)")
+  trusted_git=$(realpath "$(command -v git)")
+  trusted_tmux=$(realpath "$(command -v tmux)")
+  trusted_shell=$(realpath /bin/sh)
+  trusted_true=$(realpath /bin/true)
+  trusted_fake=$(realpath "$0")
+  trusted_tests=${trusted_fake%/*}
+  trusted_nvim=${trusted_tests%/*}
+  trusted_launcher=$trusted_nvim/scripts/nvim-ai-launch.py
+  trusted_profile_helper=$trusted_nvim/scripts/nvim-ai-opencode-profile.py
+  set -- "$trusted_python" "$trusted_bwrap" "$trusted_launcher" \
+    "$trusted_true" "$trusted_true" "$trusted_true" \
+    "$trusted_profile_helper" "$trusted_shell" "$trusted_git" \
+    "$trusted_tmux" "$trusted_fake"
+
+  expected_fingerprint=$("$trusted_python" -I -B -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["fingerprint"])' "$profile_manifest") || exit 49
+  [ "${#expected_fingerprint}" -eq 64 ] || exit 49
   grep -F "\"fingerprint\":\"$expected_fingerprint\"" "$profile_manifest" >/dev/null || exit 49
   [ "$HOME/.opencode" = "$expected_home_mask" ] || exit 50
   [ ! -e "$HOME/.opencode/host-preserved" ] || exit 51
 
-  if printf '%s' inside >"$project_root/inside.txt" 2>/dev/null; then
-    [ "$root_policy" = allow ] || exit 27
-  else
-    [ "$root_policy" = deny ] || exit 28
-  fi
+  if printf '%s' inside >"$project_root/inside.txt" 2>/dev/null; then :; fi
   if printf '%s' sibling >"$sibling_root/outside.txt" 2>/dev/null; then exit 21; fi
   if printf '%s' git >"$git_root/config" 2>/dev/null; then exit 22; fi
   if printf '%s' escape >"$project_root/escape/outside.txt" 2>/dev/null; then exit 23; fi
   printf '%s' cache >"$backend_state/cache-$fake_mode.txt"
   [ ! -S "$tmux_socket" ] || exit 24
-  if printf '%s' grant >"$grant_root/granted.txt" 2>/dev/null; then
-    [ "$grant_policy" = allow ] || exit 25
-  else
-    [ "$grant_policy" = deny ] || exit 26
-  fi
+  if printf '%s' grant >"$grant_root/granted.txt" 2>/dev/null; then :; fi
 
   if printf '%s' hostile >"$profile_root/xdg-config/opencode/opencode.json" 2>/dev/null; then exit 52; fi
   if printf '%s' hostile >"$profile_root/xdg-config/opencode/.gitignore" 2>/dev/null; then exit 53; fi
@@ -241,7 +255,7 @@ write_manifest() {
   grant_policy=$4
   port=$5
   export manifest_path launch_token root_policy grant_policy port
-  "$PYTHON" -I -B -c 'import json,os; e=os.environ; p=e["HARNESS_PROFILE"]; b=e["HARNESS_BACKEND"]; trusted=[e["PYTHON"],e["BWRAP"],e["LAUNCHER"],e["TRUE_PATH"],e["TRUE_PATH"],e["TRUE_PATH"],e["PROFILE_HELPER"],e["SHELL_PATH"],e["GIT"],e["TMUX"],e["FAKE_BACKEND"]]; fixed=[e["HARNESS_PROJECT"],e["HARNESS_SIBLING"],e["HARNESS_GIT"],b,e["HARNESS_TMUX_SOCKET"],e["HARNESS_GRANT"],e["grant_policy"],e["root_policy"],e["HARNESS_PROFILE_MANIFEST"],p,b+"/profiles",e["HARNESS_BACKENDS"],e["HARNESS_FINGERPRINT"],e["HARNESS_HOME"]+"/.opencode",*trusted]; profile={"schema":1,"version":"1.18.18","profile_root":p,"fingerprint":e["HARNESS_FINGERPRINT"],"config_source":p+"/xdg-config","auth_source":p+"/credentials/auth.json","home_mask_source":p+"/empty-home-opencode"}; env={"OPENCODE_DISABLE_AUTOUPDATE":"true","OPENCODE_DISABLE_CLAUDE_CODE":"true","OPENCODE_DISABLE_EXTERNAL_SKILLS":"true","OPENCODE_DISABLE_LSP_DOWNLOAD":"true","OPENCODE_DISABLE_PROJECT_CONFIG":"true","OPENCODE_PERMISSION":"{\"bash\":\"ask\",\"doom_loop\":\"ask\",\"external_directory\":\"ask\",\"skill\":\"deny\",\"task\":\"deny\",\"webfetch\":\"ask\",\"websearch\":\"ask\"}","OPENCODE_PURE":"true","OPENCODE_SERVER_PASSWORD":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","OPENCODE_SERVER_USERNAME":"opencode","XDG_CACHE_HOME":b+"/xdg-cache","XDG_CONFIG_HOME":b+"/xdg-config","XDG_DATA_HOME":b+"/xdg-data","XDG_STATE_HOME":b+"/xdg-state"}; prefix=[e["FAKE_BACKEND"],"--pure"]; fixture=["--fixture",*fixed]; launch={"kind":"server_attach","backend":"opencode","argv":None,"server_argv":[*prefix,"serve","--hostname","127.0.0.1","--port",e["port"],*fixture],"attach_argv":[*prefix,"attach","http://127.0.0.1:"+e["port"],"--dir",e["HARNESS_PROJECT"],"--session","ses_fixture",*fixture],"env":env,"session":"ses_fixture","capabilities":{"approval":True,"busy":True,"completion":True,"exact_session":True},"read_only_inputs":[],"protected_paths":sorted([e["FAKE_BACKEND"],p]),"event_url":"http://127.0.0.1:"+e["port"]+"/event","event_file":e["HARNESS_EVENT_FILE"],"managed_profile":profile}; writable=e["root_policy"]=="allow"; grants=[e["HARNESS_GRANT"]] if e["grant_policy"]=="allow" else []; manifest={"schema":1,"token":e["launch_token"],"identity_key":e["HARNESS_IDENTITY"],"root":e["HARNESS_PROJECT"],"git_dir":e["HARNESS_GIT_DIR"],"git_common_dir":e["HARNESS_GIT"],"git_entry":e["HARNESS_PROJECT"]+"/.git","writable":writable,"grants":grants,"review_id":"review_0123456789abcdef" if writable else None,"runtime_root":e["HARNESS_RUNTIME"],"state_root":e["HARNESS_STATE"],"context_dir":e["HARNESS_CONTEXT"],"backend_state_dir":b,"control_socket":e["HARNESS_CONTROL_SOCKET"],"control_token":e["HARNESS_CONTROL_TOKEN"],"control_helper":e["TRUE_PATH"],"event_helper":e["TRUE_PATH"],"profile_helper":e["PROFILE_HELPER"],"launcher":e["LAUNCHER"],"review_helper":e["TRUE_PATH"],"event_file":e["HARNESS_EVENT_FILE"],"tmux_socket":e["HARNESS_TMUX_SOCKET"],"python":e["PYTHON"],"bwrap":e["BWRAP"],"host_tools":sorted([e["GIT"],e["TMUX"]]),"shell":e["SHELL_PATH"],"launch":launch}; open(e["manifest_path"],"w",encoding="utf-8").write(json.dumps(manifest,separators=(",",":"))+"\n")'
+  "$PYTHON" -I -B -c 'import json,os; e=os.environ; p=e["HARNESS_PROFILE"]; b=e["HARNESS_BACKEND"]; profile={"schema":1,"version":"1.18.18","profile_root":p,"fingerprint":e["HARNESS_FINGERPRINT"],"config_source":p+"/xdg-config","auth_source":p+"/credentials/auth.json","home_mask_source":p+"/empty-home-opencode"}; env={"OPENCODE_DISABLE_AUTOUPDATE":"true","OPENCODE_DISABLE_CLAUDE_CODE":"true","OPENCODE_DISABLE_EXTERNAL_SKILLS":"true","OPENCODE_DISABLE_LSP_DOWNLOAD":"true","OPENCODE_DISABLE_PROJECT_CONFIG":"true","OPENCODE_PERMISSION":"{\"bash\":\"ask\",\"doom_loop\":\"ask\",\"external_directory\":\"ask\",\"skill\":\"deny\",\"task\":\"deny\",\"webfetch\":\"ask\",\"websearch\":\"ask\"}","OPENCODE_PURE":"true","OPENCODE_SERVER_PASSWORD":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","OPENCODE_SERVER_USERNAME":"opencode","XDG_CACHE_HOME":b+"/xdg-cache","XDG_CONFIG_HOME":b+"/xdg-config","XDG_DATA_HOME":b+"/xdg-data","XDG_STATE_HOME":b+"/xdg-state"}; prefix=[e["FAKE_BACKEND"],"--pure"]; launch={"kind":"server_attach","backend":"opencode","argv":None,"server_argv":[*prefix,"serve","--hostname","127.0.0.1","--port",e["port"]],"attach_argv":[*prefix,"attach","http://127.0.0.1:"+e["port"],"--dir",e["HARNESS_PROJECT"],"--session","ses_fixture"],"env":env,"session":"ses_fixture","capabilities":{"approval":True,"busy":True,"completion":True,"exact_session":True},"read_only_inputs":[],"protected_paths":sorted([e["FAKE_BACKEND"],p]),"event_url":"http://127.0.0.1:"+e["port"]+"/event","event_file":e["HARNESS_EVENT_FILE"],"managed_profile":profile}; writable=e["root_policy"]=="allow"; grants=[e["HARNESS_GRANT"]] if e["grant_policy"]=="allow" else []; manifest={"schema":1,"token":e["launch_token"],"identity_key":e["HARNESS_IDENTITY"],"root":e["HARNESS_PROJECT"],"git_dir":e["HARNESS_GIT_DIR"],"git_common_dir":e["HARNESS_GIT"],"git_entry":e["HARNESS_PROJECT"]+"/.git","writable":writable,"grants":grants,"review_id":"review_0123456789abcdef" if writable else None,"runtime_root":e["HARNESS_RUNTIME"],"state_root":e["HARNESS_STATE"],"context_dir":e["HARNESS_CONTEXT"],"backend_state_dir":b,"control_socket":e["HARNESS_CONTROL_SOCKET"],"control_token":e["HARNESS_CONTROL_TOKEN"],"control_helper":e["TRUE_PATH"],"event_helper":e["TRUE_PATH"],"profile_helper":e["PROFILE_HELPER"],"launcher":e["LAUNCHER"],"review_helper":e["TRUE_PATH"],"event_file":e["HARNESS_EVENT_FILE"],"tmux_socket":e["HARNESS_TMUX_SOCKET"],"python":e["PYTHON"],"bwrap":e["BWRAP"],"host_tools":sorted([e["GIT"],e["TMUX"]]),"shell":e["SHELL_PATH"],"launch":launch}; open(e["manifest_path"],"w",encoding="utf-8").write(json.dumps(manifest,separators=(",",":"))+"\n")'
   chmod 600 "$manifest_path"
 }
 

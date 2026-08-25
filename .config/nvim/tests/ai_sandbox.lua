@@ -246,6 +246,149 @@ eq(managed.manifest.launch.server_argv, server_launch.server_argv, "server argv 
 eq(managed.manifest.launch.attach_argv, server_launch.attach_argv, "attach argv preserved")
 eq(managed.manifest.launch.env, managed_environment, "managed environment preserved")
 
+local empty_session_launch = vim.deepcopy(server_launch)
+empty_session_launch.session = ""
+empty_session_launch.attach_argv = {
+  "/usr/bin/opencode",
+  "--pure",
+  "attach",
+  "http://127.0.0.1:4096",
+  "--dir",
+  "/work/repo",
+}
+local empty_session = assert(sandbox._test.prepare(base_options(empty_session_launch)))
+eq(empty_session.manifest.launch.attach_argv, empty_session_launch.attach_argv, "new-session argv")
+
+local argv_mutations = {
+  {
+    label = "server trailing argument",
+    mutate = function(launch)
+      table.insert(launch.server_argv, "--fixture")
+    end,
+  },
+  {
+    label = "server duplicate hostname",
+    mutate = function(launch)
+      vim.list_extend(launch.server_argv, { "--hostname", "0.0.0.0" })
+    end,
+  },
+  {
+    label = "attach trailing argument",
+    mutate = function(launch)
+      table.insert(launch.attach_argv, "--help")
+    end,
+  },
+  {
+    label = "attach duplicate session",
+    mutate = function(launch)
+      vim.list_extend(launch.attach_argv, { "--session", launch.session })
+    end,
+  },
+  {
+    label = "attach duplicate directory",
+    mutate = function(launch)
+      vim.list_extend(launch.attach_argv, { "--dir", identity.root })
+    end,
+  },
+  {
+    label = "empty session with session pair",
+    mutate = function(launch)
+      launch.session = ""
+    end,
+  },
+  {
+    label = "missing hostname control",
+    mutate = function(launch)
+      launch.server_argv[4] = "hostname"
+    end,
+  },
+  {
+    label = "misordered server controls",
+    mutate = function(launch)
+      launch.server_argv[4], launch.server_argv[6] = launch.server_argv[6], launch.server_argv[4]
+    end,
+  },
+  {
+    label = "changed server address",
+    mutate = function(launch)
+      launch.server_argv[5] = "0.0.0.0"
+    end,
+  },
+  {
+    label = "missing directory control",
+    mutate = function(launch)
+      launch.attach_argv[5] = "dir"
+    end,
+  },
+  {
+    label = "misordered attach controls",
+    mutate = function(launch)
+      launch.attach_argv[5], launch.attach_argv[7] = launch.attach_argv[7], launch.attach_argv[5]
+    end,
+  },
+  {
+    label = "missing session pair",
+    mutate = function(launch)
+      table.remove(launch.attach_argv)
+      table.remove(launch.attach_argv)
+    end,
+  },
+  {
+    label = "misordered session pair",
+    mutate = function(launch)
+      launch.attach_argv[7], launch.attach_argv[8] = launch.attach_argv[8], launch.attach_argv[7]
+    end,
+  },
+  {
+    label = "mismatched root",
+    mutate = function(launch)
+      launch.attach_argv[6] = "/work/other"
+    end,
+  },
+  {
+    label = "mismatched session",
+    mutate = function(launch)
+      launch.attach_argv[8] = "ses_other"
+    end,
+  },
+  {
+    label = "mismatched server port",
+    mutate = function(launch)
+      launch.server_argv[7] = "4097"
+    end,
+  },
+  {
+    label = "mismatched attach port",
+    mutate = function(launch)
+      launch.attach_argv[4] = "http://127.0.0.1:4097"
+    end,
+  },
+}
+for _, mutation in ipairs(argv_mutations) do
+  local changed = vim.deepcopy(server_launch)
+  mutation.mutate(changed)
+  rejected(function()
+    return sandbox._test.prepare(base_options(changed))
+  end, mutation.label, "OpenCode")
+end
+
+for _, port_case in ipairs({
+  { server = "0", attach = "0" },
+  { server = "65536", attach = "65536" },
+  { server = "04096", attach = "4096" },
+  { server = "+4096", attach = "4096" },
+  { server = " 4096", attach = "4096" },
+  { server = "4096 ", attach = "4096" },
+  { server = "٤٠٩٦", attach = "4096" },
+}) do
+  local changed = vim.deepcopy(server_launch)
+  changed.server_argv[7] = port_case.server
+  changed.attach_argv[4] = "http://127.0.0.1:" .. port_case.attach
+  rejected(function()
+    return sandbox._test.prepare(base_options(changed))
+  end, "noncanonical port " .. vim.inspect(port_case.server), "OpenCode")
+end
+
 local private_profile = vim.deepcopy(server_launch)
 private_profile.managed_profile.auth = "authenticated"
 rejected(function()

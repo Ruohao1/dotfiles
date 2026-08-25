@@ -739,28 +739,32 @@ def _validate_launch(manifest):
         server = _validate_string_array(launch["server_argv"], "OpenCode server argv")
         attach = _validate_string_array(launch["attach_argv"], "OpenCode attach argv")
         if (
-            len(server) < 7
+            len(server) != 7
             or server[1:6] != ["--pure", "serve", "--hostname", "127.0.0.1", "--port"]
-            or len(attach) < 6
-            or attach[1] != "--pure"
-            or attach[2] != "attach"
-            or attach[4:6] != ["--dir", manifest["root"]]
-            or server[0] != attach[0]
         ):
             raise ValueError("OpenCode server or attach command form changed")
-        try:
-            port = int(server[6])
-        except (TypeError, ValueError):
-            raise ValueError("OpenCode server port is invalid") from None
-        if port < 1 or port > 65535 or attach[3] != "http://127.0.0.1:" + str(port):
-            raise ValueError("OpenCode server and attach ports disagree")
+        port = server[6]
+        if (
+            not port.isascii()
+            or not port.isdigit()
+            or len(port) > 5
+            or int(port) < 1
+            or int(port) > 65535
+            or str(int(port)) != port
+        ):
+            raise ValueError("OpenCode server port is invalid")
+        expected_attach = [
+            server[0],
+            "--pure",
+            "attach",
+            "http://127.0.0.1:" + port,
+            "--dir",
+            manifest["root"],
+        ]
         if launch["session"]:
-            try:
-                session_index = attach.index("--session", 6)
-            except ValueError:
-                raise ValueError("OpenCode attach session is missing") from None
-            if session_index + 1 >= len(attach) or attach[session_index + 1] != launch["session"]:
-                raise ValueError("OpenCode attach session changed")
+            expected_attach.extend(["--session", launch["session"]])
+        if attach != expected_attach:
+            raise ValueError("OpenCode server or attach command form changed")
         _validate_executable(server[0], "OpenCode executable")
         if server[0] not in protected:
             raise ValueError("OpenCode executable is not protected")

@@ -429,6 +429,131 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "managed profile"):
             launcher.validate_manifest(manifest, fixture_metadata())
 
+    def test_opencode_server_and_attach_argv_shapes_are_exact(self) -> None:
+        empty_session = self.fixture.manifest()
+        empty_launch = empty_session["launch"]
+        assert isinstance(empty_launch, dict)
+        empty_launch["session"] = ""
+        empty_launch["attach_argv"] = empty_launch["attach_argv"][:6]
+        launcher.validate_manifest(empty_session, fixture_metadata())
+
+        def swap_server_controls(launch: dict[str, object]) -> None:
+            argv = launch["server_argv"]
+            assert isinstance(argv, list)
+            argv[3], argv[5] = argv[5], argv[3]
+
+        def swap_attach_controls(launch: dict[str, object]) -> None:
+            argv = launch["attach_argv"]
+            assert isinstance(argv, list)
+            argv[4], argv[6] = argv[6], argv[4]
+
+        def remove_session_pair(launch: dict[str, object]) -> None:
+            argv = launch["attach_argv"]
+            assert isinstance(argv, list)
+            del argv[-2:]
+
+        def swap_session_pair(launch: dict[str, object]) -> None:
+            argv = launch["attach_argv"]
+            assert isinstance(argv, list)
+            argv[6], argv[7] = argv[7], argv[6]
+
+        mutations = (
+            (
+                "server trailing argument",
+                lambda launch: launch["server_argv"].append("--fixture"),
+            ),
+            (
+                "server duplicate hostname",
+                lambda launch: launch["server_argv"].extend(
+                    ["--hostname", "0.0.0.0"]
+                ),
+            ),
+            (
+                "attach trailing argument",
+                lambda launch: launch["attach_argv"].append("--help"),
+            ),
+            (
+                "attach duplicate session",
+                lambda launch: launch["attach_argv"].extend(
+                    ["--session", launch["session"]]
+                ),
+            ),
+            (
+                "attach duplicate directory",
+                lambda launch: launch["attach_argv"].extend(
+                    ["--dir", str(self.fixture.project)]
+                ),
+            ),
+            (
+                "empty session with session pair",
+                lambda launch: launch.update({"session": ""}),
+            ),
+            (
+                "missing hostname control",
+                lambda launch: launch["server_argv"].__setitem__(3, "hostname"),
+            ),
+            ("misordered server controls", swap_server_controls),
+            (
+                "changed server address",
+                lambda launch: launch["server_argv"].__setitem__(4, "0.0.0.0"),
+            ),
+            (
+                "missing directory control",
+                lambda launch: launch["attach_argv"].__setitem__(4, "dir"),
+            ),
+            ("misordered attach controls", swap_attach_controls),
+            ("missing session pair", remove_session_pair),
+            ("misordered session pair", swap_session_pair),
+            (
+                "mismatched root",
+                lambda launch: launch["attach_argv"].__setitem__(
+                    5, str(self.fixture.base / "other-root")
+                ),
+            ),
+            (
+                "mismatched session",
+                lambda launch: launch["attach_argv"].__setitem__(7, "ses_other"),
+            ),
+            (
+                "mismatched server port",
+                lambda launch: launch["server_argv"].__setitem__(6, "4097"),
+            ),
+            (
+                "mismatched attach port",
+                lambda launch: launch["attach_argv"].__setitem__(
+                    3, "http://127.0.0.1:4097"
+                ),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                manifest = self.fixture.manifest()
+                launch = manifest["launch"]
+                assert isinstance(launch, dict)
+                mutate(launch)
+                with self.assertRaisesRegex(ValueError, "OpenCode"):
+                    launcher.validate_manifest(manifest, fixture_metadata())
+
+        for server_port, attach_port in (
+            ("0", "0"),
+            ("65536", "65536"),
+            ("04096", "4096"),
+            ("+4096", "4096"),
+            (" 4096", "4096"),
+            ("4096 ", "4096"),
+            ("٤٠٩٦", "4096"),
+        ):
+            with self.subTest(server_port=server_port):
+                manifest = self.fixture.manifest()
+                launch = manifest["launch"]
+                assert isinstance(launch, dict)
+                launch["server_argv"][6] = server_port
+                launch["attach_argv"][3] = (
+                    "http://127.0.0.1:" + attach_port
+                )
+                with self.assertRaisesRegex(ValueError, "OpenCode"):
+                    launcher.validate_manifest(manifest, fixture_metadata())
+
     def test_profile_public_shape_version_fingerprint_and_paths_are_exact(self) -> None:
         mutations = {
             "extra field": lambda value: value.update({"auth": "authenticated"}),

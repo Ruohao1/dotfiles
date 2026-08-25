@@ -310,7 +310,18 @@ local function optional_text(value, label)
   return value
 end
 
-local function validate_launch(launch, backend_state)
+local function canonical_port(value)
+  if type(value) ~= "string" or value == "" or #value > 5 or value:match("^[0-9]+$") == nil then
+    return nil
+  end
+  local number = tonumber(value)
+  if number == nil or number < 1 or number > 65535 or tostring(number) ~= value then
+    return nil
+  end
+  return value
+end
+
+local function validate_launch(launch, backend_state, root)
   if type(launch) ~= "table" then
     return nil, "backend launch must be an object"
   end
@@ -416,12 +427,28 @@ local function validate_launch(launch, backend_state)
     if not attach or #attach == 0 then
       return nil, attach_error or "OpenCode attach argv is empty"
     end
+    local port = canonical_port(server[7])
     if
-      server[1] ~= attach[1]
+      #server ~= 7
       or server[2] ~= "--pure"
       or server[3] ~= "serve"
+      or server[4] ~= "--hostname"
+      or server[5] ~= "127.0.0.1"
+      or server[6] ~= "--port"
+      or port == nil
+    then
+      return nil, "OpenCode server and attach command forms changed"
+    end
+    local expected_attach_length = launch.session == "" and 6 or 8
+    if
+      #attach ~= expected_attach_length
+      or attach[1] ~= server[1]
       or attach[2] ~= "--pure"
       or attach[3] ~= "attach"
+      or attach[4] ~= "http://127.0.0.1:" .. port
+      or attach[5] ~= "--dir"
+      or attach[6] ~= root
+      or (launch.session ~= "" and (attach[7] ~= "--session" or attach[8] ~= launch.session))
     then
       return nil, "OpenCode server and attach command forms changed"
     end
@@ -629,7 +656,7 @@ local function prepare(options)
   if not grants then
     return nil, grants_error
   end
-  local launch, launch_error = validate_launch(options.launch, paths.backend_state_dir)
+  local launch, launch_error = validate_launch(options.launch, paths.backend_state_dir, root)
   if not launch then
     return nil, launch_error
   end
