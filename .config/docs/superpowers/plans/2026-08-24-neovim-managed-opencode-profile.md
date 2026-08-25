@@ -651,9 +651,12 @@ Preseed the probe configuration tree with the managed contract's exact fixed boo
 Mount a private tmpfs at `/tmp`, create the fixed `/tmp/nvim-ai-probe` tree inside that writable namespace, and mount the probe home and XDG configuration sources read-only at `/tmp/nvim-ai-probe/home` and `/tmp/nvim-ai-probe/xdg-config`.
 Back the writable XDG data, cache, and state destinations beneath that private probe tree with separate trusted current-user-owned mode-0700 host directories.
 After every command, securely inspect those bounded host-visible trees before cleanup and accept only the exact audited benign artifact shape for `v1.18.18`; reject every unknown entry or forbidden log, dependency, plugin, update, LSP-download, or network-setup artifact.
+Allow `opencode.log` to be either empty or the exact 994-byte nine-line INFO startup trace that `v1.18.18` can flush during a slow but successful probe.
+Require that trace to contain one consistent eight-character lowercase hexadecimal run identifier, nine nondecreasing ISO-8601 millisecond UTC timestamps, the audited fixed messages and `/tmp/nvim-ai-probe` discovery paths, and normalized SHA-256 `5f83512e2594b9182bbf4b33632ca0b711b22b1555919e93127d28746ec2412f` after replacing only the validated timestamps and run identifier.
+Reject every other log size, level, line count, order, message, path, identifier shape, timestamp shape, normalized digest, or forbidden side-effect marker.
 Run every probe through validated Bubblewrap with `--unshare-net`, a read-only `/`, no tmux or Neovim variables, and a two-second timeout per command.
 Never attempt to create a probe destination directly beneath the read-only root bind.
-Reject any probe log or filesystem evidence of configuration dependency installation, plugin loading, update, LSP download, or network setup.
+Reject any unaudited probe log or filesystem evidence of configuration dependency installation, plugin loading, update, LSP download, or network setup.
 
 Collect these commands:
 
