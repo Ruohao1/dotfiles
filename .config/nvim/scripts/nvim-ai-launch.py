@@ -42,6 +42,7 @@ AUDITED_BOOTSTRAP_GITIGNORE_SHA256 = (
     "663a068e76d264d0bc6740f5450b6c4193c7b41ecf5e0dc222485b8a17404d95"
 )
 MOUNT_DESTINATION_CLEANUP_ERROR = "mount destination cleanup failed"
+CHILD_CLEANUP_ERROR = "managed child cleanup failed"
 
 TOP_LEVEL_KEYS = frozenset(
     (
@@ -1981,21 +1982,56 @@ def _wait_for_server(server, port):
 def _terminate_child(child):
     if child is None:
         return
+    cleanup_failed = False
+    confirmed = False
     try:
-        if child.poll() is None:
+        confirmed = child.poll() is not None
+    except OSError:
+        cleanup_failed = True
+    if not confirmed:
+        try:
             child.terminate()
-        child.wait(timeout=2.0)
-    except subprocess.TimeoutExpired:
+        except OSError:
+            cleanup_failed = True
+        try:
+            child.wait(timeout=2.0)
+            confirmed = True
+        except subprocess.TimeoutExpired:
+            pass
+        except OSError:
+            cleanup_failed = True
+    if not confirmed:
         try:
             child.kill()
         except OSError:
-            pass
+            cleanup_failed = True
         try:
             child.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            pass
-    finally:
+            confirmed = True
+        except (OSError, subprocess.TimeoutExpired):
+            cleanup_failed = True
+    if confirmed:
         _forget_child(child)
+    if cleanup_failed or not confirmed:
+        raise ValueError(CHILD_CLEANUP_ERROR)
+
+
+def _terminate_children(*children):
+    cleanup_failed = False
+    for child in children:
+        try:
+            _terminate_child(child)
+        except ValueError:
+            cleanup_failed = True
+    if cleanup_failed:
+        raise ValueError(CHILD_CLEANUP_ERROR)
+
+
+def _append_failed_event(manifest):
+    try:
+        append_event(manifest, "failed")
+    except (OSError, ValueError):
+        pass
 
 
 def run_backend(manifest, environment, on_start=None):
@@ -2017,16 +2053,20 @@ def run_backend(manifest, environment, on_start=None):
                 append_event(manifest, "failed")
             return code
         except (OSError, ValueError):
-            if child is not None:
-                _terminate_child(child)
-            try:
-                append_event(manifest, "failed")
-            except ValueError:
-                pass
+            cleanup_failed = False
+            if child is not None and child in _ACTIVE_CHILDREN:
+                try:
+                    _terminate_children(child)
+                except ValueError:
+                    cleanup_failed = True
+            _append_failed_event(manifest)
+            if cleanup_failed:
+                raise ValueError(CHILD_CLEANUP_ERROR) from None
             raise ValueError("managed backend could not run") from None
 
     server = attach = None
     stdout_descriptor = stderr_descriptor = None
+    failed_event_attempted = False
     try:
         server_argv = build_bwrap_argv(manifest, launch["server_argv"])
         attach_argv = build_bwrap_argv(manifest, launch["attach_argv"])
@@ -2061,18 +2101,25 @@ def run_backend(manifest, environment, on_start=None):
             append_event(manifest, "failed")
         return code
     except (OSError, ValueError):
-        try:
-            append_event(manifest, "failed")
-        except ValueError:
-            pass
+        _append_failed_event(manifest)
+        failed_event_attempted = True
         raise ValueError("managed server or attach client could not run") from None
     finally:
-        if stdout_descriptor is not None:
-            os.close(stdout_descriptor)
-        if stderr_descriptor is not None:
-            os.close(stderr_descriptor)
-        _terminate_child(attach)
-        _terminate_child(server)
+        cleanup_failed = False
+        for descriptor in (stdout_descriptor, stderr_descriptor):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    cleanup_failed = True
+        try:
+            _terminate_children(attach, server)
+        except ValueError:
+            cleanup_failed = True
+        if cleanup_failed:
+            if not failed_event_attempted:
+                _append_failed_event(manifest)
+            raise ValueError(CHILD_CLEANUP_ERROR) from None
 
 
 def _bounded_diagnostic(message):
@@ -2090,6 +2137,8 @@ def _bounded_diagnostic(message):
 
 
 def _fixed_wait():
+    for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(number, signal.SIG_DFL)
     while True:
         signal.pause()
 
@@ -2136,6 +2185,15 @@ def main(argv=None):
             "nvim-ai-launch: managed backend exited with code " + str(code),
         )
     except ValueError as error:
+        if _ACTIVE_CHILDREN:
+            print(
+                _bounded_diagnostic(
+                    "nvim-ai-launch: managed child cleanup failed"
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
         if started and manifest is not None and environment is not None:
             diagnostic_fallback(
                 manifest,

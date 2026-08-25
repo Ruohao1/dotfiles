@@ -8,10 +8,13 @@ import importlib.util
 import json
 import os
 import pathlib
+import select
 import shutil
 import signal
 import socket
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -1622,6 +1625,99 @@ class FakeProcess:
         self.running = False
 
 
+class UncertainCleanupProcess:
+    def __init__(self, failing_operation: str) -> None:
+        self.failing_operation = failing_operation
+        self.log: list[str] = []
+        self.initial_wait = True
+        self.cleanup_waits = 0
+
+    def poll(self) -> None:
+        self.log.append("poll")
+        if self.failing_operation == "poll":
+            raise OSError("poll credential-canary")
+        return None
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.log.append("wait")
+        if timeout is None and self.initial_wait:
+            self.initial_wait = False
+            raise OSError("runtime credential-canary")
+        self.cleanup_waits += 1
+        if self.failing_operation == "wait" and self.cleanup_waits == 1:
+            raise OSError("wait credential-canary")
+        raise subprocess.TimeoutExpired("fixture", timeout)
+
+    def terminate(self) -> None:
+        self.log.append("terminate")
+        if self.failing_operation == "terminate":
+            raise OSError("terminate credential-canary")
+
+    def kill(self) -> None:
+        self.log.append("kill")
+        if self.failing_operation == "kill":
+            raise OSError("kill credential-canary")
+
+
+class LauncherSignalProcessTests(unittest.TestCase):
+    def test_refused_launch_exits_normally_for_term_int_and_hup(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="nvim-ai-refusal-") as directory:
+            missing = str(pathlib.Path(directory).resolve() / "missing.json")
+            for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                for attempt in range(20):
+                    with self.subTest(
+                        signal=signal.Signals(number).name,
+                        attempt=attempt,
+                    ):
+                        self._assert_refused_launch_signal(missing, number)
+
+    def _assert_refused_launch_signal(self, missing: str, number: int) -> None:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                str(LAUNCHER_PATH),
+                "--manifest",
+                missing,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            close_fds=True,
+        )
+        try:
+            assert process.stderr is not None
+            readable, _, _ = select.select([process.stderr], [], [], 2.0)
+            self.assertTrue(readable, "refusal diagnostic timed out")
+            self.assertEqual(
+                process.stderr.readline(),
+                "nvim-ai-launch: launch refused\n",
+            )
+            children = pathlib.Path(
+                f"/proc/{process.pid}/task/{process.pid}/children"
+            ).read_text(encoding="ascii")
+            self.assertEqual(children.strip(), "")
+            process.send_signal(number)
+            try:
+                return_code = process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2.0)
+                self.fail(
+                    signal.Signals(number).name
+                    + " was swallowed by fixed wait"
+                )
+            self.assertEqual(return_code, -number)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2.0)
+            if process.stderr is not None:
+                process.stderr.close()
+
+
 class ProcessBoundaryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture = Fixture(self)
@@ -1750,6 +1846,114 @@ class ProcessBoundaryTests(unittest.TestCase):
         self.assertEqual(first.signals, [signal.SIGTERM])
         self.assertEqual(second.signals, [signal.SIGTERM])
 
+    def test_direct_cleanup_normalizes_every_error_and_retains_uncertain_child(self) -> None:
+        manifest = self.fixture.direct_manifest()
+        environment = launcher.build_environment(manifest, dict(os.environ))
+        for operation in ("poll", "terminate", "kill", "wait"):
+            with self.subTest(operation=operation):
+                launcher._ACTIVE_CHILDREN.clear()
+                child = UncertainCleanupProcess(operation)
+                events: list[str] = []
+
+                def start_child(*_args: object, **_options: object):
+                    launcher._ACTIVE_CHILDREN.append(child)
+                    return child
+
+                with mock.patch.object(
+                    launcher, "_start_child", side_effect=start_child
+                ):
+                    with mock.patch.object(
+                        launcher,
+                        "append_event",
+                        side_effect=lambda _manifest, state: events.append(state),
+                    ):
+                        with self.assertRaisesRegex(ValueError, "cleanup") as caught:
+                            launcher.run_backend(manifest, environment)
+                self.assertNotIn("credential-canary", str(caught.exception))
+                self.assertEqual(events, ["open", "failed"])
+                self.assertIn(child, launcher._ACTIVE_CHILDREN)
+                for action in ("poll", "terminate", "kill"):
+                    self.assertIn(action, child.log)
+                self.assertGreaterEqual(child.log.count("wait"), 3)
+
+    def test_server_cleanup_attempts_server_after_every_attach_cleanup_error(self) -> None:
+        manifest = self.fixture.manifest()
+        environment = launcher.build_environment(manifest, dict(os.environ))
+        for operation in ("poll", "terminate", "kill", "wait"):
+            with self.subTest(operation=operation):
+                launcher._ACTIVE_CHILDREN.clear()
+                server = FakeProcess()
+                attach = UncertainCleanupProcess(operation)
+                children = iter((server, attach))
+                events: list[str] = []
+
+                def start_child(*_args: object, **_options: object):
+                    child = next(children)
+                    launcher._ACTIVE_CHILDREN.append(child)
+                    return child
+
+                descriptors = [
+                    os.open(os.devnull, os.O_WRONLY),
+                    os.open(os.devnull, os.O_WRONLY),
+                ]
+                with mock.patch.object(
+                    launcher, "_open_server_output", side_effect=descriptors
+                ):
+                    with mock.patch.object(launcher, "_wait_for_server"):
+                        with mock.patch.object(
+                            launcher, "_start_child", side_effect=start_child
+                        ):
+                            with mock.patch.object(
+                                launcher,
+                                "append_event",
+                                side_effect=lambda _manifest, state: events.append(
+                                    state
+                                ),
+                            ):
+                                with self.assertRaisesRegex(
+                                    ValueError, "cleanup"
+                                ) as caught:
+                                    launcher.run_backend(manifest, environment)
+                self.assertNotIn("credential-canary", str(caught.exception))
+                self.assertEqual(events, ["open", "failed"])
+                self.assertTrue(server.terminated)
+                self.assertNotIn(server, launcher._ACTIVE_CHILDREN)
+                self.assertIn(attach, launcher._ACTIVE_CHILDREN)
+
+    def test_failed_event_error_cannot_escape_uncertain_direct_cleanup(self) -> None:
+        manifest = self.fixture.direct_manifest()
+        environment = launcher.build_environment(manifest, dict(os.environ))
+        child = UncertainCleanupProcess("kill")
+
+        def start_child(*_args: object, **_options: object):
+            launcher._ACTIVE_CHILDREN.append(child)
+            return child
+
+        def append_event(_manifest: dict[str, object], state: str) -> None:
+            if state == "failed":
+                raise ValueError("failed event credential-canary")
+
+        with mock.patch.object(launcher, "_start_child", side_effect=start_child):
+            with mock.patch.object(
+                launcher, "append_event", side_effect=append_event
+            ) as event:
+                with self.assertRaisesRegex(ValueError, "cleanup") as caught:
+                    launcher.run_backend(manifest, environment)
+        self.assertNotIn("credential-canary", str(caught.exception))
+        self.assertEqual(
+            event.call_args_list,
+            [mock.call(manifest, "open"), mock.call(manifest, "failed")],
+        )
+        self.assertIn(child, launcher._ACTIVE_CHILDREN)
+
+    def test_poll_confirms_termination_before_child_is_forgotten(self) -> None:
+        child = FakeProcess(wait_code=7, running=False)
+        launcher._ACTIVE_CHILDREN.append(child)
+        launcher._terminate_child(child)
+        self.assertNotIn(child, launcher._ACTIVE_CHILDREN)
+        self.assertFalse(child.terminated)
+        self.assertFalse(child.killed)
+
     def test_bwrap_start_failure_never_retries_the_raw_backend(self) -> None:
         manifest = self.fixture.direct_manifest()
         environment = launcher.build_environment(manifest, dict(os.environ))
@@ -1859,6 +2063,63 @@ class ProcessBoundaryTests(unittest.TestCase):
                         environment,
                         "nvim-ai-launch: managed backend failed",
                     )
+
+    def test_main_exits_without_fallback_while_child_cleanup_is_uncertain(self) -> None:
+        manifest = self.fixture.direct_manifest()
+        environment = launcher.build_environment(manifest, dict(os.environ))
+        uncertain = UncertainCleanupProcess("wait")
+        created = [
+            {
+                "path": str(self.fixture.backend_state / "prepared"),
+                "dev": 1,
+                "ino": 2,
+                "kind": "directory",
+            }
+        ]
+
+        def fail_with_uncertain_child(_manifest, _environment, on_start=None):
+            assert on_start is not None
+            launcher._ACTIVE_CHILDREN.append(uncertain)
+            on_start()
+            raise ValueError("credential-canary cleanup failure")
+
+        with mock.patch.object(launcher, "_install_signal_handlers"):
+            with mock.patch.object(
+                launcher, "consume_manifest", return_value=(manifest, created)
+            ):
+                with mock.patch.object(
+                    launcher, "build_environment", return_value=environment
+                ):
+                    with mock.patch.object(
+                        launcher,
+                        "run_backend",
+                        side_effect=fail_with_uncertain_child,
+                    ):
+                        with mock.patch.object(
+                            launcher, "rollback_mount_destinations"
+                        ) as rollback:
+                            with mock.patch.object(
+                                launcher, "diagnostic_fallback"
+                            ) as fallback:
+                                with mock.patch.object(
+                                    launcher, "_fixed_wait"
+                                ) as fixed_wait:
+                                    with mock.patch("builtins.print") as printed:
+                                        self.assertEqual(
+                                            launcher.main(
+                                                ["--manifest", "/tmp/fixture.json"]
+                                            ),
+                                            1,
+                                        )
+        rollback.assert_not_called()
+        fallback.assert_not_called()
+        fixed_wait.assert_not_called()
+        printed.assert_called_once_with(
+            "nvim-ai-launch: managed child cleanup failed",
+            file=launcher.sys.stderr,
+            flush=True,
+        )
+        self.assertEqual(launcher._ACTIVE_CHILDREN, [uncertain])
 
     def test_main_surfaces_prestart_destination_cleanup_failure(self) -> None:
         manifest = self.fixture.direct_manifest()
