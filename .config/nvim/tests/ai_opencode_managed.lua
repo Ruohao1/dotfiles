@@ -870,6 +870,25 @@ for _, failure in ipairs({
   { stdout = "", stderr = "credential-secret-canary", code = 2 },
   { stdout = "{malformed credential-secret-canary", stderr = "", code = 0 },
   { stdout = string.rep("x", 65537), stderr = "", code = 0 },
+  { stdout = "", stderr = string.rep("x", 65537), code = 0 },
+  {
+    stdout = vim.json.encode(helper_profile) .. "\n",
+    stderr = "",
+    code = 0,
+    stdout_overflow = true,
+  },
+  {
+    stdout = vim.json.encode(helper_profile) .. "\n",
+    stderr = "",
+    code = 0,
+    stderr_overflow = true,
+  },
+  {
+    stdout = vim.json.encode(helper_profile) .. "\n",
+    stderr = "",
+    code = 0,
+    system_error = true,
+  },
 }) do
   local report, err =
     registry_module._test.invoke_profile_helper(launch_paths, "prepare", request, {
@@ -882,6 +901,9 @@ for _, failure in ipairs({
           signal = 0,
           stdout = failure.stdout,
           stderr = failure.stderr,
+          stdout_overflow = failure.stdout_overflow,
+          stderr_overflow = failure.stderr_overflow,
+          system_error = failure.system_error,
         }
       end,
     })
@@ -1008,6 +1030,146 @@ assert(
   "runner exception leaked through the probe boundary"
 )
 
+local bounded_system = registry_module._test.bounded_system
+assert(type(bounded_system) == "function", "bounded production runner is not exposed for testing")
+
+local early_overflow_kills = 0
+local early_overflow_signal
+local early_overflow = bounded_system(
+  { "/fake/early-overflow" },
+  { text = true, timeout = 10 },
+  { stdout = 8, stderr = 8 },
+  function(_, options)
+    options.stdout(nil, "12345678stdout-secret-canary")
+    return {
+      kill = function(_, signal)
+        early_overflow_kills = early_overflow_kills + 1
+        early_overflow_signal = signal
+        error("kill-secret-canary")
+      end,
+      wait = function()
+        return { code = 0, signal = 0 }
+      end,
+    }
+  end
+)
+eq(early_overflow.code, 126, "overflow before process assignment fails closed")
+eq(early_overflow.stdout, "", "early overflow discards retained stdout")
+eq(early_overflow.stderr, "", "early overflow has generic stderr")
+eq(early_overflow.stdout_overflow, true, "early stdout overflow is marked")
+eq(early_overflow_kills, 1, "pending overflow kills after process assignment")
+eq(early_overflow_signal, "sigkill", "early overflow uses the hard kill boundary")
+
+local late_overflow_kills = 0
+local late_overflow_signal
+local late_overflow = bounded_system(
+  { "/fake/late-overflow" },
+  { text = true, timeout = 10 },
+  { stdout = 8, stderr = 8 },
+  function(_, options)
+    return {
+      kill = function(_, signal)
+        late_overflow_kills = late_overflow_kills + 1
+        late_overflow_signal = signal
+      end,
+      wait = function()
+        options.stderr(nil, "12345678stderr-secret-canary")
+        return { code = 0, signal = 0 }
+      end,
+    }
+  end
+)
+eq(late_overflow.code, 126, "stderr overflow fails closed")
+eq(late_overflow.stdout, "", "stderr overflow discards stdout")
+eq(late_overflow.stderr, "", "stderr overflow discards retained stderr")
+eq(late_overflow.stderr_overflow, true, "stderr overflow is marked")
+eq(late_overflow_kills, 1, "stderr overflow kills an assigned process")
+eq(late_overflow_signal, "sigkill", "stderr overflow uses the hard kill boundary")
+
+for _, case in ipairs({
+  {
+    label = "stream callback error",
+    system = function(_, options)
+      options.stdout("callback-secret-canary", nil)
+      return {
+        kill = function() end,
+        wait = function()
+          return { code = 0, signal = 0 }
+        end,
+      }
+    end,
+  },
+  {
+    label = "invalid callback data",
+    system = function(_, options)
+      options.stderr(nil, { "callback-secret-canary" })
+      return {
+        kill = function() end,
+        wait = function()
+          return { code = 0, signal = 0 }
+        end,
+      }
+    end,
+  },
+  {
+    label = "spawn error",
+    system = function()
+      error("spawn-secret-canary")
+    end,
+  },
+  {
+    label = "wait error",
+    system = function(_, options)
+      return {
+        kill = function() end,
+        wait = function()
+          options.stdout(nil, "bounded")
+          error("wait-secret-canary")
+        end,
+      }
+    end,
+  },
+}) do
+  local failed = bounded_system(
+    { "/fake/" .. case.label },
+    { text = true, timeout = 10 },
+    { stdout = 8, stderr = 8 },
+    case.system
+  )
+  eq(failed.code, 126, case.label .. " fails closed")
+  eq(failed.stdout, "", case.label .. " returns no captured stdout")
+  eq(failed.stderr, "", case.label .. " returns no captured stderr")
+  eq(failed.system_error, true, case.label .. " is marked as a runner error")
+end
+
+local exact_bounded = bounded_system(
+  { "/fake/exact-output" },
+  { text = true, timeout = 10 },
+  { stdout = 16, stderr = 16 },
+  function(_, options)
+    return {
+      kill = function()
+        error("successful bounded process was killed")
+      end,
+      wait = function()
+        options.stdout(nil, "byte-")
+        options.stdout(nil, "exact\n")
+        options.stderr(nil, "warning\n")
+        options.stdout(nil, nil)
+        options.stderr(nil, nil)
+        return { code = 0, signal = 0 }
+      end,
+    }
+  end
+)
+eq(exact_bounded.code, 0, "bounded runner preserves successful code")
+eq(exact_bounded.signal, 0, "bounded runner preserves successful signal")
+eq(exact_bounded.stdout, "byte-exact\n", "bounded runner preserves stdout bytes")
+eq(exact_bounded.stderr, "warning\n", "bounded runner preserves stderr bytes")
+eq(exact_bounded.stdout_overflow, false, "bounded stdout is not marked overflow")
+eq(exact_bounded.stderr_overflow, false, "bounded stderr is not marked overflow")
+eq(exact_bounded.system_error, false, "bounded success is not marked as a runner error")
+
 local real_probe_root = vim.fn.tempname()
 assert(vim.fn.mkdir(real_probe_root, "p", 448) == 1, "create real probe fixture root")
 local real_probe_home = real_probe_root .. "/home"
@@ -1025,6 +1187,184 @@ local real_probe = registry_module._test.read_only_probe(true_executable, {}, {
 })
 vim.fn.delete(real_probe_root, "rf")
 assert(real_probe.code == 0, "provider-free real Bubblewrap probe failed: " .. real_probe.stderr)
+
+local output_boundary_root = vim.fs.joinpath(
+  assert(vim.env.HOME),
+  ".config",
+  ".nvim-ai-output-boundary-" .. vim.fn.sha256(vim.fn.tempname()):sub(1, 16)
+)
+assert(vim.fn.mkdir(output_boundary_root, "p", 448) == 1, "create output-boundary root")
+local output_boundary_paths = {
+  home = output_boundary_root .. "/home",
+  config = output_boundary_root .. "/xdg-config",
+  data = output_boundary_root .. "/xdg-data",
+  cache = output_boundary_root .. "/xdg-cache",
+  state = output_boundary_root .. "/xdg-state",
+}
+for _, path in pairs(output_boundary_paths) do
+  assert(vim.fn.mkdir(path, "", 448) == 1, "create output-boundary directory")
+end
+
+local bounded_executable = output_boundary_root .. "/bounded-output"
+vim.fn.writefile({
+  "#!/bin/sh",
+  "printf 'bounded-stdout\\n'",
+  "printf 'bounded-stderr\\n' >&2",
+}, bounded_executable)
+assert(vim.uv.fs_chmod(bounded_executable, 448))
+
+local probe_flood_executable = output_boundary_root .. "/probe-stdout-flood"
+vim.fn.writefile({
+  "#!/bin/sh",
+  "trap '' TERM",
+  "printf 'probe-output-secret-canary'",
+  "head -c 1114112 /dev/zero | tr '\\000' x",
+  "sleep 1",
+  'printf reached > "$XDG_CACHE_HOME/post-overflow"',
+}, probe_flood_executable)
+assert(vim.uv.fs_chmod(probe_flood_executable, 448))
+
+local helper_stdout_sentinel = output_boundary_root .. "/helper-stdout-completed"
+local helper_stdout_executable = output_boundary_root .. "/helper-stdout-flood"
+vim.fn.writefile({
+  "#!/bin/sh",
+  "trap '' TERM",
+  "printf 'helper-stdout-secret-canary'",
+  "head -c 70000 /dev/zero | tr '\\000' x",
+  "sleep 1",
+  "printf reached > " .. vim.fn.shellescape(helper_stdout_sentinel),
+}, helper_stdout_executable)
+assert(vim.uv.fs_chmod(helper_stdout_executable, 448))
+
+local helper_stderr_sentinel = output_boundary_root .. "/helper-stderr-completed"
+local helper_stderr_executable = output_boundary_root .. "/helper-stderr-flood"
+vim.fn.writefile({
+  "#!/bin/sh",
+  "trap '' TERM",
+  "printf 'helper-stderr-secret-canary' >&2",
+  "head -c 70000 /dev/zero | tr '\\000' x >&2",
+  "sleep 1",
+  "printf reached > " .. vim.fn.shellescape(helper_stderr_sentinel),
+}, helper_stderr_executable)
+assert(vim.uv.fs_chmod(helper_stderr_executable, 448))
+
+local common_output_probe_options = {
+  environment = { HOME = "/tmp/nvim-ai-probe/home" },
+  working_directory = "/tmp/nvim-ai-probe",
+  read_only_mounts = {
+    { source = output_boundary_paths.home, destination = "/tmp/nvim-ai-probe/home" },
+    { source = output_boundary_paths.config, destination = "/tmp/nvim-ai-probe/xdg-config" },
+  },
+}
+local bounded_probe = registry_module._test.read_only_probe(
+  assert(require("ai.tools").resolve(bounded_executable)),
+  {},
+  common_output_probe_options
+)
+eq(bounded_probe.code, 0, "bounded default probe succeeds")
+eq(bounded_probe.stdout, "bounded-stdout\n", "bounded default probe stdout remains byte-exact")
+eq(bounded_probe.stderr, "bounded-stderr\n", "bounded default probe stderr remains byte-exact")
+
+local flood_inspected = false
+local flood_created_sentinel = false
+local flood_inspection_result
+local flood_probe_options = vim.deepcopy(common_output_probe_options)
+flood_probe_options.environment = {
+  HOME = "/tmp/nvim-ai-probe/home",
+  XDG_CACHE_HOME = "/tmp/nvim-ai-probe/xdg-cache",
+}
+flood_probe_options.writable_mounts = {
+  { source = output_boundary_paths.data, destination = "/tmp/nvim-ai-probe/xdg-data" },
+  { source = output_boundary_paths.cache, destination = "/tmp/nvim-ai-probe/xdg-cache" },
+  { source = output_boundary_paths.state, destination = "/tmp/nvim-ai-probe/xdg-state" },
+}
+flood_probe_options.inspect_artifacts = function(result)
+  flood_inspected = true
+  flood_inspection_result = vim.deepcopy(result)
+  flood_created_sentinel = vim.uv.fs_lstat(output_boundary_paths.cache .. "/post-overflow") ~= nil
+  return true
+end
+local flood_probe = registry_module._test.read_only_probe(
+  assert(require("ai.tools").resolve(probe_flood_executable)),
+  {},
+  flood_probe_options
+)
+
+local helper_boundary_failures = {}
+for _, case in ipairs({
+  {
+    label = "stdout",
+    executable = helper_stdout_executable,
+    sentinel = helper_stdout_sentinel,
+    canary = "helper-stdout-secret-canary",
+  },
+  {
+    label = "stderr",
+    executable = helper_stderr_executable,
+    sentinel = helper_stderr_sentinel,
+    canary = "helper-stderr-secret-canary",
+  },
+}) do
+  local report, helper_error = registry_module._test.invoke_profile_helper(
+    { python = case.executable, profile_helper = case.executable },
+    "prepare",
+    request,
+    {
+      revalidate = function()
+        return true
+      end,
+    }
+  )
+  if report ~= nil then
+    helper_boundary_failures[#helper_boundary_failures + 1] = case.label
+      .. " flood returned a helper report"
+  end
+  if
+    type(helper_error) ~= "string"
+    or helper_error == ""
+    or helper_error:find(case.canary, 1, true)
+  then
+    helper_boundary_failures[#helper_boundary_failures + 1] = case.label
+      .. " flood returned a non-generic helper diagnostic"
+  end
+  if vim.uv.fs_lstat(case.sentinel) then
+    helper_boundary_failures[#helper_boundary_failures + 1] = case.label
+      .. " flood process was not killed at the stream limit"
+  end
+end
+
+vim.fn.delete(output_boundary_root, "rf")
+local output_boundary_failures = {}
+if not flood_inspected then
+  output_boundary_failures[#output_boundary_failures + 1] =
+    "probe artifacts were not inspected after output overflow"
+end
+if flood_created_sentinel then
+  output_boundary_failures[#output_boundary_failures + 1] =
+    "probe stdout flood was not killed at the stream limit"
+end
+if flood_probe.code ~= 126 or flood_probe.stderr ~= "probe output exceeded configured limit" then
+  output_boundary_failures[#output_boundary_failures + 1] =
+    "probe stdout flood returned a non-generic diagnostic"
+end
+if
+  type(flood_inspection_result) ~= "table"
+  or flood_inspection_result.stdout_overflow ~= true
+  or flood_inspection_result.stderr_overflow ~= false
+then
+  output_boundary_failures[#output_boundary_failures + 1] =
+    "artifact inspection did not receive the marked stdout overflow"
+end
+if
+  flood_probe.stdout ~= ""
+  or flood_probe.stderr:find("probe-output-secret-canary", 1, true)
+  or flood_probe.stdout:find("probe-output-secret-canary", 1, true)
+then
+  output_boundary_failures[#output_boundary_failures + 1] =
+    "probe stdout flood returned captured output"
+end
+vim.list_extend(output_boundary_failures, helper_boundary_failures)
+assert(#output_boundary_failures == 0, table.concat(output_boundary_failures, "; "))
 
 local compatibility_calls = {}
 local compatibility_metadata = 4
@@ -1156,6 +1496,59 @@ eq(#compatibility_calls, 24, "executable metadata change invalidates compatibili
 local successful_probe = compatibility_options.probe
 local probe_failure_cases = {
   {
+    label = "oversized injected stdout",
+    key = "--version",
+    result = {
+      code = 0,
+      signal = 0,
+      stdout = string.rep("x", 1024 * 1024 + 1) .. "probe-secret-canary",
+      stderr = "",
+    },
+  },
+  {
+    label = "marked injected stdout overflow",
+    key = "--version",
+    result = {
+      code = 0,
+      signal = 0,
+      stdout = "1.18.18\n",
+      stderr = "",
+      stdout_overflow = true,
+    },
+  },
+  {
+    label = "marked injected stderr overflow",
+    key = "--version",
+    result = {
+      code = 0,
+      signal = 0,
+      stdout = "1.18.18\n",
+      stderr = "",
+      stderr_overflow = true,
+    },
+  },
+  {
+    label = "marked injected runner error",
+    key = "--version",
+    result = {
+      code = 0,
+      signal = 0,
+      stdout = "1.18.18\n",
+      stderr = "",
+      system_error = true,
+    },
+  },
+  {
+    label = "oversized injected stderr",
+    key = "--version",
+    result = {
+      code = 0,
+      signal = 0,
+      stdout = "1.18.18\n",
+      stderr = string.rep("x", 65537) .. "probe-secret-canary",
+    },
+  },
+  {
     label = "prefixed version",
     key = "--version",
     result = { code = 0, signal = 0, stdout = "opencode 1.18.18\n", stderr = "" },
@@ -1211,6 +1604,32 @@ for _, case in ipairs(probe_failure_cases) do
     case.label .. " leaked raw probe output"
   )
 end
+
+registry_module._test.reset_opencode_compatibility_cache()
+compatibility_metadata = compatibility_metadata + 1
+local uncached_overflow_attempts = 0
+compatibility_options.probe = function(executable, arguments, options)
+  if table.concat(arguments, "\0") == "--version" then
+    uncached_overflow_attempts = uncached_overflow_attempts + 1
+    return {
+      code = 0,
+      signal = 0,
+      stdout = string.rep("x", 1024 * 1024 + 1) .. "probe-secret-canary",
+      stderr = "",
+    }
+  end
+  return successful_probe(executable, arguments, options)
+end
+for attempt = 1, 2 do
+  local report, report_error =
+    registry_module._test.opencode_compatibility("/usr/bin/opencode", compatibility_options)
+  eq(report, nil, "overflow attempt " .. attempt .. " is incompatible")
+  assert(
+    type(report_error) == "string" and not report_error:find("probe-secret-canary", 1, true),
+    "overflow attempt returned a raw diagnostic"
+  )
+end
+eq(uncached_overflow_attempts, 2, "overflowed compatibility result is never cached")
 compatibility_options.probe = successful_probe
 
 local artifact_failures = {}
@@ -1355,7 +1774,7 @@ end
 
 local artifact_trees = {}
 local artifact_summaries = {}
-for index = 1, 2 do
+for index = 1, 8 do
   local tree = assert(registry_module._test.create_opencode_probe_tree())
   artifact_trees[index] = tree
   local result = registry_module._test.read_only_probe(
@@ -1364,10 +1783,16 @@ for index = 1, 2 do
     real_artifact_probe_options(tree)
   )
   assert(result.code == 0, "clean real OpenCode artifact fixture failed")
-  assert(
-    registry_module._test.inspect_opencode_probe_artifacts(tree, true),
-    "production artifact inspector rejected a clean real OpenCode fixture"
-  )
+  local accepted, structural_failure =
+    registry_module._test.inspect_opencode_probe_artifacts(tree, true)
+  if not accepted then
+    local safe_failure = type(structural_failure) == "string"
+        and #structural_failure <= 128
+        and not structural_failure:find("[^a-z0-9:-]")
+        and structural_failure
+      or "invalid-structural-diagnostic"
+    error("production artifact inspector rejected a clean real OpenCode fixture: " .. safe_failure)
+  end
   local database = tree.data .. "/opencode/opencode.db"
   local shared_memory = tree.data .. "/opencode/opencode.db-shm"
   local write_ahead_log = tree.data .. "/opencode/opencode.db-wal"
@@ -1404,11 +1829,13 @@ local artifact_paths = {
   unknown = mutation_tree.cache .. "/opencode/unknown-artifact",
   write_ahead_log = mutation_tree.data .. "/opencode/opencode.db-wal",
 }
-local function artifacts_rejected(label, overrides)
-  assert(
-    not registry_module._test.inspect_opencode_probe_artifacts(mutation_tree, true, overrides),
-    label .. " was accepted by the production artifact inspector"
-  )
+local function artifacts_rejected(label, overrides, expected_category)
+  local accepted, category =
+    registry_module._test.inspect_opencode_probe_artifacts(mutation_tree, true, overrides)
+  assert(not accepted, label .. " was accepted by the production artifact inspector")
+  if expected_category then
+    eq(category, expected_category, label .. " structural failure category")
+  end
 end
 
 fixture_write(artifact_paths.unknown, "unknown")
@@ -1417,6 +1844,115 @@ assert(vim.uv.fs_unlink(artifact_paths.unknown))
 
 fixture_write(artifact_paths.log, "forbidden log")
 artifacts_rejected("nonempty probe log")
+fixture_write(artifact_paths.log, "")
+
+local startup_log_suffixes = {
+  'message="creating instance" directory=/tmp/nvim-ai-probe',
+  "message=fromDirectory directory=/tmp/nvim-ai-probe",
+  "message=bootstrapping directory=/tmp/nvim-ai-probe",
+  "message=loading path=/tmp/nvim-ai-probe/xdg-config/opencode/config.json",
+  "message=loading path=/tmp/nvim-ai-probe/xdg-config/opencode/opencode.json",
+  "message=loading path=/tmp/nvim-ai-probe/xdg-config/opencode/opencode.jsonc",
+  'message="all LSPs are disabled"',
+  'message="all formatters are disabled"',
+  "message=init",
+}
+local function startup_log_fixture(timestamps, run_identifiers, suffixes)
+  local lines = {}
+  suffixes = suffixes or startup_log_suffixes
+  for index, suffix in ipairs(suffixes) do
+    local timestamp = type(timestamps) == "table" and timestamps[index] or timestamps
+    local run_identifier = type(run_identifiers) == "table" and run_identifiers[index]
+      or run_identifiers
+    lines[index] =
+      string.format("timestamp=%s level=INFO run=%s %s", timestamp, run_identifier, suffix)
+  end
+  return table.concat(lines, "\n") .. "\n"
+end
+
+local startup_time = os.time()
+local startup_timestamp = os.date("!%Y-%m-%dT%H:%M:%S.000Z", startup_time)
+local exact_startup_log = startup_log_fixture(startup_timestamp, "deadbeef")
+eq(#exact_startup_log, 994, "exact audited startup-log size")
+fixture_write(artifact_paths.log, exact_startup_log)
+assert(
+  registry_module._test.inspect_opencode_probe_artifacts(mutation_tree, true),
+  "exact audited startup log was rejected"
+)
+
+local changed_runs = vim.tbl_map(function()
+  return "deadbeef"
+end, startup_log_suffixes)
+changed_runs[#changed_runs] = "feedface"
+fixture_write(artifact_paths.log, startup_log_fixture(startup_timestamp, changed_runs))
+artifacts_rejected("inconsistent startup-log run identifier", nil, "probe-log-run-identifier")
+
+fixture_write(artifact_paths.log, startup_log_fixture(startup_timestamp, "DEADBEEF"))
+artifacts_rejected("invalid startup-log run identifier", nil, "probe-log-run-identifier")
+
+local invalid_timestamp = startup_timestamp:sub(1, 5) .. "13" .. startup_timestamp:sub(8)
+fixture_write(artifact_paths.log, startup_log_fixture(invalid_timestamp, "deadbeef"))
+artifacts_rejected("invalid startup-log timestamp", nil, "probe-log-timestamp-shape")
+
+local reversed_timestamps = vim.tbl_map(function()
+  return startup_timestamp
+end, startup_log_suffixes)
+reversed_timestamps[2] = os.date("!%Y-%m-%dT%H:%M:%S.000Z", startup_time - 1)
+fixture_write(artifact_paths.log, startup_log_fixture(reversed_timestamps, "deadbeef"))
+artifacts_rejected("reversed startup-log timestamp", nil, "probe-log-timestamp-order")
+
+local changed_suffixes = vim.deepcopy(startup_log_suffixes)
+changed_suffixes[#changed_suffixes] = "message=unit"
+fixture_write(
+  artifact_paths.log,
+  startup_log_fixture(startup_timestamp, "deadbeef", changed_suffixes)
+)
+local changed_log_accepted, changed_log_category =
+  registry_module._test.inspect_opencode_probe_artifacts(mutation_tree, true)
+assert(not changed_log_accepted, "changed fixed startup-log message was accepted")
+assert(
+  type(changed_log_category) == "string"
+    and changed_log_category:match("^probe%-log%-normalized%-digest:[0-9a-f]+$")
+    and #changed_log_category == #"probe-log-normalized-digest:" + 64,
+  "changed startup-log message returned an unsafe structural digest"
+)
+
+local reordered_suffixes = vim.deepcopy(startup_log_suffixes)
+reordered_suffixes[1], reordered_suffixes[2] = reordered_suffixes[2], reordered_suffixes[1]
+fixture_write(
+  artifact_paths.log,
+  startup_log_fixture(startup_timestamp, "deadbeef", reordered_suffixes)
+)
+artifacts_rejected("reordered startup-log messages")
+
+local changed_path_suffixes = vim.deepcopy(startup_log_suffixes)
+changed_path_suffixes[4] = changed_path_suffixes[4]:gsub("config.json", "confjg.json")
+fixture_write(
+  artifact_paths.log,
+  startup_log_fixture(startup_timestamp, "deadbeef", changed_path_suffixes)
+)
+artifacts_rejected("changed startup-log path")
+
+local changed_level_log = exact_startup_log:gsub("level=INFO", "level=WARN", 1)
+eq(#changed_level_log, 994, "changed startup-log level preserves audited size")
+fixture_write(artifact_paths.log, changed_level_log)
+artifacts_rejected("changed startup-log level", nil, "probe-log-line-shape")
+
+local forbidden_startup_suffixes = vim.deepcopy(startup_log_suffixes)
+forbidden_startup_suffixes[#forbidden_startup_suffixes] = "http://evilx"
+fixture_write(
+  artifact_paths.log,
+  startup_log_fixture(startup_timestamp, "deadbeef", forbidden_startup_suffixes)
+)
+artifacts_rejected("forbidden startup-log evidence", nil, "probe-log-forbidden-evidence")
+
+local missing_line_break_log = exact_startup_log:gsub("\n", " ", 1)
+eq(#missing_line_break_log, 994, "changed startup-log line count preserves audited size")
+fixture_write(artifact_paths.log, missing_line_break_log)
+artifacts_rejected("changed startup-log line count", nil, "probe-log-line-count")
+
+fixture_write(artifact_paths.log, exact_startup_log .. "unknown\n")
+artifacts_rejected("extra startup-log line", nil, "probe-log-size")
 fixture_write(artifact_paths.log, "")
 
 local database_bytes = fixture_read(artifact_paths.database)
@@ -1529,9 +2065,13 @@ local function artifact_pack_u48_be(value)
 end
 
 local unchecked_same_size_mutations = {}
-local function require_same_size_mutation_rejection(label)
-  if registry_module._test.inspect_opencode_probe_artifacts(mutation_tree, true) then
+local function require_same_size_mutation_rejection(label, expected_category)
+  local accepted, category =
+    registry_module._test.inspect_opencode_probe_artifacts(mutation_tree, true)
+  if accepted then
     unchecked_same_size_mutations[#unchecked_same_size_mutations + 1] = label
+  elseif expected_category then
+    eq(category, expected_category, label .. " structural failure category")
   end
 end
 
@@ -1539,7 +2079,7 @@ fixture_write(
   artifact_paths.write_ahead_log,
   flip_artifact_byte(write_ahead_log_bytes, #write_ahead_log_bytes)
 )
-require_same_size_mutation_rejection("same-size WAL final-byte flip")
+require_same_size_mutation_rejection("same-size WAL final-byte flip", "sqlite-wal-frame-checksum")
 fixture_write(artifact_paths.write_ahead_log, write_ahead_log_bytes)
 
 fixture_write(artifact_paths.write_ahead_log, flip_artifact_byte(write_ahead_log_bytes, 1000))
@@ -1596,6 +2136,40 @@ local corrupt_timestamp_shm = link_artifact_shm_to_wal(shared_memory_bytes, corr
 fixture_write(artifact_paths.write_ahead_log, corrupt_timestamp_wal)
 fixture_write(artifact_paths.shared_memory, corrupt_timestamp_shm)
 require_same_size_mutation_rejection("rechecksummed inconsistent migration timestamp")
+fixture_write(artifact_paths.write_ahead_log, write_ahead_log_bytes)
+fixture_write(artifact_paths.shared_memory, shared_memory_bytes)
+
+local project_created_offset = 255459
+local project_updated_offset = 255465
+local project_created = artifact_u48_be(write_ahead_log_bytes, project_created_offset)
+local function write_project_timestamps(created, updated)
+  local wal =
+    artifact_replace(write_ahead_log_bytes, project_created_offset, artifact_pack_u48_be(created))
+  wal = artifact_replace(wal, project_updated_offset, artifact_pack_u48_be(updated))
+  wal = rechecksum_artifact_wal(wal)
+  fixture_write(artifact_paths.write_ahead_log, wal)
+  fixture_write(artifact_paths.shared_memory, link_artifact_shm_to_wal(shared_memory_bytes, wal))
+end
+
+write_project_timestamps(project_created, project_created + 1)
+assert(
+  registry_module._test.inspect_opencode_probe_artifacts(mutation_tree, true),
+  "one-millisecond project timestamp progression was rejected"
+)
+
+write_project_timestamps(project_created, project_created - 1)
+artifacts_rejected(
+  "reversed project timestamp progression",
+  nil,
+  "sqlite-wal-project-timestamp-order"
+)
+
+write_project_timestamps(project_created, project_created + 5001)
+artifacts_rejected(
+  "over-window project timestamp progression",
+  nil,
+  "sqlite-wal-project-timestamp-span"
+)
 fixture_write(artifact_paths.write_ahead_log, write_ahead_log_bytes)
 fixture_write(artifact_paths.shared_memory, shared_memory_bytes)
 
@@ -1710,8 +2284,50 @@ for _, tree in ipairs(artifact_trees) do
 end
 
 registry_module._test.reset_opencode_compatibility_cache()
+local compatibility_observer_root
+local compatibility_observations = {}
 local installed_compatibility, installed_compatibility_error =
-  registry_module._test.opencode_compatibility(installed_opencode)
+  registry_module._test.opencode_compatibility(installed_opencode, {
+    observe_probe = function(name, tree, observation)
+      compatibility_observations[#compatibility_observations + 1] = {
+        name = name,
+        observation = vim.deepcopy(observation),
+      }
+      if observation.artifact_accepted ~= true or observation.code ~= 0 then
+        compatibility_observer_root = compatibility_observer_root
+          or "/tmp/nvim-ai-opencode-compat-failure-" .. tostring(vim.uv.hrtime())
+        assert(vim.fn.mkdir(compatibility_observer_root, "p", 448) == 1)
+        local copy = vim
+          .system({ "cp", "-a", tree.root, compatibility_observer_root .. "/" .. name }, { text = true })
+          :wait()
+        assert(copy.code == 0, "failed to preserve observed compatibility tree")
+      end
+    end,
+  })
+if not installed_compatibility then
+  local categories = {}
+  for _, observed in ipairs(compatibility_observations) do
+    local observation = observed.observation
+    categories[#categories + 1] = table.concat({
+      observed.name,
+      tostring(observation.code),
+      observation.artifact_category,
+      tostring(observation.stdout_bytes),
+      tostring(observation.stderr_bytes),
+    }, ":")
+  end
+  error(
+    "real pinned OpenCode compatibility boundary failed: "
+      .. tostring(installed_compatibility_error)
+      .. "; structural observations="
+      .. table.concat(categories, ",")
+      .. "; preserved="
+      .. tostring(compatibility_observer_root)
+  )
+end
+if compatibility_observer_root then
+  vim.fn.delete(compatibility_observer_root, "rf")
+end
 assert(
   installed_compatibility ~= nil,
   "real pinned OpenCode compatibility boundary failed: " .. tostring(installed_compatibility_error)

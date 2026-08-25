@@ -13,6 +13,7 @@ local MAX_PROFILE_REPORT_BYTES = 65536
 local MAX_COMPATIBILITY_REPORT_BYTES = 1024 * 1024
 local OPENCODE_PROBE_LOCK = "0a009c556ac8352fed53ef8323a3a97270935d30.lock"
 local OPENCODE_PROBE_DB_SHA256 = "40cf07c52bfaa52b334ef341456f970787f6dc701ffe18ad3c572cb5056dbd70"
+local OPENCODE_PROBE_LOG_SHA256 = "5f83512e2594b9182bbf4b33632ca0b711b22b1555919e93127d28746ec2412f"
 local OPENCODE_PROBE_SHM_SHA256 = "a2410912adcf2ec5a17f767f110bf3ae6539c697a0a45453c7bb6f832d0245d4"
 local OPENCODE_PROBE_WAL_SHA256 = "acbe27717b5ac59975ae57011fefbcdcd0042f80286466cf318e405c9f5e7005"
 local OPENCODE_PROBE_MIGRATION_TIMESTAMPS = {
@@ -264,6 +265,146 @@ local function private_directory(path, lstat, getuid)
     and bit.band(stat.mode, 511) == 448
 end
 
+local function bounded_system(argv, options, limits, system)
+  local function failed(stdout_overflow, stderr_overflow, system_error)
+    return {
+      code = 126,
+      signal = 0,
+      stdout = "",
+      stderr = "",
+      stdout_overflow = stdout_overflow == true,
+      stderr_overflow = stderr_overflow == true,
+      system_error = system_error == true,
+    }
+  end
+
+  if
+    type(argv) ~= "table"
+    or not vim.islist(argv)
+    or type(options) ~= "table"
+    or type(limits) ~= "table"
+    or type(limits.stdout) ~= "number"
+    or limits.stdout < 0
+    or limits.stdout ~= math.floor(limits.stdout)
+    or type(limits.stderr) ~= "number"
+    or limits.stderr < 0
+    or limits.stderr ~= math.floor(limits.stderr)
+    or (system ~= nil and type(system) ~= "function")
+  then
+    return failed(false, false, true)
+  end
+
+  local stdout_chunks = {}
+  local stderr_chunks = {}
+  local stdout_length = 0
+  local stderr_length = 0
+  local stdout_overflow = false
+  local stderr_overflow = false
+  local system_error = false
+  local process
+  local stop_requested = false
+  local kill_attempted = false
+
+  local function kill_process()
+    if kill_attempted or not process then
+      return
+    end
+    kill_attempted = true
+    local kill_ok = pcall(process.kill, process, "sigkill")
+    if not kill_ok then
+      system_error = true
+    end
+  end
+
+  local function stop_process()
+    stop_requested = true
+    kill_process()
+  end
+
+  local function capture(stream)
+    local chunks = stream == "stdout" and stdout_chunks or stderr_chunks
+    local limit = limits[stream]
+    return function(err, data)
+      local callback_ok = pcall(function()
+        if err ~= nil or (data ~= nil and type(data) ~= "string") then
+          system_error = true
+          stop_process()
+          return
+        end
+        if data == nil or stdout_overflow or stderr_overflow or system_error or #data == 0 then
+          return
+        end
+        local length = stream == "stdout" and stdout_length or stderr_length
+        local remaining = limit - length
+        if #data > remaining then
+          if remaining > 0 then
+            chunks[#chunks + 1] = data:sub(1, remaining)
+          end
+          if stream == "stdout" then
+            stdout_length = limit
+            stdout_overflow = true
+          else
+            stderr_length = limit
+            stderr_overflow = true
+          end
+          stop_process()
+          return
+        end
+        chunks[#chunks + 1] = data
+        if stream == "stdout" then
+          stdout_length = stdout_length + #data
+        else
+          stderr_length = stderr_length + #data
+        end
+      end)
+      if not callback_ok then
+        system_error = true
+        stop_process()
+      end
+    end
+  end
+
+  local options_ok, system_options = pcall(vim.deepcopy, options)
+  if not options_ok or type(system_options) ~= "table" then
+    return failed(false, false, true)
+  end
+  system_options.stdout = capture("stdout")
+  system_options.stderr = capture("stderr")
+  local spawn_ok, spawned = pcall(system or vim.system, argv, system_options)
+  if not spawn_ok or type(spawned) ~= "table" then
+    return failed(stdout_overflow, stderr_overflow, true)
+  end
+  process = spawned
+  if type(process.kill) ~= "function" or type(process.wait) ~= "function" then
+    return failed(stdout_overflow, stderr_overflow, true)
+  end
+  if stop_requested then
+    kill_process()
+  end
+  local wait_ok, completed = pcall(process.wait, process)
+  if
+    not wait_ok
+    or type(completed) ~= "table"
+    or type(completed.code) ~= "number"
+    or type(completed.signal) ~= "number"
+  then
+    system_error = true
+    stop_process()
+  end
+  if stdout_overflow or stderr_overflow or system_error then
+    return failed(stdout_overflow, stderr_overflow, system_error)
+  end
+  return {
+    code = completed.code,
+    signal = completed.signal,
+    stdout = table.concat(stdout_chunks),
+    stderr = table.concat(stderr_chunks),
+    stdout_overflow = false,
+    stderr_overflow = false,
+    system_error = false,
+  }
+end
+
 local function read_only_probe(executable, arguments, overrides)
   local tools = require("ai.tools")
   local probe = overrides or {}
@@ -272,9 +413,13 @@ local function read_only_probe(executable, arguments, overrides)
   local environ = probe.environ or vim.fn.environ
   local lstat = probe.lstat or vim.uv.fs_lstat
   local getuid = probe.getuid or vim.uv.getuid
-  local run = probe.run or function(argv, options)
-    return vim.system(argv, options):wait()
-  end
+  local run = probe.run
+    or function(argv, options)
+      return bounded_system(argv, options, {
+        stdout = MAX_COMPATIBILITY_REPORT_BYTES,
+        stderr = MAX_HELP_BYTES,
+      })
+    end
 
   local executable_check_ok, executable_ok, executable_error = pcall(revalidate, executable)
   if not executable_check_ok or not executable_ok then
@@ -452,6 +597,17 @@ local function read_only_probe(executable, arguments, overrides)
     end
   end
   if not ok then
+    return { code = 126, signal = 0, stdout = "", stderr = "probe execution failed" }
+  end
+  if type(result) == "table" and (result.stdout_overflow or result.stderr_overflow) then
+    return {
+      code = 126,
+      signal = 0,
+      stdout = "",
+      stderr = "probe output exceeded configured limit",
+    }
+  end
+  if type(result) == "table" and result.system_error then
     return { code = 126, signal = 0, stdout = "", stderr = "probe execution failed" }
   end
   return result
@@ -837,10 +993,118 @@ local function normalize_probe_bytes(bytes, ranges)
   return table.concat(chunks)
 end
 
+local function probe_digest_failure(category, digest)
+  if type(digest) == "string" and #digest == 64 and not digest:find("[^0-9a-f]") then
+    return category .. ":" .. digest
+  end
+  return category .. ":invalid"
+end
+
+local function valid_probe_utc_timestamp(value)
+  if type(value) ~= "string" then
+    return false
+  end
+  local year, month, day, hour, minute, second, millisecond =
+    value:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)T(%d%d):(%d%d):(%d%d)%.(%d%d%d)Z$")
+  year = tonumber(year)
+  month = tonumber(month)
+  day = tonumber(day)
+  hour = tonumber(hour)
+  minute = tonumber(minute)
+  second = tonumber(second)
+  millisecond = tonumber(millisecond)
+  if
+    not year
+    or year < 1970
+    or not month
+    or month < 1
+    or month > 12
+    or not day
+    or not hour
+    or hour > 23
+    or not minute
+    or minute > 59
+    or not second
+    or second > 59
+    or not millisecond
+    or millisecond > 999
+  then
+    return false
+  end
+  local days = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
+  if year % 4 == 0 and (year % 100 ~= 0 or year % 400 == 0) then
+    days[2] = 29
+  end
+  return day >= 1 and day <= days[month]
+end
+
+local function valid_probe_log(bytes, filesystem)
+  if bytes == "" then
+    return true
+  end
+  if type(bytes) ~= "string" or #bytes ~= 994 then
+    return false, "probe-log-size"
+  end
+  if forbidden_probe_artifact(bytes) then
+    return false, "probe-log-forbidden-evidence"
+  end
+
+  local lines = {}
+  local cursor = 1
+  while cursor <= #bytes do
+    local newline = bytes:find("\n", cursor, true)
+    if not newline then
+      return false, "probe-log-line-count"
+    end
+    lines[#lines + 1] = bytes:sub(cursor, newline - 1)
+    cursor = newline + 1
+  end
+  if #lines ~= 9 then
+    return false, "probe-log-line-count"
+  end
+
+  local run_identifier
+  local previous_timestamp
+  local normalized = {}
+  for _, line in ipairs(lines) do
+    local timestamp, run, suffix = line:match("^timestamp=(%S+) level=INFO run=(%S+) (.+)$")
+    if not timestamp or not run or not suffix then
+      return false, "probe-log-line-shape"
+    end
+    if not valid_probe_utc_timestamp(timestamp) then
+      return false, "probe-log-timestamp-shape"
+    end
+    if previous_timestamp and timestamp < previous_timestamp then
+      return false, "probe-log-timestamp-order"
+    end
+    previous_timestamp = timestamp
+    if #run ~= 8 or run:find("[^0-9a-f]") then
+      return false, "probe-log-run-identifier"
+    end
+    if run_identifier and run ~= run_identifier then
+      return false, "probe-log-run-identifier"
+    end
+    run_identifier = run
+    normalized[#normalized + 1] = "timestamp=<time> level=INFO run=<duration> " .. suffix .. "\n"
+  end
+  local normalized_sha256 = filesystem.sha256(table.concat(normalized))
+  if normalized_sha256 ~= OPENCODE_PROBE_LOG_SHA256 then
+    return false, probe_digest_failure("probe-log-normalized-digest", normalized_sha256)
+  end
+  return true
+end
+
+local function safe_probe_artifact_category(value)
+  if type(value) == "string" and #value > 0 and #value <= 128 and not value:find("[^a-z0-9:-]") then
+    return value
+  end
+  return "unavailable"
+end
+
 local function valid_probe_wal_timestamps(write_ahead_log, filesystem)
   local now = filesystem.time()
   if type(now) ~= "number" or now <= 0 then
-    return false
+    return false, "sqlite-wal-clock"
   end
   local now_milliseconds = math.floor(now * 1000)
   local lower_bound = now_milliseconds - 60000
@@ -850,29 +1114,42 @@ local function valid_probe_wal_timestamps(write_ahead_log, filesystem)
   local maximum
   for _, offset in ipairs(OPENCODE_PROBE_MIGRATION_TIMESTAMPS) do
     local value = probe_u48_big_endian(write_ahead_log, offset)
-    if
-      not value
-      or value < lower_bound
-      or value > upper_bound
-      or (previous and value > previous)
-    then
-      return false
+    if not value then
+      return false, "sqlite-wal-migration-timestamp-structure"
+    end
+    if value < lower_bound or value > upper_bound then
+      return false, "sqlite-wal-migration-timestamp-range"
+    end
+    if previous and value > previous then
+      return false, "sqlite-wal-migration-timestamp-order"
     end
     previous = value
     minimum = minimum and math.min(minimum, value) or value
     maximum = maximum and math.max(maximum, value) or value
   end
   if not minimum or maximum - minimum > 1000 then
-    return false
+    return false, "sqlite-wal-migration-timestamp-span"
   end
   local created = probe_u48_big_endian(write_ahead_log, OPENCODE_PROBE_PROJECT_TIMESTAMPS[1])
   local updated = probe_u48_big_endian(write_ahead_log, OPENCODE_PROBE_PROJECT_TIMESTAMPS[2])
-  return created ~= nil
-    and created == updated
-    and created >= maximum
-    and created - maximum <= 5000
-    and created >= lower_bound
-    and created <= upper_bound
+  if not created or not updated then
+    return false, "sqlite-wal-project-timestamp-structure"
+  end
+  if updated < created then
+    return false, "sqlite-wal-project-timestamp-order"
+  end
+  if updated - created > 5000 or created < maximum or created - maximum > 5000 then
+    return false, "sqlite-wal-project-timestamp-span"
+  end
+  if
+    created < lower_bound
+    or created > upper_bound
+    or updated < lower_bound
+    or updated > upper_bound
+  then
+    return false, "sqlite-wal-project-timestamp-range"
+  end
+  return true
 end
 
 local function valid_probe_wal(write_ahead_log, filesystem)
@@ -895,7 +1172,7 @@ local function valid_probe_wal(write_ahead_log, filesystem)
     0x00
   )
   if #write_ahead_log ~= 259592 or write_ahead_log:sub(1, 16) ~= wal_header then
-    return nil
+    return nil, "sqlite-wal-header"
   end
   local checksum0, checksum1 = probe_sqlite_checksum(write_ahead_log, 1, 24, 0, 0)
   if
@@ -903,22 +1180,22 @@ local function valid_probe_wal(write_ahead_log, filesystem)
     or checksum0 ~= probe_u32(write_ahead_log, 25, false)
     or checksum1 ~= probe_u32(write_ahead_log, 29, false)
   then
-    return nil
+    return nil, "sqlite-wal-header-checksum"
   end
   local salt = write_ahead_log:sub(17, 24)
   if salt == string.rep("\0", 8) then
-    return nil
+    return nil, "sqlite-wal-salt"
   end
   local page_numbers = {}
   local normalized_ranges = { { offset = 17, length = 16 } }
   for frame = 0, 62 do
     local base = 33 + frame * 4120
     if write_ahead_log:sub(base + 8, base + 15) ~= salt then
-      return nil
+      return nil, "sqlite-wal-frame-salt"
     end
     checksum0, checksum1 = probe_sqlite_checksum(write_ahead_log, base, 8, checksum0, checksum1)
     if not checksum0 then
-      return nil
+      return nil, "sqlite-wal-frame-structure"
     end
     checksum0, checksum1 =
       probe_sqlite_checksum(write_ahead_log, base + 24, 4096, checksum0, checksum1)
@@ -927,17 +1204,18 @@ local function valid_probe_wal(write_ahead_log, filesystem)
       or checksum0 ~= probe_u32(write_ahead_log, base + 16, false)
       or checksum1 ~= probe_u32(write_ahead_log, base + 20, false)
     then
-      return nil
+      return nil, "sqlite-wal-frame-checksum"
     end
     local page_number = probe_u32(write_ahead_log, base, false)
     if not page_number or page_number == 0 then
-      return nil
+      return nil, "sqlite-wal-frame-page"
     end
     page_numbers[#page_numbers + 1] = page_number
     normalized_ranges[#normalized_ranges + 1] = { offset = base + 8, length = 16 }
   end
-  if not valid_probe_wal_timestamps(write_ahead_log, filesystem) then
-    return nil
+  local timestamps_ok, timestamp_error = valid_probe_wal_timestamps(write_ahead_log, filesystem)
+  if not timestamps_ok then
+    return nil, timestamp_error
   end
   for _, offset in ipairs(OPENCODE_PROBE_MIGRATION_TIMESTAMPS) do
     normalized_ranges[#normalized_ranges + 1] = { offset = offset, length = 6 }
@@ -946,8 +1224,12 @@ local function valid_probe_wal(write_ahead_log, filesystem)
     normalized_ranges[#normalized_ranges + 1] = { offset = offset, length = 6 }
   end
   local normalized = normalize_probe_bytes(write_ahead_log, normalized_ranges)
-  if not normalized or filesystem.sha256(normalized) ~= OPENCODE_PROBE_WAL_SHA256 then
-    return nil
+  if not normalized then
+    return nil, "sqlite-wal-normalization"
+  end
+  local normalized_sha256 = filesystem.sha256(normalized)
+  if normalized_sha256 ~= OPENCODE_PROBE_WAL_SHA256 then
+    return nil, probe_digest_failure("sqlite-wal-normalized-digest", normalized_sha256)
   end
   return {
     checksum0 = checksum0,
@@ -973,7 +1255,7 @@ local function valid_probe_shm(shared_memory, wal, filesystem)
     or probe_u32(shared_memory, 29, true) ~= wal.checksum1
     or shared_memory:sub(33, 40) ~= wal.salt
   then
-    return false
+    return false, "sqlite-shm-header"
   end
   local checksum0, checksum1 = probe_sqlite_checksum(shared_memory, 1, 40, 0, 0)
   if
@@ -990,31 +1272,43 @@ local function valid_probe_shm(shared_memory, wal, filesystem)
     or probe_u32(shared_memory, 129, true) ~= 0
     or probe_u32(shared_memory, 133, true) ~= 0
   then
-    return false
+    return false, "sqlite-shm-header-checksum-or-state"
   end
   for index = 1, 4062 do
     local page_number = probe_u32(shared_memory, 137 + (index - 1) * 4, true)
     local expected = index <= 63 and wal.page_numbers[index] or 0
     if page_number ~= expected then
-      return false
+      return false, "sqlite-shm-page-map"
     end
   end
   local normalized = normalize_probe_bytes(shared_memory, {
     { offset = 25, length = 24 },
     { offset = 73, length = 24 },
   })
-  return normalized ~= nil and filesystem.sha256(normalized) == OPENCODE_PROBE_SHM_SHA256
+  if not normalized then
+    return false, "sqlite-shm-normalization"
+  end
+  local normalized_sha256 = filesystem.sha256(normalized)
+  if normalized_sha256 ~= OPENCODE_PROBE_SHM_SHA256 then
+    return false, probe_digest_failure("sqlite-shm-normalized-digest", normalized_sha256)
+  end
+  return true
 end
 
 local function valid_probe_sqlite_files(database, shared_memory, write_ahead_log, filesystem)
+  if #database ~= 4096 then
+    return false, "sqlite-database-size"
+  end
+  local database_sha256 = filesystem.sha256(database)
+  if database_sha256 ~= OPENCODE_PROBE_DB_SHA256 then
+    return false, probe_digest_failure("sqlite-database-digest", database_sha256)
+  end
   if
-    #database ~= 4096
-    or filesystem.sha256(database) ~= OPENCODE_PROBE_DB_SHA256
-    or forbidden_probe_artifact(database)
+    forbidden_probe_artifact(database)
     or forbidden_probe_artifact(shared_memory)
     or forbidden_probe_artifact(write_ahead_log)
   then
-    return false
+    return false, "sqlite-forbidden-evidence"
   end
   for _, marker in ipairs({
     "SQLite format 3\0",
@@ -1023,24 +1317,27 @@ local function valid_probe_sqlite_files(database, shared_memory, write_ahead_log
     "CREATE TABLE `credential`",
   }) do
     if not write_ahead_log:find(marker, 1, true) then
-      return false
+      return false, "sqlite-audited-marker"
     end
   end
-  local wal = valid_probe_wal(write_ahead_log, filesystem)
-  return wal ~= nil and valid_probe_shm(shared_memory, wal, filesystem)
+  local wal, wal_error = valid_probe_wal(write_ahead_log, filesystem)
+  if not wal then
+    return false, wal_error
+  end
+  return valid_probe_shm(shared_memory, wal, filesystem)
 end
 
 local function inspect_opencode_probe_artifacts(tree, semantic, overrides)
   local filesystem = probe_artifact_filesystem(overrides)
   if not validate_probe_inputs(tree, filesystem) then
-    return nil
+    return nil, "probe-input-tree"
   end
   if
     not exact_probe_directory(tree.data, { "opencode" }, filesystem)
     or not exact_probe_directory(tree.cache, { "opencode" }, filesystem)
     or not exact_probe_directory(tree.state, { "opencode" }, filesystem)
   then
-    return nil
+    return nil, "probe-xdg-root-tree"
   end
   local data = tree.data .. "/opencode"
   local cache = tree.cache .. "/opencode"
@@ -1056,7 +1353,7 @@ local function inspect_opencode_probe_artifacts(tree, semantic, overrides)
     or not exact_probe_directory(cache .. "/bin", {}, filesystem)
     or not exact_probe_directory(state, semantic and { "locks" } or {}, filesystem)
   then
-    return nil
+    return nil, "probe-artifact-tree"
   end
   if not semantic then
     return true
@@ -1067,25 +1364,31 @@ local function inspect_opencode_probe_artifacts(tree, semantic, overrides)
     not exact_probe_directory(lock_root, { OPENCODE_PROBE_LOCK }, filesystem)
     or not exact_probe_directory(lock, { "heartbeat", "meta.json" }, filesystem)
   then
-    return nil
+    return nil, "probe-lock-tree"
   end
-  local log = read_probe_file(data .. "/log/opencode.log", 0, filesystem)
+  local log = read_probe_file(data .. "/log/opencode.log", 994, filesystem)
   local heartbeat = read_probe_file(lock .. "/heartbeat", 0, filesystem)
   local metadata = read_probe_file(lock .. "/meta.json", 512, filesystem)
   local database = read_probe_file(data .. "/opencode.db", 4096, filesystem)
   local shared_memory = read_probe_file(data .. "/opencode.db-shm", 32768, filesystem)
   local write_ahead_log = read_probe_file(data .. "/opencode.db-wal", 259592, filesystem)
-  if
-    log ~= ""
-    or heartbeat ~= ""
-    or not metadata
-    or not database
-    or not shared_memory
-    or not write_ahead_log
-    or not valid_probe_lock_metadata(metadata, filesystem)
-    or not valid_probe_sqlite_files(database, shared_memory, write_ahead_log, filesystem)
-  then
-    return nil
+  local log_ok, log_error = valid_probe_log(log, filesystem)
+  if not log_ok then
+    return nil, log_error
+  end
+  if heartbeat ~= "" then
+    return nil, "probe-heartbeat"
+  end
+  if not metadata or not valid_probe_lock_metadata(metadata, filesystem) then
+    return nil, "probe-lock-metadata"
+  end
+  if not database or not shared_memory or not write_ahead_log then
+    return nil, "probe-sqlite-file-boundary"
+  end
+  local sqlite_ok, sqlite_error =
+    valid_probe_sqlite_files(database, shared_memory, write_ahead_log, filesystem)
+  if not sqlite_ok then
+    return nil, sqlite_error
   end
   return true
 end
@@ -1118,6 +1421,9 @@ end
 
 local function opencode_compatibility(executable, overrides)
   local options = overrides or {}
+  if options.observe_probe ~= nil and type(options.observe_probe) ~= "function" then
+    return nil, "managed OpenCode compatibility observer is invalid"
+  end
   local revalidate = options.revalidate or require("ai.tools").revalidate
   local stat = options.stat or vim.uv.fs_lstat
   local canonical, canonical_error = canonical_path(executable, "OpenCode executable", false)
@@ -1175,16 +1481,23 @@ local function opencode_compatibility(executable, overrides)
       },
     }
     local ok, result
+    local artifact_accepted = false
+    local artifact_category = "unavailable"
     if options.probe then
       ok, result =
         pcall(options.probe, canonical, vim.deepcopy(arguments), vim.deepcopy(probe_options))
       if options.inspect_artifacts ~= nil then
         local inspection_ok, accepted =
           pcall(options.inspect_artifacts, name, vim.deepcopy(tree), result)
+        artifact_accepted = inspection_ok and accepted == true
+        artifact_category = artifact_accepted and "injected-accepted" or "injected-rejected"
         if not inspection_ok or accepted ~= true then
           ok = false
           result = nil
         end
+      else
+        artifact_accepted = true
+        artifact_category = "injected-not-inspected"
       end
     else
       probe_options.inspect_artifacts = function()
@@ -1192,9 +1505,33 @@ local function opencode_compatibility(executable, overrides)
           and name ~= "root_help"
           and name ~= "serve_help"
           and name ~= "attach_help"
-        return inspect_opencode_probe_artifacts(tree, semantic)
+        local accepted, category = inspect_opencode_probe_artifacts(tree, semantic)
+        artifact_accepted = accepted == true
+        artifact_category = artifact_accepted and "accepted"
+          or safe_probe_artifact_category(category)
+        return accepted
       end
       ok, result = pcall(read_only_probe, canonical, arguments, probe_options)
+    end
+    if options.observe_probe then
+      local observation = {
+        artifact_accepted = artifact_accepted,
+        artifact_category = safe_probe_artifact_category(artifact_category),
+        code = type(result) == "table" and result.code or nil,
+        signal = type(result) == "table" and result.signal or nil,
+        stdout_bytes = type(result) == "table"
+            and type(result.stdout) == "string"
+            and #result.stdout
+          or nil,
+        stderr_bytes = type(result) == "table"
+            and type(result.stderr) == "string"
+            and #result.stderr
+          or nil,
+        stdout_overflow = type(result) == "table" and result.stdout_overflow == true,
+        stderr_overflow = type(result) == "table" and result.stderr_overflow == true,
+        system_error = type(result) == "table" and result.system_error == true,
+      }
+      pcall(options.observe_probe, name, vim.deepcopy(tree), observation)
     end
     if owns_tree then
       pcall(vim.fn.delete, tree.root, "rf")
@@ -1203,6 +1540,9 @@ local function opencode_compatibility(executable, overrides)
       not ok
       or not valid_probe_result(result)
       or result.code == 125
+      or result.stdout_overflow
+      or result.stderr_overflow
+      or result.system_error
       or #result.stdout > MAX_COMPATIBILITY_REPORT_BYTES
       or #result.stderr > MAX_HELP_BYTES
     then
@@ -1500,7 +1840,10 @@ local function invoke_profile_helper(paths, operation, request, overrides)
   end
   local run = options.run
     or function(argv, system_options)
-      return vim.system(argv, system_options):wait()
+      return bounded_system(argv, system_options, {
+        stdout = MAX_PROFILE_REPORT_BYTES,
+        stderr = MAX_PROFILE_REPORT_BYTES,
+      })
     end
   local argv = { python, "-I", "-B", helper, "--operation", operation }
   local run_ok, result = pcall(run, argv, {
@@ -1514,8 +1857,12 @@ local function invoke_profile_helper(paths, operation, request, overrides)
     not run_ok
     or not valid_probe_result(result)
     or result.code ~= 0
+    or result.stdout_overflow
+    or result.stderr_overflow
+    or result.system_error
     or result.stderr ~= ""
     or #result.stdout > MAX_PROFILE_REPORT_BYTES
+    or #result.stderr > MAX_PROFILE_REPORT_BYTES
   then
     return nil, "managed OpenCode profile helper failed"
   end
@@ -2074,6 +2421,7 @@ end
 
 M._test = {
   auth_arguments = auth_arguments,
+  bounded_system = bounded_system,
   create_opencode_probe_tree = create_opencode_probe_tree,
   inspect_opencode_probe_artifacts = inspect_opencode_probe_artifacts,
   invoke_profile_helper = invoke_profile_helper,
