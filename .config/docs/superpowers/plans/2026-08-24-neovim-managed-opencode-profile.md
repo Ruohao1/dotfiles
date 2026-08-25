@@ -477,6 +477,9 @@ Use exclusive file creation, complete write loops, `fsync` on every file, and `f
 Publish `TOKEN` from the trusted sibling parent into `BACKEND_STATE/profiles` with one final Linux `renameat2(RENAME_NOREPLACE)` call through `ctypes`, fail closed when that primitive is unavailable, and never fall back to replacement-capable `os.rename`.
 Refuse an existing staging or destination path instead of replacing it.
 On failure, remove only entries proven to be children of the helper-created staging directory and leave every pre-existing path untouched.
+When identity capture fails after a successful `mkdir`, fail closed and leave the basename untouched even when it appears empty; never trade provenance for cleanup.
+Treat the no-replace rename as tentative until both source and destination parents are synced and every final identity check succeeds.
+If a later step fails, scrub through the retained generation descriptor and remove the destination only when it still matches the captured generation identity.
 Reject any unexpected entry when inspecting a published profile and require `empty-home-opencode` to remain empty.
 Build the instruction snapshot by considering the user file first and repository file second, deduplicating the second only when its stable device and inode equal the first.
 For each present source, append its fixed heading and exact accepted source bytes, append one line feed when those bytes do not already end in one, then append one separator line feed.
