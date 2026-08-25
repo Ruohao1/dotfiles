@@ -295,8 +295,8 @@ Require a report with this exact shape:
   version = "1.18.18",
   help = {
     root = { "--pure", "serve", "attach" },
-    serve = { "--hostname", "--port", "OPENCODE_SERVER_PASSWORD" },
-    attach = { "--dir", "--session" },
+    serve = { "--hostname", "--port" },
+    attach = { "--dir", "--session", "OPENCODE_SERVER_PASSWORD" },
   },
   names = { "build", "compaction", "plan", "summary", "title" },
   agents = {
@@ -676,6 +676,8 @@ Collect these commands:
 
 Parse JSON only from stdout for the five expected `debug agent` commands.
 Require the version probe to exit `0` and contain exactly `1.18.18` followed by at most one line feed, with no prefix, suffix, prerelease, or build metadata.
+Require each help probe to exit `0`, emit an empty stdout, and provide its bounded help document on stderr.
+Require the server help document to contain `--hostname` and `--port`, and require the attach help document to contain `--dir`, `--session`, and `OPENCODE_SERVER_PASSWORD`.
 Require `general` and `explore` to exit nonzero with the bounded exact `Agent NAME not found` category, not arbitrary failure text.
 Parse only top-level `NAME (MODE)` headers from `agent list`, sort them, and require the exact five-name set.
 Never place raw probe output into the returned health error.
