@@ -239,6 +239,7 @@ local function read_only_probe(executable, arguments, overrides)
     if type(probe.read_only_mounts) ~= "table" or not vim.islist(probe.read_only_mounts) then
       return { code = 126, signal = 0, stdout = "", stderr = "probe mounts are invalid" }
     end
+    local mounts = {}
     for _, mount in ipairs(probe.read_only_mounts) do
       if type(mount) ~= "table" then
         return { code = 126, signal = 0, stdout = "", stderr = "probe mount is invalid" }
@@ -254,7 +255,13 @@ local function read_only_probe(executable, arguments, overrides)
           stderr = source_error or destination_error,
         }
       end
-      vim.list_extend(argv, { "--ro-bind", source, destination })
+      mounts[#mounts + 1] = { source = source, destination = destination }
+    end
+    for _, mount in ipairs(mounts) do
+      vim.list_extend(argv, { "--dir", mount.destination })
+    end
+    for _, mount in ipairs(mounts) do
+      vim.list_extend(argv, { "--ro-bind", mount.source, mount.destination })
     end
   end
   if probe.working_directory ~= nil then
@@ -357,7 +364,7 @@ end
 local function opencode_probe_environment()
   local managed = require("ai.backends.opencode_managed")
   return {
-    HOME = "/probe/home",
+    HOME = "/tmp/nvim-ai-probe/home",
     OPENCODE_CONFIG_CONTENT = managed.config_json(),
     OPENCODE_DISABLE_AUTOUPDATE = "true",
     OPENCODE_DISABLE_CLAUDE_CODE = "true",
@@ -366,10 +373,10 @@ local function opencode_probe_environment()
     OPENCODE_DISABLE_PROJECT_CONFIG = "true",
     OPENCODE_PERMISSION = managed.policy_json(),
     OPENCODE_PURE = "true",
-    XDG_CACHE_HOME = "/tmp/xdg-cache",
-    XDG_CONFIG_HOME = "/probe/xdg-config",
-    XDG_DATA_HOME = "/tmp/xdg-data",
-    XDG_STATE_HOME = "/tmp/xdg-state",
+    XDG_CACHE_HOME = "/tmp/nvim-ai-probe/xdg-cache",
+    XDG_CONFIG_HOME = "/tmp/nvim-ai-probe/xdg-config",
+    XDG_DATA_HOME = "/tmp/nvim-ai-probe/xdg-data",
+    XDG_STATE_HOME = "/tmp/nvim-ai-probe/xdg-state",
   }
 end
 
@@ -412,10 +419,10 @@ local function opencode_compatibility(executable, overrides)
   end
   local probe_options = {
     environment = opencode_probe_environment(),
-    working_directory = "/probe",
+    working_directory = "/tmp/nvim-ai-probe",
     read_only_mounts = {
-      { source = tree.home, destination = "/probe/home" },
-      { source = tree.config, destination = "/probe/xdg-config" },
+      { source = tree.home, destination = "/tmp/nvim-ai-probe/home" },
+      { source = tree.config, destination = "/tmp/nvim-ai-probe/xdg-config" },
     },
   }
   local function run(arguments)

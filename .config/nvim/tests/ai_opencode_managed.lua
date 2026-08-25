@@ -876,11 +876,11 @@ local semantic_probe = registry_module._test.read_only_probe("/usr/bin/opencode"
     assert(path == "/usr/bin/opencode" or path == "/usr/bin/bwrap")
     return true
   end,
-  environment = { HOME = "/probe/home", OPENCODE_PURE = "true" },
-  working_directory = "/probe",
+  environment = { HOME = "/tmp/nvim-ai-probe/home", OPENCODE_PURE = "true" },
+  working_directory = "/tmp/nvim-ai-probe",
   read_only_mounts = {
-    { source = "/tmp/probe-home", destination = "/probe/home" },
-    { source = "/tmp/probe-config", destination = "/probe/xdg-config" },
+    { source = "/tmp/probe-home", destination = "/tmp/nvim-ai-probe/home" },
+    { source = "/tmp/probe-config", destination = "/tmp/nvim-ai-probe/xdg-config" },
   },
   run = function(argv, options)
     semantic_probe_argv = vim.deepcopy(argv)
@@ -907,25 +907,47 @@ eq(semantic_probe_argv, {
   "--tmpfs",
   "/tmp",
   "--dir",
-  "/probe",
+  "/tmp/nvim-ai-probe",
+  "--dir",
+  "/tmp/nvim-ai-probe/home",
+  "--dir",
+  "/tmp/nvim-ai-probe/xdg-config",
   "--ro-bind",
   "/tmp/probe-home",
-  "/probe/home",
+  "/tmp/nvim-ai-probe/home",
   "--ro-bind",
   "/tmp/probe-config",
-  "/probe/xdg-config",
+  "/tmp/nvim-ai-probe/xdg-config",
   "--chdir",
-  "/probe",
+  "/tmp/nvim-ai-probe",
   "--",
   "/usr/bin/opencode",
   "--version",
 }, "exact semantic Bubblewrap probe argv")
 eq(semantic_probe_options.clear_env, true, "semantic probe clears the environment")
 eq(semantic_probe_options.env, {
-  HOME = "/probe/home",
+  HOME = "/tmp/nvim-ai-probe/home",
   OPENCODE_PURE = "true",
 }, "semantic probe admits only the exact environment")
 eq(semantic_probe_options.timeout, 2000, "semantic probe command timeout")
+
+local real_probe_root = vim.fn.tempname()
+assert(vim.fn.mkdir(real_probe_root, "p", 448) == 1, "create real probe fixture root")
+local real_probe_home = real_probe_root .. "/home"
+local real_probe_config = real_probe_root .. "/xdg-config"
+assert(vim.fn.mkdir(real_probe_home, "", 448) == 1, "create real probe home")
+assert(vim.fn.mkdir(real_probe_config, "", 448) == 1, "create real probe config")
+local true_executable = assert(require("ai.tools").resolve("true"))
+local real_probe = registry_module._test.read_only_probe(true_executable, {}, {
+  environment = { HOME = "/tmp/nvim-ai-probe/home" },
+  working_directory = "/tmp/nvim-ai-probe",
+  read_only_mounts = {
+    { source = real_probe_home, destination = "/tmp/nvim-ai-probe/home" },
+    { source = real_probe_config, destination = "/tmp/nvim-ai-probe/xdg-config" },
+  },
+})
+vim.fn.delete(real_probe_root, "rf")
+assert(real_probe.code == 0, "provider-free real Bubblewrap probe failed: " .. real_probe.stderr)
 
 local compatibility_calls = {}
 local compatibility_metadata = 4
@@ -993,7 +1015,7 @@ eq(
 )
 for _, call in ipairs(compatibility_calls) do
   eq(call.options.environment, {
-    HOME = "/probe/home",
+    HOME = "/tmp/nvim-ai-probe/home",
     OPENCODE_CONFIG_CONTENT = managed.config_json(),
     OPENCODE_DISABLE_AUTOUPDATE = "true",
     OPENCODE_DISABLE_CLAUDE_CODE = "true",
@@ -1002,12 +1024,12 @@ for _, call in ipairs(compatibility_calls) do
     OPENCODE_DISABLE_PROJECT_CONFIG = "true",
     OPENCODE_PERMISSION = managed.policy_json(),
     OPENCODE_PURE = "true",
-    XDG_CACHE_HOME = "/tmp/xdg-cache",
-    XDG_CONFIG_HOME = "/probe/xdg-config",
-    XDG_DATA_HOME = "/tmp/xdg-data",
-    XDG_STATE_HOME = "/tmp/xdg-state",
+    XDG_CACHE_HOME = "/tmp/nvim-ai-probe/xdg-cache",
+    XDG_CONFIG_HOME = "/tmp/nvim-ai-probe/xdg-config",
+    XDG_DATA_HOME = "/tmp/nvim-ai-probe/xdg-data",
+    XDG_STATE_HOME = "/tmp/nvim-ai-probe/xdg-state",
   }, "exact clear OpenCode probe environment")
-  eq(call.options.working_directory, "/probe", "fixed OpenCode probe working directory")
+  eq(call.options.working_directory, "/tmp/nvim-ai-probe", "fixed OpenCode probe working directory")
 end
 
 assert(registry_module._test.opencode_compatibility("/usr/bin/opencode", compatibility_options))
