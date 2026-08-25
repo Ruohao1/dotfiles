@@ -56,6 +56,17 @@ local HIDDEN_TOOLS = {
   "websearch",
   "skill",
 }
+local HELPER_PROFILE_KEYS = {
+  "schema",
+  "version",
+  "profile_root",
+  "fingerprint",
+  "config_source",
+  "auth_source",
+  "home_mask_source",
+  "auth",
+  "credential_count",
+}
 
 local function has_control(value)
   return type(value) ~= "string" or value:find(C0_PATTERN) ~= nil or value:find(C1_PATTERN) ~= nil
@@ -492,6 +503,114 @@ function M.profile_reference(profile)
     token = components.token,
     fingerprint = components.fingerprint,
     version = VERSION,
+  }
+end
+
+function M.inspection_request(reference, identity, paths)
+  if type(reference) ~= "table" then
+    return nil, "OpenCode profile reference must be an object"
+  end
+  local exact, exact_error =
+    exact_keys(reference, { "token", "fingerprint", "version" }, "OpenCode profile reference")
+  if not exact then
+    return nil, exact_error
+  end
+  if not valid_hex(reference.token, 32) then
+    return nil, "OpenCode profile reference token is invalid"
+  end
+  if not valid_hex(reference.fingerprint, 64) then
+    return nil, "OpenCode profile reference fingerprint is invalid"
+  end
+  if reference.version ~= VERSION then
+    return nil, "OpenCode profile reference version is unsupported"
+  end
+  if type(identity) ~= "table" or not valid_hex(identity.key, 32) then
+    return nil, "AI identity key is invalid"
+  end
+  local root, root_error = canonical_path(identity.root, "AI root")
+  if not root then
+    return nil, root_error
+  end
+  if type(paths) ~= "table" then
+    return nil, "AI paths must be an object"
+  end
+  local backend_state, state_error = canonical_path(paths.backend_state, "OpenCode backend state")
+  if not backend_state then
+    return nil, state_error
+  end
+  return {
+    schema = 1,
+    backend_state = backend_state,
+    token = reference.token,
+    identity_key = identity.key,
+    root = root,
+    version = VERSION,
+    fingerprint = reference.fingerprint,
+  }
+end
+
+function M.validate_profile_report(report, expected)
+  local exact, exact_error = exact_keys(report, HELPER_PROFILE_KEYS, "OpenCode profile report")
+  if not exact then
+    return nil, exact_error
+  end
+  if type(expected) ~= "table" then
+    return nil, "OpenCode profile expectation must be an object"
+  end
+  local backend_state, state_error =
+    canonical_path(expected.backend_state, "OpenCode backend state")
+  if not backend_state then
+    return nil, state_error
+  end
+  if not valid_hex(expected.token, 32) then
+    return nil, "OpenCode expected profile token is invalid"
+  end
+  if expected.fingerprint ~= nil and not valid_hex(expected.fingerprint, 64) then
+    return nil, "OpenCode expected profile fingerprint is invalid"
+  end
+  local components, components_error = profile_components(report)
+  if not components then
+    return nil, components_error
+  end
+  if components.backend_state ~= backend_state or components.token ~= expected.token then
+    return nil, "OpenCode profile report does not match the requested generation"
+  end
+  if expected.fingerprint and components.fingerprint ~= expected.fingerprint then
+    return nil, "OpenCode profile report fingerprint changed"
+  end
+  if report.auth ~= "authenticated" then
+    return nil, "OpenCode profile has no compatible credentials"
+  end
+  if
+    type(report.credential_count) ~= "number"
+    or report.credential_count % 1 ~= 0
+    or report.credential_count < 1
+    or report.credential_count > 128
+  then
+    return nil, "OpenCode profile credential count is invalid"
+  end
+  local expected_sources = {
+    config_source = report.profile_root .. "/xdg-config",
+    auth_source = report.profile_root .. "/credentials/auth.json",
+    home_mask_source = report.profile_root .. "/empty-home-opencode",
+  }
+  for field, expected_path in pairs(expected_sources) do
+    local source, source_error = canonical_path(report[field], "OpenCode " .. field)
+    if not source then
+      return nil, source_error
+    end
+    if source ~= expected_path then
+      return nil, "OpenCode profile report contains an unexpected source path"
+    end
+  end
+  return {
+    schema = 1,
+    version = VERSION,
+    profile_root = report.profile_root,
+    fingerprint = report.fingerprint,
+    config_source = report.config_source,
+    auth_source = report.auth_source,
+    home_mask_source = report.home_mask_source,
   }
 end
 

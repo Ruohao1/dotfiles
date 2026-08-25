@@ -13,11 +13,9 @@ local function contains(value, needle, label)
 end
 
 local registry_module = require("ai.backends")
+local managed = require("ai.backends.opencode_managed")
 
 eq(registry_module.names(), { "codex", "claude", "opencode" }, "backend order")
-
-local OPENCODE_PERMISSION =
-  '{"*":"ask","read":"allow","edit":"allow","glob":"allow","grep":"allow","list":"allow","lsp":"allow","question":"allow","todowrite":"allow"}'
 
 local identity = {
   key = string.rep("a", 32),
@@ -39,15 +37,16 @@ local paths = {
   global_codex_home = "/home/user/.codex",
   global_claude_config = "/home/user/.claude",
   global_claude_home_file = "/home/user/.claude.json",
-  global_opencode_config = "/home/user/.config/opencode",
   global_opencode_data = "/home/user/.local/share/opencode",
+  home_agents = "/home/user/AGENTS.md",
+  profile_helper = "/config/nvim/scripts/nvim-ai-opencode-profile.py",
   grants = {},
 }
 
 local directories = {
   ["/home/user/.codex"] = true,
   ["/home/user/.claude"] = true,
-  ["/home/user/.config/opencode"] = true,
+  ["/home/user"] = true,
   ["/home/user/.local/share/opencode"] = true,
 }
 local files = {
@@ -59,8 +58,8 @@ local files = {
   ["/home/user/.claude/settings.json"] = true,
   ["/home/user/.claude.json"] = true,
   ["/home/user/.local/share/opencode/auth.json"] = true,
-  ["/home/user/.local/share/opencode/mcp-auth.json"] = true,
-  ["/home/user/.local/share/opencode/account.json"] = true,
+  ["/config/nvim/scripts/nvim-ai-opencode-profile.py"] = true,
+  ["/usr/bin/python3"] = true,
 }
 local help_text = {
   codex = {
@@ -76,7 +75,35 @@ local help_text = {
     ["attach\0--help"] = "--dir --session",
   },
 }
-local calls = { executable = {}, revalidate = {}, version = {}, auth = {}, help = {} }
+local profile_token = string.rep("b", 32)
+local profile_fingerprint = string.rep("c", 64)
+local prepared_profile = {
+  schema = 1,
+  version = "1.18.18",
+  profile_root = "/state/identity/backends/opencode/profiles/" .. profile_token,
+  fingerprint = profile_fingerprint,
+  config_source = "/state/identity/backends/opencode/profiles/" .. profile_token .. "/xdg-config",
+  auth_source = "/state/identity/backends/opencode/profiles/"
+    .. profile_token
+    .. "/credentials/auth.json",
+  home_mask_source = "/state/identity/backends/opencode/profiles/"
+    .. profile_token
+    .. "/empty-home-opencode",
+  auth = "authenticated",
+  credential_count = 1,
+}
+local compatibility_report = managed._test.compatibility_fixture()
+local calls = {
+  executable = {},
+  revalidate = {},
+  version = {},
+  auth = {},
+  help = {},
+  compatibility = {},
+  inspect_auth = {},
+  prepare = {},
+  inspect_profile = {},
+}
 local registry = registry_module._test.new({
   executable = function(name)
     table.insert(calls.executable, name)
@@ -88,14 +115,15 @@ local registry = registry_module._test.new({
   end,
   version = function(name, executable)
     table.insert(calls.version, { name, executable })
-    return { code = 0, signal = 0, stdout = name .. " 1.0\n", stderr = "" }
+    local output = name == "opencode" and "1.18.18\n" or name .. " 1.0\n"
+    return { code = 0, signal = 0, stdout = output, stderr = "" }
   end,
   auth = function(name, executable)
     table.insert(calls.auth, { name, executable })
+    assert(name ~= "opencode", "OpenCode must never invoke auth list")
     local output = {
       codex = "Logged in using ChatGPT\n",
       claude = '{"loggedIn":true}\n',
-      opencode = "1 credentials\n",
     }
     return { code = 0, signal = 0, stdout = assert(output[name]), stderr = "" }
   end,
@@ -116,6 +144,28 @@ local registry = registry_module._test.new({
   end,
   password = function()
     return "0123456789abcdef0123456789abcdef"
+  end,
+  profile_token = function()
+    return profile_token
+  end,
+  prepare_opencode_profile = function(request)
+    calls.prepare[#calls.prepare + 1] = vim.deepcopy(request)
+    return vim.deepcopy(prepared_profile)
+  end,
+  inspect_opencode_profile = function(request)
+    calls.inspect_profile[#calls.inspect_profile + 1] = vim.deepcopy(request)
+    return vim.deepcopy(prepared_profile)
+  end,
+  inspect_opencode_auth = function(path)
+    calls.inspect_auth[#calls.inspect_auth + 1] = path
+    return "authenticated"
+  end,
+  opencode_auth_path = function()
+    return "/home/user/.local/share/opencode/auth.json"
+  end,
+  opencode_compatibility = function(executable)
+    calls.compatibility[#calls.compatibility + 1] = executable
+    return vim.deepcopy(compatibility_report)
   end,
   stat = function(path)
     if directories[path] then
@@ -235,6 +285,7 @@ local opencode_launch = assert(opencode:new_session(identity, paths))
 eq(opencode_launch.kind, "server_attach", "OpenCode launch kind")
 eq(opencode_launch.server_argv, {
   "/usr/bin/opencode",
+  "--pure",
   "serve",
   "--hostname",
   "127.0.0.1",
@@ -243,6 +294,7 @@ eq(opencode_launch.server_argv, {
 }, "OpenCode server")
 eq(opencode_launch.attach_argv, {
   "/usr/bin/opencode",
+  "--pure",
   "attach",
   "http://127.0.0.1:43123",
   "--dir",
@@ -250,12 +302,18 @@ eq(opencode_launch.attach_argv, {
 }, "OpenCode attach")
 eq(opencode_launch.env, {
   OPENCODE_DISABLE_AUTOUPDATE = "true",
+  OPENCODE_DISABLE_CLAUDE_CODE = "true",
+  OPENCODE_DISABLE_EXTERNAL_SKILLS = "true",
   OPENCODE_DISABLE_LSP_DOWNLOAD = "true",
-  OPENCODE_PERMISSION = OPENCODE_PERMISSION,
+  OPENCODE_DISABLE_PROJECT_CONFIG = "true",
+  OPENCODE_PERMISSION = managed.policy_json(),
+  OPENCODE_PURE = "true",
   OPENCODE_SERVER_PASSWORD = "0123456789abcdef0123456789abcdef",
   OPENCODE_SERVER_USERNAME = "opencode",
   XDG_CACHE_HOME = "/state/identity/backends/opencode/xdg-cache",
+  XDG_CONFIG_HOME = "/state/identity/backends/opencode/xdg-config",
   XDG_DATA_HOME = "/state/identity/backends/opencode/xdg-data",
+  XDG_STATE_HOME = "/state/identity/backends/opencode/xdg-state",
 }, "OpenCode isolated environment")
 eq(opencode_launch.session, "", "OpenCode starts without a guessed session")
 eq(opencode_launch.capabilities, {
@@ -264,31 +322,46 @@ eq(opencode_launch.capabilities, {
   completion = true,
   exact_session = true,
 }, "OpenCode capabilities")
-eq(opencode_launch.read_only_inputs, {
-  {
-    source = "/home/user/.local/share/opencode/account.json",
-    destination = "/state/identity/backends/opencode/xdg-data/opencode/account.json",
-    kind = "file",
-  },
-  {
-    source = "/home/user/.local/share/opencode/auth.json",
-    destination = "/state/identity/backends/opencode/xdg-data/opencode/auth.json",
-    kind = "file",
-  },
-  {
-    source = "/home/user/.local/share/opencode/mcp-auth.json",
-    destination = "/state/identity/backends/opencode/xdg-data/opencode/mcp-auth.json",
-    kind = "file",
-  },
-}, "OpenCode read-only authentication")
+eq(opencode_launch.read_only_inputs, {}, "raw global OpenCode inputs excluded")
 eq(opencode_launch.protected_paths, {
-  "/home/user/.config/opencode",
-  "/home/user/.local/share/opencode",
+  prepared_profile.profile_root,
   "/usr/bin/opencode",
 }, "OpenCode protected paths")
-local opencode_resume = assert(opencode:resume_session(identity, paths, "ses_test123"))
+eq(opencode_launch.managed_profile, {
+  schema = 1,
+  version = "1.18.18",
+  profile_root = prepared_profile.profile_root,
+  fingerprint = profile_fingerprint,
+  config_source = prepared_profile.config_source,
+  auth_source = prepared_profile.auth_source,
+  home_mask_source = prepared_profile.home_mask_source,
+}, "OpenCode launch strips helper-private profile fields")
+eq(calls.prepare, {
+  {
+    schema = 1,
+    token = profile_token,
+    identity_key = identity.key,
+    root = identity.root,
+    backend_state = paths.backend_state,
+    global_auth = paths.global_opencode_data .. "/auth.json",
+    user_agents = paths.home_agents,
+    repo_agents = identity.root .. "/AGENTS.md",
+    version = "1.18.18",
+    config_json = managed.config_json(),
+    policy_json = managed.policy_json(),
+  },
+}, "OpenCode helper receives the exact approved prepare request")
+
+local resume_paths = vim.deepcopy(paths)
+resume_paths.opencode_profile = {
+  token = profile_token,
+  fingerprint = profile_fingerprint,
+  version = "1.18.18",
+}
+local opencode_resume = assert(opencode:resume_session(identity, resume_paths, "ses_test123"))
 eq(opencode_resume.attach_argv, {
   "/usr/bin/opencode",
+  "--pure",
   "attach",
   "http://127.0.0.1:43123",
   "--dir",
@@ -296,13 +369,57 @@ eq(opencode_resume.attach_argv, {
   "--session",
   "ses_test123",
 }, "OpenCode exact resume")
-eq(opencode_resume.env.OPENCODE_PERMISSION, OPENCODE_PERMISSION, "OpenCode resume permission")
+eq(
+  opencode_resume.managed_profile.profile_root,
+  opencode_launch.managed_profile.profile_root,
+  "OpenCode resume reuses profile"
+)
+eq(#calls.prepare, 1, "OpenCode reuse does not prepare a replacement profile")
+eq(calls.inspect_profile, {
+  {
+    schema = 1,
+    backend_state = paths.backend_state,
+    token = profile_token,
+    identity_key = identity.key,
+    root = identity.root,
+    version = "1.18.18",
+    fingerprint = profile_fingerprint,
+  },
+}, "OpenCode reuse inspects only the exact nonsecret reference")
+eq(opencode_resume.env.OPENCODE_PERMISSION, managed.policy_json(), "OpenCode resume permission")
 eq(opencode_resume.env.OPENCODE_DISABLE_AUTOUPDATE, "true", "OpenCode resume update policy")
 eq(opencode_resume.env.OPENCODE_DISABLE_LSP_DOWNLOAD, "true", "OpenCode resume LSP download policy")
+eq(
+  assert(opencode:profile_reference(opencode_launch)),
+  resume_paths.opencode_profile,
+  "OpenCode profile reference"
+)
+eq(
+  assert(opencode:validate_profile(resume_paths.opencode_profile, identity, paths)),
+  opencode_launch.managed_profile,
+  "OpenCode profile reference validation"
+)
+eq(#calls.prepare, 1, "profile validation never prepares a replacement")
 local invalid_opencode, invalid_opencode_error =
   opencode:resume_session(identity, paths, "../foreign")
 eq(invalid_opencode, nil, "OpenCode rejects invalid session")
 contains(invalid_opencode_error, "session", "OpenCode session error")
+
+local bad_reference_paths = vim.deepcopy(resume_paths)
+bad_reference_paths.opencode_profile.fingerprint = string.rep("d", 64)
+local prepare_before_bad_reference = #calls.prepare
+local invalid_reference, invalid_reference_error =
+  opencode:resume_session(identity, bad_reference_paths, "ses_test123")
+eq(invalid_reference, nil, "invalid managed profile reference fails closed")
+contains(invalid_reference_error, "profile", "invalid profile reference diagnostic")
+eq(#calls.prepare, prepare_before_bad_reference, "invalid reference has no fresh-profile fallback")
+
+local foreign_profile_paths = vim.deepcopy(paths)
+foreign_profile_paths.opencode_profile = resume_paths.opencode_profile
+local foreign_codex = codex:new_session(identity, foreign_profile_paths)
+eq(foreign_codex, nil, "Codex rejects an OpenCode profile reference")
+local foreign_claude = claude:new_session(identity, foreign_profile_paths)
+eq(foreign_claude, nil, "Claude rejects an OpenCode profile reference")
 
 eq(
   codex:format_context({ kind = "location", path = "lua/main.lua", line = 7, column = 3 }),
@@ -354,7 +471,7 @@ first_opencode_launch.env.OPENCODE_PERMISSION = "changed"
 local fresh_opencode_launch = assert(opencode:new_session(identity, opencode_paths))
 eq(
   fresh_opencode_launch.env.OPENCODE_PERMISSION,
-  OPENCODE_PERMISSION,
+  managed.policy_json(),
   "OpenCode permission tables are fresh"
 )
 
@@ -373,20 +490,23 @@ eq(calls.help, {
   { "codex", "/usr/bin/codex", { "--help" } },
   { "codex", "/usr/bin/codex", { "resume", "--help" } },
   { "claude", "/usr/bin/claude", { "--help" } },
-  { "opencode", "/usr/bin/opencode", { "--help" } },
-  { "opencode", "/usr/bin/opencode", { "serve", "--help" } },
-  { "opencode", "/usr/bin/opencode", { "attach", "--help" } },
 }, "exact compatibility help probes")
+eq(calls.compatibility, { "/usr/bin/opencode" }, "OpenCode uses the semantic compatibility probe")
+eq(
+  calls.inspect_auth,
+  { "/home/user/.local/share/opencode/auth.json" },
+  "OpenCode health inspects only the approved global auth file"
+)
 eq(registry_module._test.auth_arguments("codex"), { "login", "status" }, "Codex auth argv")
 eq(
   registry_module._test.auth_arguments("claude"),
   { "auth", "status", "--json" },
   "Claude auth argv"
 )
-eq(registry_module._test.auth_arguments("opencode"), { "auth", "list" }, "OpenCode auth argv")
-local changed_auth_arguments = assert(registry_module._test.auth_arguments("opencode"))
-changed_auth_arguments[1] = "changed"
-eq(registry_module._test.auth_arguments("opencode"), { "auth", "list" }, "fresh auth argv")
+eq(registry_module._test.auth_arguments("opencode"), nil, "OpenCode has no auth-list argv")
+for _, call in ipairs(calls.auth) do
+  assert(call[1] ~= "opencode", "OpenCode invoked auth list")
+end
 
 local function health_with_auth(name, result)
   local fixture = registry_module._test.new({
@@ -535,59 +655,6 @@ local auth_cases = {
     "unknown",
     "Claude malformed JSON",
   },
-  {
-    "opencode",
-    { code = 1, signal = 0, stdout = "No credentials found\n", stderr = "" },
-    "unauthenticated",
-    "OpenCode explicit empty state on failure",
-  },
-  {
-    "opencode",
-    { code = 1, signal = 0, stdout = "", stderr = "No credentials found\n" },
-    "unauthenticated",
-    "OpenCode explicit empty state on stderr",
-  },
-  {
-    "opencode",
-    { code = 0, signal = 0, stdout = "0 credentials\n", stderr = "" },
-    "unauthenticated",
-    "OpenCode zero credential footer",
-  },
-  {
-    "opencode",
-    { code = 0, signal = 0, stdout = "0 credential\n", stderr = "" },
-    "unauthenticated",
-    "OpenCode singular zero credential footer",
-  },
-  {
-    "opencode",
-    { code = 0, signal = 0, stdout = "1 credential\n", stderr = "" },
-    "authenticated",
-    "OpenCode singular positive credential footer",
-  },
-  {
-    "opencode",
-    { code = 0, signal = 0, stdout = "", stderr = "1 credentials\n" },
-    "unknown",
-    "OpenCode ignores positive footer on stderr",
-  },
-  {
-    "opencode",
-    {
-      code = 0,
-      signal = 0,
-      stdout = "private-provider-name oauth\n\27[90m└\27[0m 1 credentials\n",
-      stderr = "",
-    },
-    "authenticated",
-    "OpenCode positive credential footer",
-  },
-  {
-    "opencode",
-    { code = 0, signal = 0, stdout = "Provider catalog loaded\n", stderr = "" },
-    "unknown",
-    "OpenCode ambiguous success",
-  },
 }
 for _, case in ipairs(auth_cases) do
   local health = health_with_auth(case[1], case[2])
@@ -602,18 +669,125 @@ for _, case in ipairs(auth_cases) do
   end
 end
 
-local private_failure = health_with_auth("opencode", {
-  code = 2,
-  signal = 0,
-  stdout = "",
-  stderr = "credential-secret-sentinel",
-})
-eq(private_failure.auth, "unknown", "OpenCode failed probe is unknown")
-assert(#private_failure.error > 0 and #private_failure.error <= 256, "bounded auth diagnostic")
-assert(
-  not vim.inspect(private_failure):find("credential-secret-sentinel", 1, true),
-  "auth diagnostic leaks credential detail"
+local function managed_health(overrides)
+  local options = overrides or {}
+  local order = {}
+  local fixture = registry_module._test.new({
+    executable = function(name)
+      order[#order + 1] = "executable"
+      return "/usr/bin/" .. name
+    end,
+    revalidate = function()
+      order[#order + 1] = "revalidate"
+      return true
+    end,
+    opencode_compatibility = function()
+      order[#order + 1] = "compatibility"
+      if options.compatibility_error then
+        return nil, options.compatibility_error
+      end
+      return vim.deepcopy(options.compatibility or compatibility_report)
+    end,
+    opencode_auth_path = function()
+      order[#order + 1] = "auth_path"
+      return "/home/user/.local/share/opencode/auth.json"
+    end,
+    inspect_opencode_auth = function(path)
+      order[#order + 1] = "inspect_auth"
+      eq(path, "/home/user/.local/share/opencode/auth.json", "managed auth inspection path")
+      if options.auth_exception then
+        error(options.auth_exception)
+      end
+      return options.auth or "authenticated", options.auth_error
+    end,
+    stat = function(path)
+      return path == "/usr/bin/opencode" and { type = "file", mode = 493, uid = 0 } or nil
+    end,
+    uid = function()
+      return 1000
+    end,
+  })
+  return fixture:health("opencode"), order
+end
+
+local healthy_opencode, healthy_order = managed_health()
+eq(healthy_opencode.installed, true, "managed OpenCode is installed")
+eq(healthy_opencode.version, "1.18.18", "managed OpenCode exact health version")
+eq(healthy_opencode.auth, "authenticated", "managed OpenCode filtered authentication")
+eq(healthy_opencode.capabilities, opencode:capabilities(), "managed OpenCode health capabilities")
+eq(healthy_opencode.error, "", "managed OpenCode health succeeds")
+eq(
+  healthy_order,
+  { "executable", "revalidate", "compatibility", "auth_path", "inspect_auth" },
+  "managed OpenCode health ordering"
 )
+
+local health_failures = {
+  {
+    label = "unknown exact version",
+    mutate = function(options)
+      options.compatibility = vim.deepcopy(compatibility_report)
+      options.compatibility.version = "1.18.19"
+    end,
+  },
+  {
+    label = "missing pure mode",
+    mutate = function(options)
+      options.compatibility = vim.deepcopy(compatibility_report)
+      options.compatibility.help.root[1] = "--unsafe"
+    end,
+  },
+  {
+    label = "malformed agent report",
+    mutate = function(options)
+      options.compatibility = vim.deepcopy(compatibility_report)
+      options.compatibility.agents.build = "malformed-agent-canary"
+    end,
+  },
+  {
+    label = "semantic helper failure",
+    mutate = function(options)
+      options.compatibility_error = "compatibility-secret-canary"
+    end,
+  },
+  {
+    label = "unauthenticated filtered credentials",
+    mutate = function(options)
+      options.auth = "unauthenticated"
+    end,
+  },
+  {
+    label = "authentication helper exception",
+    mutate = function(options)
+      options.auth_exception = "credential-secret-canary"
+    end,
+  },
+  {
+    label = "unknown authentication",
+    mutate = function(options)
+      options.auth = "unknown"
+      options.auth_error = "credential-helper-private-canary"
+    end,
+  },
+}
+for _, case in ipairs(health_failures) do
+  local options = {}
+  case.mutate(options)
+  local health = managed_health(options)
+  eq(health.installed, true, case.label .. " remains detected")
+  eq(health.capabilities, {}, case.label .. " disables capabilities")
+  assert(type(health.error) == "string" and health.error ~= "", case.label .. " has no error")
+  assert(#health.error <= 256, case.label .. " error is unbounded")
+  local serialized = vim.inspect(health)
+  for _, canary in ipairs({
+    "malformed-agent-canary",
+    "compatibility-secret-canary",
+    "credential-secret-canary",
+    "credential-helper-private-canary",
+  }) do
+    assert(not serialized:find(canary, 1, true), case.label .. " leaked private output")
+  end
+end
 
 local absent_calls = 0
 local absent = registry_module._test.new({
