@@ -3265,6 +3265,8 @@ require_contains "$macos_output" \
   "launchctl kickstart -k gui/$(id -u)/dev.ruohao.tmux-workspace" \
   'macOS dry-run reports LaunchAgent kickstart'
 require_contains "$macos_output" 'install homebrew-formula neovim' 'Homebrew plan includes Neovim formula'
+require_contains "$macos_output" 'install homebrew-formula tree-sitter-cli' \
+  'Homebrew plan includes the Tree-sitter CLI formula'
 require_contains "$macos_output" 'install homebrew-cask ghostty' 'Homebrew plan includes Ghostty cask'
 require_contains "$macos_output" \
   'ensure uv-tool visidata==3.4 with pyarrow==25.0.0 and duckdb==1.5.5' \
@@ -5742,6 +5744,8 @@ fi
 brew_apply_commands=$(cat "$brew_apply_log" 2>/dev/null || true)
 require_contains "$brew_apply_commands" 'pinned-installer homebrew a34ae4ee9151cbce4c3b33bca7043a972b7ae9a5' 'Homebrew bootstrap uses the pinned installer revision'
 require_contains "$brew_apply_commands" 'brew install neovim' 'Homebrew package phase installs missing formulae'
+require_contains "$brew_apply_commands" 'brew install tree-sitter-cli' \
+  'Homebrew package phase installs the Tree-sitter CLI'
 require_contains "$brew_apply_commands" 'brew install --cask ghostty' 'Homebrew package phase installs missing casks'
 require_contains "$brew_apply_commands" \
   'uv tool install --force --with pyarrow==25.0.0 --with duckdb==1.5.5 --no-config visidata==3.4' \

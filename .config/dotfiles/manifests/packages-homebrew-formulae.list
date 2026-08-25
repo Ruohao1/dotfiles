@@ -6,7 +6,7 @@ ripgrep
 jq
 shellcheck
 stylua
-tree-sitter
+tree-sitter-cli
 herdr
 imagemagick
 uv
