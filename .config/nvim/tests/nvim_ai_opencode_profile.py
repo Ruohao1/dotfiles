@@ -1123,6 +1123,7 @@ class PublicationBoundaryTests(unittest.TestCase):
         original_open = os.open
         staging_name = f".opencode-profile-{TOKEN}.tmp"
         staging = fixture.backend_state.parent / staging_name
+        injected = False
 
         def fail_staging_open(
             path: object,
@@ -1131,7 +1132,9 @@ class PublicationBoundaryTests(unittest.TestCase):
             *,
             dir_fd: int | None = None,
         ):
-            if path == staging_name and dir_fd is not None:
+            nonlocal injected
+            if path == staging_name and dir_fd is not None and not injected:
+                injected = True
                 raise OSError("injected staging open failure")
             return original_open(path, flags, mode, dir_fd=dir_fd)
 
@@ -1140,6 +1143,36 @@ class PublicationBoundaryTests(unittest.TestCase):
                 fixture.prepare()
         failed_create_staging_exists = staging.exists()
         self.assertFalse(failed_create_staging_exists)
+
+    def test_staging_first_lstat_failure_recovers_the_empty_created_entry(
+        self,
+    ) -> None:
+        fixture = Fixture(self)
+        original_entry_lstat = helper._entry_lstat
+        staging_name = f".opencode-profile-{TOKEN}.tmp"
+        staging = fixture.backend_state.parent / staging_name
+        injected = False
+
+        def fail_first_post_mkdir_lstat(parent_descriptor: int, name: str):
+            nonlocal injected
+            if name == staging_name and staging.exists() and not injected:
+                injected = True
+                raise OSError("injected first post-mkdir lstat failure")
+            return original_entry_lstat(parent_descriptor, name)
+
+        caught = False
+        with mock.patch.object(
+            helper,
+            "_entry_lstat",
+            side_effect=fail_first_post_mkdir_lstat,
+        ):
+            try:
+                fixture.prepare()
+            except ValueError:
+                caught = True
+        staging_exists = staging.exists()
+        self.assertTrue(caught)
+        self.assertFalse(staging_exists)
 
     def test_empty_destination_injected_after_final_precheck_is_not_replaced(
         self,

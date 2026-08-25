@@ -566,8 +566,10 @@ def _verify_private_child(parent_descriptor, name, identity):
 def _create_private_child(parent_descriptor, name):
     descriptor = None
     created_identity = None
+    mkdir_succeeded = False
     try:
         os.mkdir(name, 0o700, dir_fd=parent_descriptor)
+        mkdir_succeeded = True
         created = _entry_lstat(parent_descriptor, name)
         created_identity = _directory_metadata(created)
         _validate_private_directory_metadata(created)
@@ -589,14 +591,8 @@ def _create_private_child(parent_descriptor, name):
                 os.close(descriptor)
             except OSError:
                 pass
-        if created_identity is not None:
-            try:
-                current = _entry_lstat(parent_descriptor, name)
-                if _directory_metadata(current) == created_identity:
-                    os.rmdir(name, dir_fd=parent_descriptor)
-                    os.fsync(parent_descriptor)
-            except OSError:
-                pass
+        if mkdir_succeeded:
+            _recover_created_child(parent_descriptor, name, created_identity)
         if isinstance(error, ValueError):
             raise
         raise ValueError("private directory cannot be created") from None
@@ -674,6 +670,42 @@ def _remove_tree_contents(descriptor):
     except OSError:
         return False
     return True
+
+
+def _recover_created_child(parent_descriptor, name, created_identity):
+    descriptor = None
+    try:
+        before = _entry_lstat(parent_descriptor, name)
+        _validate_private_directory_metadata(before)
+        before_identity = _directory_metadata(before)
+        if created_identity is not None and before_identity != created_identity:
+            return
+        descriptor = os.open(name, _directory_flags(), dir_fd=parent_descriptor)
+        opened = os.fstat(descriptor)
+        _validate_private_directory_metadata(opened)
+        opened_identity = _directory_metadata(opened)
+        if before_identity != opened_identity:
+            return
+        current = _entry_lstat(parent_descriptor, name)
+        _validate_private_directory_metadata(current)
+        if _directory_metadata(current) != opened_identity:
+            return
+        if not _remove_tree_contents(descriptor):
+            return
+        current = _entry_lstat(parent_descriptor, name)
+        _validate_private_directory_metadata(current)
+        if _directory_metadata(current) != opened_identity:
+            return
+        os.rmdir(name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+    except (OSError, ValueError):
+        pass
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _cleanup_staging(parent_descriptor, name, descriptor, identity):
