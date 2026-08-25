@@ -1118,6 +1118,29 @@ class PublicationBoundaryTests(unittest.TestCase):
         self.assertTrue(stolen.is_dir())
         self.assertFalse(fixture.profile_root().exists())
 
+    def test_staging_open_failure_removes_the_proven_empty_created_entry(self) -> None:
+        fixture = Fixture(self)
+        original_open = os.open
+        staging_name = f".opencode-profile-{TOKEN}.tmp"
+        staging = fixture.backend_state.parent / staging_name
+
+        def fail_staging_open(
+            path: object,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ):
+            if path == staging_name and dir_fd is not None:
+                raise OSError("injected staging open failure")
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch.object(helper.os, "open", side_effect=fail_staging_open):
+            with self.assertRaises(ValueError):
+                fixture.prepare()
+        failed_create_staging_exists = staging.exists()
+        self.assertFalse(failed_create_staging_exists)
+
     def test_empty_destination_injected_after_final_precheck_is_not_replaced(
         self,
     ) -> None:
@@ -1257,6 +1280,7 @@ class PublicationBoundaryTests(unittest.TestCase):
         fixture = Fixture(self)
         original_rename = os.rename
         replacement: pathlib.Path | None = None
+        stolen = fixture.backend_state.parent / ".stolen"
 
         def replace_staging(
             _source_descriptor: int,
@@ -1267,7 +1291,6 @@ class PublicationBoundaryTests(unittest.TestCase):
             nonlocal replacement
             parent = fixture.backend_state.parent
             staging = parent / os.fspath(src)
-            stolen = parent / ".stolen"
             original_rename(staging, stolen)
             staging.mkdir(mode=0o700)
             replacement = staging / "attacker-sentinel"
@@ -1282,6 +1305,11 @@ class PublicationBoundaryTests(unittest.TestCase):
                 fixture.prepare()
         self.assertIsNotNone(replacement)
         self.assertEqual(replacement.read_text(encoding="utf-8"), "foreign")
+        stolen_auth = stolen / "credentials/auth.json"
+        stolen_contains_api_canary = (
+            stolen_auth.is_file() and b"api-canary" in stolen_auth.read_bytes()
+        )
+        self.assertFalse(stolen_contains_api_canary)
         self.assertFalse(fixture.profile_root().exists())
 
     def test_destination_replacement_before_rename_is_never_overwritten(self) -> None:
