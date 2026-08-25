@@ -673,12 +673,19 @@ def _remove_tree_contents(descriptor):
 
 
 def _recover_created_child(parent_descriptor, name, created_identity):
+    if created_identity is None:
+        try:
+            os.rmdir(name, dir_fd=parent_descriptor)
+            os.fsync(parent_descriptor)
+        except OSError:
+            pass
+        return
     descriptor = None
     try:
         before = _entry_lstat(parent_descriptor, name)
         _validate_private_directory_metadata(before)
         before_identity = _directory_metadata(before)
-        if created_identity is not None and before_identity != created_identity:
+        if before_identity != created_identity:
             return
         descriptor = os.open(name, _directory_flags(), dir_fd=parent_descriptor)
         opened = os.fstat(descriptor)

@@ -1174,6 +1174,46 @@ class PublicationBoundaryTests(unittest.TestCase):
         self.assertTrue(caught)
         self.assertFalse(staging_exists)
 
+    def test_first_lstat_failure_never_adopts_a_foreign_staging_replacement(
+        self,
+    ) -> None:
+        fixture = Fixture(self)
+        original_entry_lstat = helper._entry_lstat
+        original_rename = os.rename
+        staging_name = f".opencode-profile-{TOKEN}.tmp"
+        staging = fixture.backend_state.parent / staging_name
+        stolen = fixture.backend_state.parent / ".staging-created-by-helper"
+        sentinel = staging / "attacker-sentinel"
+        injected = False
+
+        def replace_then_fail_first_lstat(parent_descriptor: int, name: str):
+            nonlocal injected
+            if name == staging_name and staging.exists() and not injected:
+                injected = True
+                original_rename(staging, stolen)
+                staging.mkdir(mode=0o700)
+                sentinel.write_text("foreign", encoding="utf-8")
+                os.chmod(sentinel, 0o600)
+                raise OSError("injected first post-mkdir lstat failure")
+            return original_entry_lstat(parent_descriptor, name)
+
+        caught = False
+        with mock.patch.object(
+            helper,
+            "_entry_lstat",
+            side_effect=replace_then_fail_first_lstat,
+        ):
+            try:
+                fixture.prepare()
+            except ValueError:
+                caught = True
+        self.assertTrue(caught)
+        self.assertTrue(staging.is_dir())
+        self.assertTrue(sentinel.is_file())
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "foreign")
+        self.assertTrue(stolen.is_dir())
+        self.assertFalse(fixture.profile_root().exists())
+
     def test_empty_destination_injected_after_final_precheck_is_not_replaced(
         self,
     ) -> None:
