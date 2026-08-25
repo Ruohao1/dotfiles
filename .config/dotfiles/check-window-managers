@@ -376,14 +376,20 @@ else
   fail 'obsolete WM+Shift+C reload bindings are removed everywhere'
 fi
 
-if grep -Fqx 'hl.bind("SUPER + 1", hl.dsp.focus({ workspace = 1 }))' \
-  "$hypr_config" \
-  && grep -Fqx "bindsym \$mod+1 workspace --no-auto-back-and-forth \"0\"" \
-    "$i3_config" \
-  && grep -Fqx "alt-1 = 'workspace 0'" "$check_tmp/aerospace.normalized"; then
-  pass 'physical key 1 selects the first valid workspace on every platform'
+aerospace_numeric_bindings_are_direct=true
+for workspace_digit in 0 1 2 3 4 5 6 7 8 9; do
+  if ! grep -Fqx "alt-$workspace_digit = 'workspace $workspace_digit'" \
+      "$check_tmp/aerospace.normalized" \
+    || ! grep -Fqx \
+      "alt-shift-$workspace_digit = 'move-node-to-workspace $workspace_digit'" \
+      "$check_tmp/aerospace.normalized"; then
+    aerospace_numeric_bindings_are_direct=false
+  fi
+done
+if [ "$aerospace_numeric_bindings_are_direct" = true ]; then
+  pass 'AeroSpace numeric bindings use direct workspace numbers without offsets'
 else
-  fail 'physical key 1 selects the first valid workspace on every platform'
+  fail 'AeroSpace numeric bindings use direct workspace numbers without offsets'
 fi
 
 if ! grep -Fq 'workspace = "name:' "$hypr_config"; then
