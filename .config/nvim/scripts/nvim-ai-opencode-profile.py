@@ -24,6 +24,12 @@ AUDITED_CONFIG_JSON = (
     '"summary":{"permission":{"*":"deny"}},'
     '"title":{"permission":{"*":"deny"}}}}'
 )
+AUDITED_BOOTSTRAP_GITIGNORE = (
+    b"node_modules\npackage.json\npackage-lock.json\nbun.lock\n.gitignore"
+)
+AUDITED_BOOTSTRAP_GITIGNORE_SHA256 = (
+    "663a068e76d264d0bc6740f5450b6c4193c7b41ecf5e0dc222485b8a17404d95"
+)
 
 MAX_PROVIDERS = 128
 MAX_PROVIDER_BYTES = 256
@@ -892,6 +898,11 @@ def _publish_profile(request, auth_bytes, count, instruction_bytes):
                 xdg_descriptor, "opencode"
             )
             try:
+                _write_private_file(
+                    opencode_descriptor,
+                    ".gitignore",
+                    AUDITED_BOOTSTRAP_GITIGNORE,
+                )
                 _write_private_file(opencode_descriptor, "AGENTS.md", instruction_bytes)
                 _write_private_file(opencode_descriptor, "opencode.json", config_bytes)
                 os.fsync(opencode_descriptor)
@@ -1169,7 +1180,21 @@ def inspect_profile(request):
             xdg_descriptor, "opencode"
         )
         descriptors.append(opencode_descriptor)
-        _require_entries(opencode_descriptor, ("AGENTS.md", "opencode.json"))
+        _require_entries(
+            opencode_descriptor,
+            (".gitignore", "AGENTS.md", "opencode.json"),
+        )
+        bootstrap_bytes = _secure_read_entry(
+            opencode_descriptor,
+            ".gitignore",
+            len(AUDITED_BOOTSTRAP_GITIGNORE),
+        )
+        if (
+            bootstrap_bytes != AUDITED_BOOTSTRAP_GITIGNORE
+            or hashlib.sha256(bootstrap_bytes).hexdigest()
+            != AUDITED_BOOTSTRAP_GITIGNORE_SHA256
+        ):
+            raise ValueError("profile bootstrap is not canonical")
         config_bytes = _secure_read_entry(
             opencode_descriptor, "opencode.json", MAX_JSON_BYTES
         )
@@ -1200,7 +1225,10 @@ def inspect_profile(request):
         _require_entries(credentials_descriptor, ("auth.json",))
         _require_entries(empty_descriptor, ())
         _require_entries(xdg_descriptor, ("opencode",))
-        _require_entries(opencode_descriptor, ("AGENTS.md", "opencode.json"))
+        _require_entries(
+            opencode_descriptor,
+            (".gitignore", "AGENTS.md", "opencode.json"),
+        )
         if (
             _secure_read_entry(credentials_descriptor, "auth.json", MAX_JSON_BYTES)
             != auth_bytes
@@ -1211,6 +1239,15 @@ def inspect_profile(request):
             != config_bytes
         ):
             raise ValueError("profile configuration changed during inspection")
+        if (
+            _secure_read_entry(
+                opencode_descriptor,
+                ".gitignore",
+                len(AUDITED_BOOTSTRAP_GITIGNORE),
+            )
+            != bootstrap_bytes
+        ):
+            raise ValueError("profile bootstrap changed during inspection")
         if (
             _secure_read_entry(opencode_descriptor, "AGENTS.md", MAX_SNAPSHOT_BYTES)
             != instruction_bytes

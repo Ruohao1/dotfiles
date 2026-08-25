@@ -39,6 +39,12 @@ CONFIG_JSON = (
     '"summary":{"permission":{"*":"deny"}},'
     '"title":{"permission":{"*":"deny"}}}}'
 )
+BOOTSTRAP_GITIGNORE = (
+    b"node_modules\npackage.json\npackage-lock.json\nbun.lock\n.gitignore"
+)
+BOOTSTRAP_GITIGNORE_SHA256 = (
+    "663a068e76d264d0bc6740f5450b6c4193c7b41ecf5e0dc222485b8a17404d95"
+)
 IDENTITY_KEY = "a" * 32
 TOKEN = "b" * 32
 SECOND_TOKEN = "c" * 32
@@ -208,6 +214,11 @@ class StaticContractTests(unittest.TestCase):
         self.assertEqual(helper.AUDITED_VERSION, VERSION)
         self.assertEqual(helper.AUDITED_POLICY_JSON, POLICY_JSON)
         self.assertEqual(helper.AUDITED_CONFIG_JSON, CONFIG_JSON)
+        self.assertEqual(helper.AUDITED_BOOTSTRAP_GITIGNORE, BOOTSTRAP_GITIGNORE)
+        self.assertEqual(
+            helper.AUDITED_BOOTSTRAP_GITIGNORE_SHA256,
+            BOOTSTRAP_GITIGNORE_SHA256,
+        )
         self.assertEqual(helper.MAX_SOURCE_BYTES, MAX_SOURCE_BYTES)
         self.assertEqual(helper.MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_BYTES)
         self.assertEqual(helper.MAX_JSON_BYTES, MAX_JSON_BYTES)
@@ -487,6 +498,7 @@ class ProfileConstructionTests(unittest.TestCase):
                 "manifest.json",
                 "xdg-config",
                 "xdg-config/opencode",
+                "xdg-config/opencode/.gitignore",
                 "xdg-config/opencode/AGENTS.md",
                 "xdg-config/opencode/opencode.json",
             ],
@@ -518,6 +530,16 @@ class ProfileConstructionTests(unittest.TestCase):
             (profile / "xdg-config/opencode/opencode.json").read_bytes(),
             CONFIG_JSON.encode("utf-8"),
         )
+        bootstrap = profile / "xdg-config/opencode/.gitignore"
+        bootstrap_bytes = bootstrap.read_bytes()
+        self.assertEqual(len(bootstrap_bytes), 63)
+        self.assertEqual(bootstrap_bytes, BOOTSTRAP_GITIGNORE)
+        self.assertFalse(bootstrap_bytes.endswith(b"\n"))
+        self.assertEqual(
+            hashlib.sha256(bootstrap_bytes).hexdigest(),
+            BOOTSTRAP_GITIGNORE_SHA256,
+        )
+        self.assertEqual(stat.S_IMODE(bootstrap.lstat().st_mode), 0o600)
 
         auth_bytes = (profile / "credentials/auth.json").read_bytes()
         self.assertTrue(auth_bytes.endswith(b"\n"))
@@ -1374,7 +1396,7 @@ class PublicationBoundaryTests(unittest.TestCase):
 
         with mock.patch.object(helper.os, "fsync", side_effect=observing_fsync):
             fixture.prepare()
-        self.assertEqual(synced["file"], 4)
+        self.assertEqual(synced["file"], 5)
         self.assertGreaterEqual(synced["directory"], 7)
         self.assertTrue(
             {
@@ -1567,6 +1589,91 @@ class InspectProfileTests(unittest.TestCase):
         inspected = helper.inspect_profile(fixture.profile_request(prepared))
         self.assertEqual(inspected, prepared)
         self.assertNotIn("canary", compact_json(inspected))
+
+    def test_rejects_unsafe_or_changed_bootstrap_gitignore(self) -> None:
+        mutations = (
+            "missing",
+            "changed-bytes",
+            "appended-lf",
+            "mode",
+            "owner",
+            "symlink",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                fixture = Fixture(self)
+                prepared = fixture.prepare()
+                path = fixture.profile_root() / "xdg-config/opencode/.gitignore"
+                patcher = None
+                if mutation == "missing":
+                    path.unlink()
+                elif mutation == "changed-bytes":
+                    path.write_bytes(b"x" + BOOTSTRAP_GITIGNORE[1:])
+                elif mutation == "appended-lf":
+                    path.write_bytes(BOOTSTRAP_GITIGNORE + b"\n")
+                elif mutation == "mode":
+                    os.chmod(path, 0o644)
+                elif mutation == "owner":
+                    original_entry_lstat = helper._entry_lstat
+
+                    def wrong_bootstrap_owner(
+                        parent_descriptor: int,
+                        name: str,
+                    ):
+                        result = original_entry_lstat(parent_descriptor, name)
+                        if name == ".gitignore":
+                            return StatProxy(result, st_uid=os.getuid() + 1)
+                        return result
+
+                    patcher = mock.patch.object(
+                        helper,
+                        "_entry_lstat",
+                        side_effect=wrong_bootstrap_owner,
+                    )
+                else:
+                    target = fixture.base / "bootstrap-target"
+                    target.write_bytes(path.read_bytes())
+                    os.chmod(target, 0o600)
+                    path.unlink()
+                    path.symlink_to(target)
+
+                context = (
+                    patcher
+                    if patcher is not None
+                    else mock.patch.object(helper, "AUDITED_VERSION", VERSION)
+                )
+                with context, self.assertRaises(ValueError) as caught:
+                    helper.inspect_profile(fixture.profile_request(prepared))
+                self.assertNotIn("canary", str(caught.exception))
+
+    def test_rejects_late_bootstrap_gitignore_replacement(self) -> None:
+        fixture = Fixture(self)
+        prepared = fixture.prepare()
+        path = fixture.profile_root() / "xdg-config/opencode/.gitignore"
+        original_validate = helper._validate_manifest
+        replaced = False
+
+        def replace_after_manifest_validation(*args: object, **kwargs: object):
+            nonlocal replaced
+            result = original_validate(*args, **kwargs)
+            replacement = path.with_name("bootstrap-replacement")
+            replacement.write_bytes(b"x" + BOOTSTRAP_GITIGNORE[1:])
+            os.chmod(replacement, 0o600)
+            os.replace(replacement, path)
+            replaced = True
+            return result
+
+        with (
+            mock.patch.object(
+                helper,
+                "_validate_manifest",
+                side_effect=replace_after_manifest_validation,
+            ),
+            self.assertRaises(ValueError) as caught,
+        ):
+            helper.inspect_profile(fixture.profile_request(prepared))
+        self.assertTrue(replaced)
+        self.assertNotIn("canary", str(caught.exception))
 
     def test_rejects_changed_reference_and_manifest_identity_fields(self) -> None:
         request_mutations = {
