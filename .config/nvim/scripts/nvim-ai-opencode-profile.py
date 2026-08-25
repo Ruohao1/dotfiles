@@ -674,11 +674,6 @@ def _remove_tree_contents(descriptor):
 
 def _recover_created_child(parent_descriptor, name, created_identity):
     if created_identity is None:
-        try:
-            os.rmdir(name, dir_fd=parent_descriptor)
-            os.fsync(parent_descriptor)
-        except OSError:
-            pass
         return
     descriptor = None
     try:
@@ -726,6 +721,28 @@ def _cleanup_staging(parent_descriptor, name, descriptor, identity):
         if current is not None and _directory_metadata(current) == identity:
             os.rmdir(name, dir_fd=parent_descriptor)
         os.fsync(parent_descriptor)
+    except OSError:
+        pass
+
+
+def _cleanup_published_generation(
+    source_parent_descriptor,
+    destination_parent_descriptor,
+    name,
+    descriptor,
+    identity,
+):
+    if not _remove_tree_contents(descriptor):
+        return
+    try:
+        current = _entry_lstat(destination_parent_descriptor, name)
+    except OSError:
+        current = None
+    try:
+        if current is not None and _directory_metadata(current) == identity:
+            os.rmdir(name, dir_fd=destination_parent_descriptor)
+        os.fsync(destination_parent_descriptor)
+        os.fsync(source_parent_descriptor)
     except OSError:
         pass
 
@@ -826,7 +843,8 @@ def _publish_profile(request, auth_bytes, count, instruction_bytes):
     profiles_descriptor = None
     staging_descriptor = None
     staging_identity = None
-    published = False
+    renamed = False
+    publication_complete = False
     try:
         backend_parent = os.path.dirname(request["backend_state"])
         backend_name = os.path.basename(request["backend_state"])
@@ -900,7 +918,7 @@ def _publish_profile(request, auth_bytes, count, instruction_bytes):
             profiles_descriptor,
             destination_name,
         )
-        published = True
+        renamed = True
         os.fsync(profiles_descriptor)
         os.fsync(parent_descriptor)
         if _entry_exists(parent_descriptor, staging_name):
@@ -917,23 +935,33 @@ def _publish_profile(request, auth_bytes, count, instruction_bytes):
             raise ValueError("backend state parent changed during publication")
         if _directory_metadata(final_backend) != backend_identity:
             raise ValueError("backend state changed during publication")
+        publication_complete = True
     except ValueError:
         raise
     except OSError:
         raise ValueError("profile publication failed") from None
     finally:
         if (
-            not published
+            not publication_complete
             and parent_descriptor is not None
             and staging_descriptor is not None
             and staging_identity is not None
         ):
-            _cleanup_staging(
-                parent_descriptor,
-                staging_name,
-                staging_descriptor,
-                staging_identity,
-            )
+            if renamed and profiles_descriptor is not None:
+                _cleanup_published_generation(
+                    parent_descriptor,
+                    profiles_descriptor,
+                    destination_name,
+                    staging_descriptor,
+                    staging_identity,
+                )
+            else:
+                _cleanup_staging(
+                    parent_descriptor,
+                    staging_name,
+                    staging_descriptor,
+                    staging_identity,
+                )
         for descriptor in (
             staging_descriptor,
             profiles_descriptor,

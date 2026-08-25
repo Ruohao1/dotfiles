@@ -1144,7 +1144,7 @@ class PublicationBoundaryTests(unittest.TestCase):
         failed_create_staging_exists = staging.exists()
         self.assertFalse(failed_create_staging_exists)
 
-    def test_staging_first_lstat_failure_recovers_the_empty_created_entry(
+    def test_staging_first_lstat_failure_preserves_unresolved_empty_basename(
         self,
     ) -> None:
         fixture = Fixture(self)
@@ -1172,7 +1172,44 @@ class PublicationBoundaryTests(unittest.TestCase):
                 caught = True
         staging_exists = staging.exists()
         self.assertTrue(caught)
-        self.assertFalse(staging_exists)
+        self.assertTrue(staging_exists)
+        self.assertEqual(list(staging.iterdir()), [])
+
+    def test_first_lstat_failure_preserves_an_empty_foreign_replacement(
+        self,
+    ) -> None:
+        fixture = Fixture(self)
+        original_entry_lstat = helper._entry_lstat
+        original_rename = os.rename
+        staging_name = f".opencode-profile-{TOKEN}.tmp"
+        staging = fixture.backend_state.parent / staging_name
+        stolen = fixture.backend_state.parent / ".staging-created-by-helper"
+        injected = False
+
+        def replace_then_fail_first_lstat(parent_descriptor: int, name: str):
+            nonlocal injected
+            if name == staging_name and staging.exists() and not injected:
+                injected = True
+                original_rename(staging, stolen)
+                staging.mkdir(mode=0o700)
+                raise OSError("injected first post-mkdir lstat failure")
+            return original_entry_lstat(parent_descriptor, name)
+
+        caught = False
+        with mock.patch.object(
+            helper,
+            "_entry_lstat",
+            side_effect=replace_then_fail_first_lstat,
+        ):
+            try:
+                fixture.prepare()
+            except ValueError:
+                caught = True
+        self.assertTrue(caught)
+        self.assertTrue(staging.is_dir())
+        self.assertEqual(list(staging.iterdir()), [])
+        self.assertTrue(stolen.is_dir())
+        self.assertFalse(fixture.profile_root().exists())
 
     def test_first_lstat_failure_never_adopts_a_foreign_staging_replacement(
         self,
@@ -1346,6 +1383,108 @@ class PublicationBoundaryTests(unittest.TestCase):
                 fixture.backend_state / "profiles",
             }.issubset(synced_directories)
         )
+
+    def test_post_rename_profiles_fsync_failure_removes_the_generation(self) -> None:
+        fixture = Fixture(self)
+        original_fsync = os.fsync
+        profiles = (fixture.backend_state / "profiles").resolve()
+        profiles_syncs = 0
+        injected = False
+
+        def fail_second_profiles_fsync(descriptor: int):
+            nonlocal profiles_syncs, injected
+            opened_path = pathlib.Path(
+                os.readlink(f"/proc/self/fd/{descriptor}")
+            ).resolve()
+            if opened_path == profiles:
+                profiles_syncs += 1
+                if profiles_syncs == 2:
+                    injected = True
+                    raise OSError("injected post-rename profiles fsync failure")
+            return original_fsync(descriptor)
+
+        with mock.patch.object(
+            helper.os,
+            "fsync",
+            side_effect=fail_second_profiles_fsync,
+        ):
+            with self.assertRaises(ValueError):
+                fixture.prepare()
+        profile = fixture.profile_root()
+        self.assertTrue(injected)
+        self.assertFalse(profile.exists())
+        self.assertFalse((profile / "credentials/auth.json").exists())
+        self.assertFalse(
+            (fixture.backend_state.parent / f".opencode-profile-{TOKEN}.tmp").exists()
+        )
+
+    def test_final_verification_failure_removes_the_generation(self) -> None:
+        fixture = Fixture(self)
+        original_verify = helper._verify_private_child
+        injected = False
+
+        def fail_destination_verification(
+            parent_descriptor: int,
+            name: str,
+            identity: tuple[int, int, int, int],
+        ) -> None:
+            nonlocal injected
+            if name == TOKEN and not injected:
+                injected = True
+                raise ValueError("injected final destination verification failure")
+            original_verify(parent_descriptor, name, identity)
+
+        with mock.patch.object(
+            helper,
+            "_verify_private_child",
+            side_effect=fail_destination_verification,
+        ):
+            with self.assertRaises(ValueError):
+                fixture.prepare()
+        profile = fixture.profile_root()
+        self.assertTrue(injected)
+        self.assertFalse(profile.exists())
+        self.assertFalse((profile / "credentials/auth.json").exists())
+
+    def test_replaced_destination_survives_incomplete_publication_cleanup(
+        self,
+    ) -> None:
+        fixture = Fixture(self)
+        original_verify = helper._verify_private_child
+        original_rename = os.rename
+        profile = fixture.profile_root()
+        stolen = profile.parent / ".stolen-published-generation"
+        sentinel = profile / "attacker-sentinel"
+        injected = False
+
+        def replace_destination_before_final_verification(
+            parent_descriptor: int,
+            name: str,
+            identity: tuple[int, int, int, int],
+        ) -> None:
+            nonlocal injected
+            if name == TOKEN and not injected:
+                injected = True
+                original_rename(profile, stolen)
+                profile.mkdir(mode=0o700)
+                sentinel.write_text("foreign", encoding="utf-8")
+                os.chmod(sentinel, 0o600)
+                raise ValueError("injected final destination replacement")
+            original_verify(parent_descriptor, name, identity)
+
+        with mock.patch.object(
+            helper,
+            "_verify_private_child",
+            side_effect=replace_destination_before_final_verification,
+        ):
+            with self.assertRaises(ValueError):
+                fixture.prepare()
+        self.assertTrue(injected)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "foreign")
+        self.assertTrue(stolen.is_dir())
+        stolen_auth = stolen / "credentials/auth.json"
+        self.assertFalse(stolen_auth.exists())
+        self.assertEqual(list(stolen.iterdir()), [])
 
     def test_staging_replacement_on_publication_is_not_deleted_or_published(
         self,
