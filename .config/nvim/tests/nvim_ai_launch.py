@@ -604,6 +604,15 @@ class ManifestTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "grant"):
                     launcher.validate_manifest(changed, fixture_metadata())
 
+    def test_writable_review_id_requires_a_nonempty_lowercase_hex_suffix(self) -> None:
+        manifest = self.fixture.manifest(writable=True)
+        manifest["review_id"] = "review_"
+        with self.assertRaisesRegex(ValueError, "review"):
+            launcher.validate_manifest(manifest, fixture_metadata())
+
+        manifest["review_id"] = "review_a"
+        launcher.validate_manifest(manifest, fixture_metadata())
+
     def test_manifest_is_descriptor_read_and_unlinked_only_after_validation(self) -> None:
         path = self.fixture.write_launch_manifest(self.fixture.manifest())
         consumed = launcher.consume_manifest(str(path))

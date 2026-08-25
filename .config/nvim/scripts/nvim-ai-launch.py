@@ -414,6 +414,7 @@ def _validate_grants(manifest):
         if (
             not isinstance(review, str)
             or not review.startswith("review_")
+            or not review[7:]
             or not _valid_hex(review[7:], len(review) - 7)
             or len(review) > 128
         ):
