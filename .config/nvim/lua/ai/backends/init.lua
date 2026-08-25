@@ -405,6 +405,15 @@ local function bounded_system(argv, options, limits, system)
   }
 end
 
+local function valid_probe_result(result)
+  return type(result) == "table"
+    and type(result.code) == "number"
+    and type(result.signal) == "number"
+    and result.signal == 0
+    and type(result.stdout) == "string"
+    and type(result.stderr) == "string"
+end
+
 local function read_only_probe(executable, arguments, overrides)
   local tools = require("ai.tools")
   local probe = overrides or {}
@@ -596,10 +605,10 @@ local function read_only_probe(executable, arguments, overrides)
       }
     end
   end
-  if not ok then
+  if not ok or not valid_probe_result(result) then
     return { code = 126, signal = 0, stdout = "", stderr = "probe execution failed" }
   end
-  if type(result) == "table" and (result.stdout_overflow or result.stderr_overflow) then
+  if result.stdout_overflow or result.stderr_overflow then
     return {
       code = 126,
       signal = 0,
@@ -607,7 +616,7 @@ local function read_only_probe(executable, arguments, overrides)
       stderr = "probe output exceeded configured limit",
     }
   end
-  if type(result) == "table" and result.system_error then
+  if result.system_error then
     return { code = 126, signal = 0, stdout = "", stderr = "probe execution failed" }
   end
   return result
@@ -876,6 +885,23 @@ local function create_opencode_probe_tree()
     return nil, "managed OpenCode probe directory creation failed"
   end
   return tree
+end
+
+local function cleanup_owned_probe_tree(root, remove, lstat)
+  if
+    type(root) ~= "string"
+    or root == ""
+    or type(remove) ~= "function"
+    or type(lstat) ~= "function"
+  then
+    return false
+  end
+  local remove_ok, status = pcall(remove, root, "rf")
+  if not remove_ok or status ~= 0 then
+    return false
+  end
+  local lstat_ok, stat, _, code = pcall(lstat, root)
+  return lstat_ok and stat == nil and code == "ENOENT"
 end
 
 local function forbidden_probe_artifact(bytes)
@@ -1393,13 +1419,6 @@ local function inspect_opencode_probe_artifacts(tree, semantic, overrides)
   return true
 end
 
-local function valid_probe_result(result)
-  return type(result) == "table"
-    and type(result.code) == "number"
-    and type(result.stdout) == "string"
-    and type(result.stderr) == "string"
-end
-
 local function opencode_probe_environment()
   local managed = require("ai.backends.opencode_managed")
   return {
@@ -1533,11 +1552,11 @@ local function opencode_compatibility(executable, overrides)
       }
       pcall(options.observe_probe, name, vim.deepcopy(tree), observation)
     end
-    if owns_tree then
-      pcall(vim.fn.delete, tree.root, "rf")
-    end
+    local cleanup_ok = not owns_tree
+      or cleanup_owned_probe_tree(tree.root, vim.fn.delete, vim.uv.fs_lstat)
     if
       not ok
+      or not cleanup_ok
       or not valid_probe_result(result)
       or result.code == 125
       or result.stdout_overflow
@@ -2222,12 +2241,7 @@ local function new(deps)
     if not ok then
       return nil, clean_text(result, MAX_DIAGNOSTIC_BYTES)
     end
-    if
-      type(result) ~= "table"
-      or type(result.code) ~= "number"
-      or type(result.stdout) ~= "string"
-      or type(result.stderr) ~= "string"
-    then
+    if not valid_probe_result(result) then
       return nil, "probe returned an invalid result"
     end
     return result
@@ -2422,6 +2436,7 @@ end
 M._test = {
   auth_arguments = auth_arguments,
   bounded_system = bounded_system,
+  cleanup_owned_probe_tree = cleanup_owned_probe_tree,
   create_opencode_probe_tree = create_opencode_probe_tree,
   inspect_opencode_probe_artifacts = inspect_opencode_probe_artifacts,
   invoke_profile_helper = invoke_profile_helper,

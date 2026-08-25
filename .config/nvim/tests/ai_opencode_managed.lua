@@ -866,6 +866,73 @@ eq(
   "profile helper revalidates canonical Python and helper paths"
 )
 
+local subprocess_boundary_failures = {}
+local killed_helper_root = vim.fn.tempname()
+assert(vim.fn.mkdir(killed_helper_root, "p", 448) == 1)
+local killed_helper = killed_helper_root .. "/profile-helper"
+vim.fn.writefile({
+  "#!/bin/sh",
+  "printf '%s\\n' " .. vim.fn.shellescape(vim.json.encode(helper_profile)),
+  "kill -KILL $$",
+}, killed_helper)
+assert(vim.uv.fs_chmod(killed_helper, 448))
+local killed_helper_stat = assert(vim.uv.fs_lstat(killed_helper))
+eq(require("bit").band(killed_helper_stat.mode, 511), 448, "self-signaling helper fixture mode")
+local killed_helper_report, killed_helper_error = registry_module._test.invoke_profile_helper(
+  { python = killed_helper, profile_helper = killed_helper },
+  "prepare",
+  request,
+  {
+    revalidate = function()
+      return true
+    end,
+  }
+)
+if killed_helper_report ~= nil then
+  subprocess_boundary_failures[#subprocess_boundary_failures + 1] =
+    "real self-SIGKILL helper returned a profile report"
+end
+if
+  type(killed_helper_error) ~= "string"
+  or killed_helper_error == ""
+  or killed_helper_error:find(profile_token, 1, true)
+then
+  subprocess_boundary_failures[#subprocess_boundary_failures + 1] =
+    "real self-SIGKILL helper returned a non-generic diagnostic"
+end
+assert(vim.fn.delete(killed_helper_root, "rf") == 0)
+
+for _, case in ipairs({
+  { label = "signaled injected helper", signal = 9 },
+  { label = "missing-signal injected helper", omit_signal = true },
+}) do
+  local report, helper_error =
+    registry_module._test.invoke_profile_helper(launch_paths, "prepare", request, {
+      revalidate = function()
+        return true
+      end,
+      run = function()
+        local result = {
+          code = 0,
+          stdout = vim.json.encode(helper_profile) .. "\n",
+          stderr = "",
+        }
+        if not case.omit_signal then
+          result.signal = case.signal
+        end
+        return result
+      end,
+    })
+  if report ~= nil then
+    subprocess_boundary_failures[#subprocess_boundary_failures + 1] = case.label
+      .. " returned a profile report"
+  end
+  if type(helper_error) ~= "string" or helper_error == "" then
+    subprocess_boundary_failures[#subprocess_boundary_failures + 1] = case.label
+      .. " returned no generic diagnostic"
+  end
+end
+
 for _, failure in ipairs({
   { stdout = "", stderr = "credential-secret-canary", code = 2 },
   { stdout = "{malformed credential-secret-canary", stderr = "", code = 0 },
@@ -1029,6 +1096,52 @@ assert(
   not raised_probe.stderr:find("probe-artifact-secret-canary", 1, true),
   "runner exception leaked through the probe boundary"
 )
+
+for _, case in ipairs({
+  { label = "signaled read-only probe", signal = 9 },
+  { label = "missing-signal read-only probe", omit_signal = true },
+}) do
+  local inspected = false
+  local result = registry_module._test.read_only_probe("/usr/bin/opencode", {}, {
+    resolve = function()
+      return "/usr/bin/bwrap"
+    end,
+    revalidate = function()
+      return true
+    end,
+    run = function()
+      local completed = {
+        code = 0,
+        stdout = "read-only-signal-secret-canary",
+        stderr = "",
+      }
+      if not case.omit_signal then
+        completed.signal = case.signal
+      end
+      return completed
+    end,
+    inspect_artifacts = function(completed)
+      inspected = type(completed) == "table"
+        and completed.stdout == "read-only-signal-secret-canary"
+      return true
+    end,
+  })
+  if not inspected then
+    subprocess_boundary_failures[#subprocess_boundary_failures + 1] = case.label
+      .. " skipped artifact inspection"
+  end
+  if
+    result.code ~= 126
+    or result.signal ~= 0
+    or result.stdout ~= ""
+    or type(result.stderr) ~= "string"
+    or result.stderr == ""
+    or result.stderr:find("read-only-signal-secret-canary", 1, true)
+  then
+    subprocess_boundary_failures[#subprocess_boundary_failures + 1] = case.label
+      .. " crossed the subprocess boundary"
+  end
+end
 
 local bounded_system = registry_module._test.bounded_system
 assert(type(bounded_system) == "function", "bounded production runner is not exposed for testing")
@@ -1494,6 +1607,76 @@ assert(registry_module._test.opencode_compatibility("/usr/bin/opencode", compati
 eq(#compatibility_calls, 24, "executable metadata change invalidates compatibility cache")
 
 local successful_probe = compatibility_options.probe
+for _, case in ipairs({
+  {
+    label = "signaled compatibility probe",
+    result = {
+      code = 0,
+      signal = 9,
+      stdout = "1.18.18\n",
+      stderr = "",
+    },
+  },
+  {
+    label = "missing-signal compatibility probe",
+    result = {
+      code = 0,
+      stdout = "1.18.18\n",
+      stderr = "",
+    },
+  },
+}) do
+  registry_module._test.reset_opencode_compatibility_cache()
+  compatibility_metadata = compatibility_metadata + 1
+  local probe_attempts = 0
+  local artifact_inspections = 0
+  local signal_options = vim.tbl_extend("force", {}, compatibility_options, {
+    probe = function(executable, arguments, options)
+      if table.concat(arguments, "\0") == "--version" then
+        probe_attempts = probe_attempts + 1
+        return vim.deepcopy(case.result)
+      end
+      return successful_probe(executable, arguments, options)
+    end,
+    inspect_artifacts = function(name)
+      if name == "version" then
+        artifact_inspections = artifact_inspections + 1
+      end
+      return true
+    end,
+  })
+  for attempt = 1, 2 do
+    local report, report_error =
+      registry_module._test.opencode_compatibility("/usr/bin/opencode", signal_options)
+    if report ~= nil then
+      subprocess_boundary_failures[#subprocess_boundary_failures + 1] = case.label
+        .. " attempt "
+        .. attempt
+        .. " was accepted"
+    end
+    if
+      type(report_error) ~= "string"
+      or report_error == ""
+      or report_error:find("compatibility-signal-secret-canary", 1, true)
+    then
+      subprocess_boundary_failures[#subprocess_boundary_failures + 1] = case.label
+        .. " attempt "
+        .. attempt
+        .. " returned a non-generic diagnostic"
+    end
+  end
+  if probe_attempts ~= 2 then
+    subprocess_boundary_failures[#subprocess_boundary_failures + 1] = case.label
+      .. " was cached after rejection"
+  end
+  if artifact_inspections ~= 2 then
+    subprocess_boundary_failures[#subprocess_boundary_failures + 1] = case.label
+      .. " was rejected before artifact inspection"
+  end
+end
+registry_module._test.reset_opencode_compatibility_cache()
+compatibility_options.probe = successful_probe
+
 local probe_failure_cases = {
   {
     label = "oversized injected stdout",
@@ -1719,6 +1902,172 @@ end
 assert(#artifact_failures == 0, table.concat(artifact_failures, "; "))
 
 local installed_opencode = assert(require("ai.tools").resolve("opencode"))
+
+registry_module._test.reset_opencode_compatibility_cache()
+local original_delete = vim.fn.delete
+local cleanup_roots = {}
+local cleanup_root_set = {}
+local cleanup_report
+local cleanup_error
+vim.fn.delete = function(path, flags)
+  if cleanup_root_set[path] then
+    return -1
+  end
+  return original_delete(path, flags)
+end
+local cleanup_call_ok, cleanup_call_error = pcall(function()
+  for _ = 1, 3 do
+    cleanup_report, cleanup_error =
+      registry_module._test.opencode_compatibility(installed_opencode, {
+        observe_probe = function(_, tree)
+          if not cleanup_root_set[tree.root] then
+            cleanup_root_set[tree.root] = true
+            cleanup_roots[#cleanup_roots + 1] = tree.root
+          end
+        end,
+      })
+    if cleanup_report ~= nil then
+      break
+    end
+  end
+end)
+vim.fn.delete = original_delete
+if not cleanup_call_ok then
+  subprocess_boundary_failures[#subprocess_boundary_failures + 1] =
+    "owned-tree cleanup failure raised through the compatibility boundary"
+  cleanup_error = cleanup_call_error
+end
+if cleanup_report ~= nil then
+  subprocess_boundary_failures[#subprocess_boundary_failures + 1] =
+    "owned-tree cleanup failure was accepted"
+elseif type(cleanup_error) ~= "string" or cleanup_error == "" then
+  subprocess_boundary_failures[#subprocess_boundary_failures + 1] =
+    "owned-tree cleanup failure returned no generic diagnostic"
+end
+if #cleanup_roots == 0 then
+  subprocess_boundary_failures[#subprocess_boundary_failures + 1] =
+    "owned-tree cleanup failure test observed no owned root"
+end
+for _, root in ipairs(cleanup_roots) do
+  assert(original_delete(root, "rf") == 0, "clean failed owned probe root")
+  assert(vim.uv.fs_lstat(root) == nil, "failed owned probe root still exists")
+end
+
+local cleanup_replay_calls = 0
+local cleanup_replay = registry_module._test.opencode_compatibility(installed_opencode, {
+  probe = function(executable, arguments, options)
+    cleanup_replay_calls = cleanup_replay_calls + 1
+    return successful_probe(executable, arguments, options)
+  end,
+})
+if cleanup_replay == nil then
+  subprocess_boundary_failures[#subprocess_boundary_failures + 1] =
+    "compatibility did not recover after cleanup was restored"
+end
+if cleanup_replay_calls ~= 12 then
+  subprocess_boundary_failures[#subprocess_boundary_failures + 1] =
+    "cleanup-failed compatibility report was cached"
+end
+registry_module._test.reset_opencode_compatibility_cache()
+
+local cleanup_owned_probe_tree = registry_module._test.cleanup_owned_probe_tree
+if type(cleanup_owned_probe_tree) ~= "function" then
+  subprocess_boundary_failures[#subprocess_boundary_failures + 1] =
+    "owned-tree cleanup validator is unavailable"
+else
+  local untrusted_cleanup_root = vim.fn.tempname()
+  assert(vim.fn.mkdir(untrusted_cleanup_root, "p", 448) == 1)
+  local untrusted_cleanup_accepted = cleanup_owned_probe_tree(untrusted_cleanup_root)
+  if untrusted_cleanup_accepted or vim.uv.fs_lstat(untrusted_cleanup_root) == nil then
+    subprocess_boundary_failures[#subprocess_boundary_failures + 1] =
+      "test cleanup wrapper performed default recursive deletion"
+  end
+  if vim.uv.fs_lstat(untrusted_cleanup_root) then
+    assert(original_delete(untrusted_cleanup_root, "rf") == 0)
+  end
+
+  for _, case in ipairs({
+    {
+      label = "delete exception",
+      remove = function()
+        error("cleanup-secret-canary")
+      end,
+      lstat = function()
+        error("lstat must not run after delete exception")
+      end,
+      accepted = false,
+    },
+    {
+      label = "delete failure status",
+      remove = function()
+        return -1
+      end,
+      lstat = function()
+        error("lstat must not run after delete failure")
+      end,
+      accepted = false,
+    },
+    {
+      label = "root still present",
+      remove = function()
+        return 0
+      end,
+      lstat = function()
+        return { type = "directory" }
+      end,
+      accepted = false,
+    },
+    {
+      label = "root lstat exception",
+      remove = function()
+        return 0
+      end,
+      lstat = function()
+        error("cleanup-secret-canary")
+      end,
+      accepted = false,
+    },
+    {
+      label = "ambiguous nil root stat",
+      remove = function()
+        return 0
+      end,
+      lstat = function()
+        return nil
+      end,
+      accepted = false,
+    },
+    {
+      label = "root lookup error",
+      remove = function()
+        return 0
+      end,
+      lstat = function()
+        return nil, "permission denied", "EACCES"
+      end,
+      accepted = false,
+    },
+    {
+      label = "verified root absence",
+      remove = function()
+        return 0
+      end,
+      lstat = function()
+        return nil, "no such file or directory", "ENOENT"
+      end,
+      accepted = true,
+    },
+  }) do
+    eq(
+      cleanup_owned_probe_tree("/tmp/owned-probe-root", case.remove, case.lstat),
+      case.accepted,
+      case.label
+    )
+  end
+end
+
+assert(#subprocess_boundary_failures == 0, table.concat(subprocess_boundary_failures, "; "))
+
 local real_artifact_environment = {
   HOME = "/tmp/nvim-ai-probe/home",
   OPENCODE_CONFIG_CONTENT = managed.config_json(),

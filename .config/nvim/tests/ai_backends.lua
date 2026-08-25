@@ -818,6 +818,63 @@ local absent_health = absent:health("codex")
 eq(absent_health.installed, false, "absent executable")
 eq(absent_calls, 0, "absent backend runs no probes")
 
+for _, case in ipairs({
+  {
+    label = "signaled generic version probe",
+    result = {
+      code = 0,
+      signal = 9,
+      stdout = "codex 9.9 generic-signal-secret-canary\n",
+      stderr = "",
+    },
+  },
+  {
+    label = "missing-signal generic version probe",
+    result = {
+      code = 0,
+      stdout = "codex 9.9 generic-signal-secret-canary\n",
+      stderr = "",
+    },
+  },
+}) do
+  local later_probe_calls = 0
+  local signaled = registry_module._test.new({
+    executable = function(name)
+      return "/usr/bin/" .. name
+    end,
+    revalidate = function()
+      return true
+    end,
+    version = function()
+      return vim.deepcopy(case.result)
+    end,
+    auth = function()
+      later_probe_calls = later_probe_calls + 1
+      return { code = 0, signal = 0, stdout = "Logged in using ChatGPT\n", stderr = "" }
+    end,
+    help = function()
+      later_probe_calls = later_probe_calls + 1
+      return { code = 0, signal = 0, stdout = "", stderr = "" }
+    end,
+    stat = function(path)
+      return files[path] and { type = "file", mode = 493, uid = 0 } or nil
+    end,
+    uid = function()
+      return 1000
+    end,
+  })
+  local health = signaled:health("codex")
+  eq(health.version, "", case.label .. " is rejected")
+  eq(health.auth, "unknown", case.label .. " skips authentication")
+  eq(health.capabilities, {}, case.label .. " disables capabilities")
+  eq(later_probe_calls, 0, case.label .. " skips later probes")
+  assert(type(health.error) == "string" and health.error ~= "", case.label .. " is generic")
+  assert(
+    not vim.inspect(health):find("generic-signal-secret-canary", 1, true),
+    case.label .. " leaked subprocess output"
+  )
+end
+
 local incompatible = registry_module._test.new({
   executable = function(name)
     return "/usr/bin/" .. name
