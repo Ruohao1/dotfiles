@@ -809,7 +809,7 @@ def _directory_flags():
     return flags
 
 
-def _open_private_directory_path(path, label):
+def _open_private_directory_path(path, label, return_identity=False):
     _validate_private_directory(path, label)
     descriptor = None
     try:
@@ -818,6 +818,9 @@ def _open_private_directory_path(path, label):
         opened = os.fstat(descriptor)
         if _metadata_identity(before) != _metadata_identity(opened):
             raise ValueError(label + " changed during validation")
+        identity = _metadata_identity(opened)
+        if return_identity:
+            return descriptor, identity
         return descriptor
     except Exception:
         if descriptor is not None:
@@ -825,7 +828,9 @@ def _open_private_directory_path(path, label):
         raise
 
 
-def _open_private_child(parent_descriptor, name, label):
+def _open_private_child(
+    parent_descriptor, name, label, return_identity=False
+):
     descriptor = None
     try:
         before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
@@ -839,6 +844,9 @@ def _open_private_child(parent_descriptor, name, label):
         opened = os.fstat(descriptor)
         if _metadata_identity(before) != _metadata_identity(opened):
             raise ValueError(label + " changed during validation")
+        identity = _metadata_identity(opened)
+        if return_identity:
+            return descriptor, identity
         return descriptor
     except (OSError, ValueError):
         if descriptor is not None:
@@ -851,6 +859,59 @@ def _list_entries(descriptor, label):
         return sorted(os.listdir(descriptor))
     except OSError:
         raise ValueError(label + " cannot be inspected") from None
+
+
+def _verify_private_directory_path(path, descriptor, identity, label):
+    try:
+        current = os.lstat(path)
+        opened = os.fstat(descriptor)
+        physical = os.path.realpath(path)
+    except (OSError, ValueError):
+        raise ValueError(label + " changed during validation") from None
+    for metadata in (current, opened):
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != _current_uid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise ValueError(label + " changed during validation")
+    if (
+        physical != path
+        or stat.S_ISLNK(current.st_mode)
+        or _metadata_identity(current) != identity
+        or _metadata_identity(opened) != identity
+    ):
+        raise ValueError(label + " changed during validation")
+
+
+def _verify_private_directory_child(
+    parent_descriptor,
+    name,
+    descriptor,
+    identity,
+    label,
+):
+    try:
+        current = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        opened = os.fstat(descriptor)
+    except OSError:
+        raise ValueError(label + " changed during validation") from None
+    for metadata in (current, opened):
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != _current_uid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise ValueError(label + " changed during validation")
+    if (
+        _metadata_identity(current) != identity
+        or _metadata_identity(opened) != identity
+    ):
+        raise ValueError(label + " changed during validation")
 
 
 def _read_regular_at(parent_descriptor, name, maximum, label="profile file"):
@@ -906,19 +967,38 @@ def _read_regular_at(parent_descriptor, name, maximum, label="profile file"):
 def _read_managed_home_bootstrap(descriptor):
     if _list_entries(descriptor, "managed home mask") != [".gitignore"]:
         raise ValueError("managed home mask bootstrap tree is not canonical")
+    try:
+        before = os.stat(
+            ".gitignore",
+            dir_fd=descriptor,
+            follow_symlinks=False,
+        )
+    except OSError:
+        raise ValueError("managed home bootstrap cannot be inspected") from None
     payload = _read_regular_at(
         descriptor,
         ".gitignore",
         len(AUDITED_BOOTSTRAP_GITIGNORE),
         "managed home bootstrap",
     )
+    try:
+        after = os.stat(
+            ".gitignore",
+            dir_fd=descriptor,
+            follow_symlinks=False,
+        )
+    except OSError:
+        raise ValueError("managed home bootstrap changed during validation") from None
+    identity = _metadata_identity(after)
+    if _metadata_identity(before) != identity:
+        raise ValueError("managed home bootstrap changed during validation")
     if (
         payload != AUDITED_BOOTSTRAP_GITIGNORE
         or hashlib.sha256(payload).hexdigest()
         != AUDITED_BOOTSTRAP_GITIGNORE_SHA256
     ):
         raise ValueError("managed home bootstrap changed")
-    return payload
+    return payload, identity
 
 
 def _validate_credential_string(value, label, maximum):
@@ -1136,15 +1216,23 @@ def validate_managed_profile(manifest, parent_env):
     backend_descriptor = profiles_descriptor = profile_descriptor = None
     credentials_descriptor = mask_descriptor = xdg_descriptor = opencode_descriptor = None
     try:
-        backend_descriptor = _open_private_directory_path(
-            manifest["backend_state_dir"], "backend state directory"
+        backend_descriptor, backend_identity = _open_private_directory_path(
+            manifest["backend_state_dir"],
+            "backend state directory",
+            return_identity=True,
         )
-        profiles_descriptor = _open_private_child(
-            backend_descriptor, "profiles", "managed profiles directory"
+        profiles_descriptor, profiles_identity = _open_private_child(
+            backend_descriptor,
+            "profiles",
+            "managed profiles directory",
+            return_identity=True,
         )
         token = os.path.basename(profile["profile_root"])
-        profile_descriptor = _open_private_child(
-            profiles_descriptor, token, "managed profile"
+        profile_descriptor, profile_identity = _open_private_child(
+            profiles_descriptor,
+            token,
+            "managed profile",
+            return_identity=True,
         )
         if _list_entries(profile_descriptor, "managed profile") != [
             "credentials",
@@ -1153,8 +1241,11 @@ def validate_managed_profile(manifest, parent_env):
             "xdg-config",
         ]:
             raise ValueError("managed profile has an unexpected tree")
-        credentials_descriptor = _open_private_child(
-            profile_descriptor, "credentials", "managed credentials directory"
+        credentials_descriptor, credentials_identity = _open_private_child(
+            profile_descriptor,
+            "credentials",
+            "managed credentials directory",
+            return_identity=True,
         )
         if _list_entries(credentials_descriptor, "managed credentials") != ["auth.json"]:
             raise ValueError("managed profile has unexpected credential entries")
@@ -1163,18 +1254,29 @@ def validate_managed_profile(manifest, parent_env):
         )
         _validate_authentication(auth)
 
-        mask_descriptor = _open_private_child(
-            profile_descriptor, "empty-home-opencode", "managed home mask"
+        mask_descriptor, mask_identity = _open_private_child(
+            profile_descriptor,
+            "empty-home-opencode",
+            "managed home mask",
+            return_identity=True,
         )
-        home_bootstrap = _read_managed_home_bootstrap(mask_descriptor)
+        home_bootstrap, home_bootstrap_identity = (
+            _read_managed_home_bootstrap(mask_descriptor)
+        )
 
-        xdg_descriptor = _open_private_child(
-            profile_descriptor, "xdg-config", "managed XDG configuration"
+        xdg_descriptor, xdg_identity = _open_private_child(
+            profile_descriptor,
+            "xdg-config",
+            "managed XDG configuration",
+            return_identity=True,
         )
         if _list_entries(xdg_descriptor, "managed XDG configuration") != ["opencode"]:
             raise ValueError("managed profile has an unexpected XDG tree")
-        opencode_descriptor = _open_private_child(
-            xdg_descriptor, "opencode", "managed OpenCode configuration"
+        opencode_descriptor, opencode_identity = _open_private_child(
+            xdg_descriptor,
+            "opencode",
+            "managed OpenCode configuration",
+            return_identity=True,
         )
         if _list_entries(opencode_descriptor, "managed OpenCode configuration") != [
             ".gitignore",
@@ -1234,8 +1336,69 @@ def validate_managed_profile(manifest, parent_env):
             raise ValueError("profile manifest is not canonical JSON")
         if profile["fingerprint"] != fingerprint:
             raise ValueError("managed profile fingerprint changed")
-        if _read_managed_home_bootstrap(mask_descriptor) != home_bootstrap:
+        _verify_private_directory_child(
+            profile_descriptor,
+            "credentials",
+            credentials_descriptor,
+            credentials_identity,
+            "managed credentials directory",
+        )
+        _verify_private_directory_child(
+            profile_descriptor,
+            "empty-home-opencode",
+            mask_descriptor,
+            mask_identity,
+            "managed home mask",
+        )
+        _verify_private_directory_child(
+            xdg_descriptor,
+            "opencode",
+            opencode_descriptor,
+            opencode_identity,
+            "managed OpenCode configuration",
+        )
+        _verify_private_directory_child(
+            profile_descriptor,
+            "xdg-config",
+            xdg_descriptor,
+            xdg_identity,
+            "managed XDG configuration",
+        )
+        _verify_private_directory_child(
+            profiles_descriptor,
+            token,
+            profile_descriptor,
+            profile_identity,
+            "managed profile",
+        )
+        _verify_private_directory_child(
+            backend_descriptor,
+            "profiles",
+            profiles_descriptor,
+            profiles_identity,
+            "managed profiles directory",
+        )
+        _verify_private_directory_path(
+            manifest["backend_state_dir"],
+            backend_descriptor,
+            backend_identity,
+            "backend state directory",
+        )
+        final_home_bootstrap, final_home_bootstrap_identity = (
+            _read_managed_home_bootstrap(mask_descriptor)
+        )
+        if (
+            final_home_bootstrap != home_bootstrap
+            or final_home_bootstrap_identity != home_bootstrap_identity
+        ):
             raise ValueError("managed home bootstrap changed during validation")
+        _verify_private_directory_child(
+            profile_descriptor,
+            "empty-home-opencode",
+            mask_descriptor,
+            mask_identity,
+            "managed home mask",
+        )
         return {
             "schema": 1,
             "version": AUDITED_VERSION,

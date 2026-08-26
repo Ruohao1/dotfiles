@@ -812,6 +812,142 @@ class ManagedProfileTests(unittest.TestCase):
             self.validate()
         self.assertTrue(replaced)
 
+    def test_same_byte_home_mask_bootstrap_replacement_during_validation_fails(
+        self,
+    ) -> None:
+        path = self.fixture.profile_root / "empty-home-opencode/.gitignore"
+        original_inode = path.lstat().st_ino
+        original_read = launcher._read_regular_at
+        replacement_inode = None
+
+        def replace_after_home_bootstrap_read(
+            parent_descriptor: int,
+            name: str,
+            maximum: int,
+            label: str = "profile file",
+        ):
+            nonlocal replacement_inode
+            payload = original_read(parent_descriptor, name, maximum, label)
+            if label == "managed home bootstrap" and replacement_inode is None:
+                replacement = path.with_name("home-bootstrap-replacement")
+                replacement.write_bytes(BOOTSTRAP_GITIGNORE)
+                os.chmod(replacement, 0o600)
+                os.replace(replacement, path)
+                replacement_inode = path.lstat().st_ino
+            return payload
+
+        with (
+            mock.patch.object(
+                launcher,
+                "_read_regular_at",
+                side_effect=replace_after_home_bootstrap_read,
+            ),
+            self.assertRaisesRegex(
+                ValueError, "managed home bootstrap.*changed"
+            ),
+        ):
+            self.validate()
+        self.assertIsNotNone(replacement_inode)
+        self.assertNotEqual(replacement_inode, original_inode)
+
+    def test_public_home_mask_directory_replacement_during_validation_fails(
+        self,
+    ) -> None:
+        mask = self.fixture.profile_root / "empty-home-opencode"
+        original_mask = mask.with_name("empty-home-opencode-original")
+        original_read = launcher._read_regular_at
+        replaced = False
+
+        def replace_after_home_bootstrap_read(
+            parent_descriptor: int,
+            name: str,
+            maximum: int,
+            label: str = "profile file",
+        ):
+            nonlocal replaced
+            payload = original_read(parent_descriptor, name, maximum, label)
+            if label == "managed home bootstrap" and not replaced:
+                mask.rename(original_mask)
+                mask.mkdir(mode=0o700)
+                self.fixture.private_file(mask / ".gitignore", BOOTSTRAP_GITIGNORE)
+                self.fixture.private_file(
+                    mask / "opencode.json",
+                    b'{"permission":{"*":"allow"}}',
+                )
+                replaced = True
+            return payload
+
+        with (
+            mock.patch.object(
+                launcher,
+                "_read_regular_at",
+                side_effect=replace_after_home_bootstrap_read,
+            ),
+            self.assertRaisesRegex(
+                ValueError, "managed home mask changed during validation"
+            ),
+        ):
+            self.validate()
+        self.assertTrue(replaced)
+        self.assertEqual(
+            (mask / "opencode.json").read_bytes(),
+            b'{"permission":{"*":"allow"}}',
+        )
+
+    def test_public_managed_profile_ancestor_replacement_during_validation_fails(
+        self,
+    ) -> None:
+        replacements = {
+            "backend state directory": lambda fixture: fixture.backend_state,
+            "managed profiles directory": lambda fixture: fixture.backend_state
+            / "profiles",
+            "managed profile": lambda fixture: fixture.profile_root,
+            "managed credentials directory": lambda fixture: fixture.profile_root
+            / "credentials",
+            "managed XDG configuration": lambda fixture: fixture.profile_root
+            / "xdg-config",
+            "managed OpenCode configuration": lambda fixture: fixture.profile_root
+            / "xdg-config/opencode",
+        }
+        for label, locate in replacements.items():
+            with self.subTest(label=label):
+                fixture = Fixture(self)
+                target = locate(fixture)
+                moved = target.with_name(target.name + "-original")
+                original_read = launcher._read_regular_at
+                replaced = False
+
+                def replace_after_manifest_read(
+                    parent_descriptor: int,
+                    name: str,
+                    maximum: int,
+                    read_label: str = "profile file",
+                ):
+                    nonlocal replaced
+                    payload = original_read(
+                        parent_descriptor, name, maximum, read_label
+                    )
+                    if read_label == "profile manifest" and not replaced:
+                        target.rename(moved)
+                        target.mkdir(mode=0o700)
+                        replaced = True
+                    return payload
+
+                with (
+                    mock.patch.object(
+                        launcher,
+                        "_read_regular_at",
+                        side_effect=replace_after_manifest_read,
+                    ),
+                    self.assertRaisesRegex(
+                        ValueError, label + " changed during validation"
+                    ),
+                ):
+                    launcher.validate_managed_profile(
+                        fixture.manifest(), {"HOME": str(fixture.home)}
+                    )
+                self.assertTrue(replaced)
+
     def test_isolated_account_state_fails(self) -> None:
         data = self.fixture.backend_state / "xdg-data" / "opencode"
         data.mkdir(mode=0o700)

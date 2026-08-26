@@ -1787,6 +1787,36 @@ class InspectProfileTests(unittest.TestCase):
         self.assertTrue(replaced)
         self.assertNotIn("canary", str(caught.exception))
 
+    def test_rejects_same_byte_home_mask_bootstrap_replacement(self) -> None:
+        fixture = Fixture(self)
+        prepared = fixture.prepare()
+        path = fixture.profile_root() / "empty-home-opencode/.gitignore"
+        original_inode = path.lstat().st_ino
+        original_validate = helper._validate_manifest
+        replacement_inode = None
+
+        def replace_after_manifest_validation(*args: object, **kwargs: object):
+            nonlocal replacement_inode
+            result = original_validate(*args, **kwargs)
+            replacement = path.with_name("home-bootstrap-replacement")
+            replacement.write_bytes(BOOTSTRAP_GITIGNORE)
+            os.chmod(replacement, 0o600)
+            os.replace(replacement, path)
+            replacement_inode = path.lstat().st_ino
+            return result
+
+        with (
+            mock.patch.object(
+                helper,
+                "_validate_manifest",
+                side_effect=replace_after_manifest_validation,
+            ),
+            self.assertRaisesRegex(ValueError, "home mask bootstrap.*changed"),
+        ):
+            helper.inspect_profile(fixture.profile_request(prepared))
+        self.assertIsNotNone(replacement_inode)
+        self.assertNotEqual(replacement_inode, original_inode)
+
     def test_rejects_changed_reference_and_manifest_identity_fields(self) -> None:
         request_mutations = {
             "schema": 2,

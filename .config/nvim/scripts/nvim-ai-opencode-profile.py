@@ -1086,20 +1086,35 @@ def _require_entries(descriptor, expected):
 def _read_home_mask_bootstrap(descriptor):
     try:
         _require_entries(descriptor, (".gitignore",))
+        before = _entry_lstat(descriptor, ".gitignore")
+        _validate_file_metadata(
+            before,
+            len(AUDITED_BOOTSTRAP_GITIGNORE),
+            "credential",
+        )
         payload = _secure_read_entry(
             descriptor,
             ".gitignore",
             len(AUDITED_BOOTSTRAP_GITIGNORE),
         )
-    except ValueError:
+        after = _entry_lstat(descriptor, ".gitignore")
+        _validate_file_metadata(
+            after,
+            len(AUDITED_BOOTSTRAP_GITIGNORE),
+            "credential",
+        )
+    except (OSError, ValueError):
         raise ValueError("home mask bootstrap is unsafe") from None
+    identity = _file_metadata(after)
+    if _file_metadata(before) != identity:
+        raise ValueError("home mask bootstrap changed during inspection")
     if (
         payload != AUDITED_BOOTSTRAP_GITIGNORE
         or hashlib.sha256(payload).hexdigest()
         != AUDITED_BOOTSTRAP_GITIGNORE_SHA256
     ):
         raise ValueError("home mask bootstrap is not canonical")
-    return payload
+    return payload, identity
 
 
 def _canonical_json_file(payload, label):
@@ -1193,7 +1208,9 @@ def inspect_profile(request):
             profile_descriptor, "empty-home-opencode"
         )
         descriptors.append(empty_descriptor)
-        home_bootstrap_bytes = _read_home_mask_bootstrap(empty_descriptor)
+        home_bootstrap_bytes, home_bootstrap_identity = _read_home_mask_bootstrap(
+            empty_descriptor
+        )
 
         xdg_descriptor, xdg_identity = _open_private_child(
             profile_descriptor, "xdg-config"
@@ -1271,7 +1288,13 @@ def inspect_profile(request):
             != bootstrap_bytes
         ):
             raise ValueError("profile bootstrap changed during inspection")
-        if _read_home_mask_bootstrap(empty_descriptor) != home_bootstrap_bytes:
+        final_home_bootstrap, final_home_bootstrap_identity = (
+            _read_home_mask_bootstrap(empty_descriptor)
+        )
+        if (
+            final_home_bootstrap != home_bootstrap_bytes
+            or final_home_bootstrap_identity != home_bootstrap_identity
+        ):
             raise ValueError("home mask bootstrap changed during inspection")
         if (
             _secure_read_entry(opencode_descriptor, "AGENTS.md", MAX_SNAPSHOT_BYTES)
