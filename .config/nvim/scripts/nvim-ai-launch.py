@@ -903,6 +903,24 @@ def _read_regular_at(parent_descriptor, name, maximum, label="profile file"):
                 pass
 
 
+def _read_managed_home_bootstrap(descriptor):
+    if _list_entries(descriptor, "managed home mask") != [".gitignore"]:
+        raise ValueError("managed home mask bootstrap tree is not canonical")
+    payload = _read_regular_at(
+        descriptor,
+        ".gitignore",
+        len(AUDITED_BOOTSTRAP_GITIGNORE),
+        "managed home bootstrap",
+    )
+    if (
+        payload != AUDITED_BOOTSTRAP_GITIGNORE
+        or hashlib.sha256(payload).hexdigest()
+        != AUDITED_BOOTSTRAP_GITIGNORE_SHA256
+    ):
+        raise ValueError("managed home bootstrap changed")
+    return payload
+
+
 def _validate_credential_string(value, label, maximum):
     if not isinstance(value, str):
         raise ValueError(label + " has an invalid credential field")
@@ -1148,8 +1166,7 @@ def validate_managed_profile(manifest, parent_env):
         mask_descriptor = _open_private_child(
             profile_descriptor, "empty-home-opencode", "managed home mask"
         )
-        if _list_entries(mask_descriptor, "managed home mask"):
-            raise ValueError("managed home mask is not empty")
+        home_bootstrap = _read_managed_home_bootstrap(mask_descriptor)
 
         xdg_descriptor = _open_private_child(
             profile_descriptor, "xdg-config", "managed XDG configuration"
@@ -1217,6 +1234,8 @@ def validate_managed_profile(manifest, parent_env):
             raise ValueError("profile manifest is not canonical JSON")
         if profile["fingerprint"] != fingerprint:
             raise ValueError("managed profile fingerprint changed")
+        if _read_managed_home_bootstrap(mask_descriptor) != home_bootstrap:
+            raise ValueError("managed home bootstrap changed during validation")
         return {
             "schema": 1,
             "version": AUDITED_VERSION,

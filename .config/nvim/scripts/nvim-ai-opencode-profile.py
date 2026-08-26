@@ -886,6 +886,11 @@ def _publish_profile(request, auth_bytes, count, instruction_bytes):
             staging_descriptor, "empty-home-opencode"
         )
         try:
+            _write_private_file(
+                empty_descriptor,
+                ".gitignore",
+                AUDITED_BOOTSTRAP_GITIGNORE,
+            )
             os.fsync(empty_descriptor)
         finally:
             os.close(empty_descriptor)
@@ -1078,6 +1083,25 @@ def _require_entries(descriptor, expected):
         raise ValueError("profile tree contains unexpected entries")
 
 
+def _read_home_mask_bootstrap(descriptor):
+    try:
+        _require_entries(descriptor, (".gitignore",))
+        payload = _secure_read_entry(
+            descriptor,
+            ".gitignore",
+            len(AUDITED_BOOTSTRAP_GITIGNORE),
+        )
+    except ValueError:
+        raise ValueError("home mask bootstrap is unsafe") from None
+    if (
+        payload != AUDITED_BOOTSTRAP_GITIGNORE
+        or hashlib.sha256(payload).hexdigest()
+        != AUDITED_BOOTSTRAP_GITIGNORE_SHA256
+    ):
+        raise ValueError("home mask bootstrap is not canonical")
+    return payload
+
+
 def _canonical_json_file(payload, label):
     if not payload.endswith(b"\n") or payload.endswith(b"\n\n"):
         raise ValueError(label + " is not canonical JSON")
@@ -1169,7 +1193,7 @@ def inspect_profile(request):
             profile_descriptor, "empty-home-opencode"
         )
         descriptors.append(empty_descriptor)
-        _require_entries(empty_descriptor, ())
+        home_bootstrap_bytes = _read_home_mask_bootstrap(empty_descriptor)
 
         xdg_descriptor, xdg_identity = _open_private_child(
             profile_descriptor, "xdg-config"
@@ -1223,7 +1247,6 @@ def inspect_profile(request):
             ("credentials", "empty-home-opencode", "manifest.json", "xdg-config"),
         )
         _require_entries(credentials_descriptor, ("auth.json",))
-        _require_entries(empty_descriptor, ())
         _require_entries(xdg_descriptor, ("opencode",))
         _require_entries(
             opencode_descriptor,
@@ -1248,6 +1271,8 @@ def inspect_profile(request):
             != bootstrap_bytes
         ):
             raise ValueError("profile bootstrap changed during inspection")
+        if _read_home_mask_bootstrap(empty_descriptor) != home_bootstrap_bytes:
+            raise ValueError("home mask bootstrap changed during inspection")
         if (
             _secure_read_entry(opencode_descriptor, "AGENTS.md", MAX_SNAPSHOT_BYTES)
             != instruction_bytes

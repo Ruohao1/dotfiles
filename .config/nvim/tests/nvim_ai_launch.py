@@ -181,7 +181,8 @@ class Fixture:
             credentials / "auth.json",
             (compact_json(self.auth) + "\n").encode("utf-8"),
         )
-        self.private_dir(profile / "empty-home-opencode")
+        home_mask = self.private_dir(profile / "empty-home-opencode")
+        self.private_file(home_mask / ".gitignore", BOOTSTRAP_GITIGNORE)
         opencode = self.private_dir(profile / "xdg-config" / "opencode")
         self.private_file(opencode / ".gitignore", BOOTSTRAP_GITIGNORE)
         self.private_file(opencode / "AGENTS.md", self.instructions)
@@ -673,6 +674,15 @@ class ManagedProfileTests(unittest.TestCase):
             hashlib.sha256(BOOTSTRAP_GITIGNORE).hexdigest(),
             BOOTSTRAP_GITIGNORE_SHA256,
         )
+        home_mask = self.fixture.profile_root / "empty-home-opencode"
+        self.assertEqual(
+            sorted(path.name for path in home_mask.iterdir()), [".gitignore"]
+        )
+        home_bootstrap = home_mask / ".gitignore"
+        self.assertEqual(home_bootstrap.read_bytes(), BOOTSTRAP_GITIGNORE)
+        metadata = home_bootstrap.lstat()
+        self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+        self.assertEqual(metadata.st_uid, os.getuid())
 
     def test_symlink_component_wrong_mode_wrong_owner_and_extra_entry_fail(self) -> None:
         profile = self.fixture.profile_root
@@ -698,14 +708,111 @@ class ManagedProfileTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "owner"):
                 self.validate()
 
-    def test_nonempty_home_mask_and_isolated_account_state_fail(self) -> None:
-        marker = self.fixture.private_file(
-            self.fixture.profile_root / "empty-home-opencode" / "marker", b"x"
+    def test_invalid_home_mask_bootstrap_fails(self) -> None:
+        mutations = (
+            "missing",
+            "changed-bytes",
+            "wrong-kind",
+            "mode",
+            "owner",
+            "symlink",
+            "extra",
         )
-        with self.assertRaisesRegex(ValueError, "home mask"):
-            self.validate()
-        marker.unlink()
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                fixture = Fixture(self)
+                mask = fixture.profile_root / "empty-home-opencode"
+                path = mask / ".gitignore"
+                patcher = None
+                if mutation == "missing":
+                    path.unlink()
+                elif mutation == "changed-bytes":
+                    path.write_bytes(b"x" + BOOTSTRAP_GITIGNORE[1:])
+                elif mutation == "wrong-kind":
+                    path.unlink()
+                    path.mkdir(mode=0o700)
+                elif mutation == "mode":
+                    os.chmod(path, 0o644)
+                elif mutation == "owner":
+                    mask_metadata = mask.stat()
+                    original_stat = launcher.os.stat
 
+                    def wrong_home_bootstrap_owner(
+                        name: object,
+                        *args: object,
+                        **kwargs: object,
+                    ):
+                        result = original_stat(name, *args, **kwargs)
+                        parent_descriptor = kwargs.get("dir_fd")
+                        if name == ".gitignore" and isinstance(parent_descriptor, int):
+                            parent_metadata = os.fstat(parent_descriptor)
+                            if (
+                                parent_metadata.st_dev == mask_metadata.st_dev
+                                and parent_metadata.st_ino == mask_metadata.st_ino
+                            ):
+                                return StatProxy(result, st_uid=os.getuid() + 1)
+                        return result
+
+                    patcher = mock.patch.object(
+                        launcher.os,
+                        "stat",
+                        side_effect=wrong_home_bootstrap_owner,
+                    )
+                elif mutation == "symlink":
+                    target = fixture.base / "home-bootstrap-target"
+                    target.write_bytes(path.read_bytes())
+                    os.chmod(target, 0o600)
+                    path.unlink()
+                    path.symlink_to(target)
+                else:
+                    fixture.private_file(mask / "unexpected", b"x")
+
+                context = patcher if patcher is not None else mock.patch.object(
+                    launcher, "AUDITED_VERSION", VERSION
+                )
+                manifest = fixture.manifest()
+                with context, self.assertRaisesRegex(
+                    ValueError, "managed home (?:mask )?bootstrap"
+                ):
+                    launcher.validate_managed_profile(
+                        manifest, {"HOME": str(fixture.home)}
+                    )
+
+    def test_home_mask_bootstrap_replacement_during_validation_fails(self) -> None:
+        path = self.fixture.profile_root / "empty-home-opencode/.gitignore"
+        original_read = launcher._read_regular_at
+        replaced = False
+
+        def replace_after_home_bootstrap_read(
+            parent_descriptor: int,
+            name: str,
+            maximum: int,
+            label: str = "profile file",
+        ):
+            nonlocal replaced
+            payload = original_read(parent_descriptor, name, maximum, label)
+            if label == "managed home bootstrap" and not replaced:
+                replacement = path.with_name("home-bootstrap-replacement")
+                replacement.write_bytes(b"x" + BOOTSTRAP_GITIGNORE[1:])
+                os.chmod(replacement, 0o600)
+                os.replace(replacement, path)
+                replaced = True
+            return payload
+
+        with (
+            mock.patch.object(
+                launcher,
+                "_read_regular_at",
+                side_effect=replace_after_home_bootstrap_read,
+            ),
+            self.assertRaisesRegex(
+                ValueError, "managed home (?:mask )?bootstrap"
+            ),
+        ):
+            self.validate()
+        self.assertTrue(replaced)
+
+    def test_isolated_account_state_fails(self) -> None:
         data = self.fixture.backend_state / "xdg-data" / "opencode"
         data.mkdir(mode=0o700)
         for name in ("account.json", "mcp-auth.json"):

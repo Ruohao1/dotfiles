@@ -77,6 +77,7 @@ if [ "${1:-}" = "--pure" ]; then
   grep -F "\"fingerprint\":\"$expected_fingerprint\"" "$profile_manifest" >/dev/null || exit 49
   [ "$HOME/.opencode" = "$expected_home_mask" ] || exit 50
   [ ! -e "$HOME/.opencode/host-preserved" ] || exit 51
+  "$trusted_python" -I -B -c 'import os,pathlib,stat,sys; path=pathlib.Path(sys.argv[1]); expected=b"node_modules\npackage.json\npackage-lock.json\nbun.lock\n.gitignore"; metadata=(path/".gitignore").lstat(); valid=sorted(item.name for item in path.iterdir())==[".gitignore"] and stat.S_ISREG(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode) and metadata.st_uid==os.getuid() and stat.S_IMODE(metadata.st_mode)==0o600 and (path/".gitignore").read_bytes()==expected; raise SystemExit(0 if valid else 1)' "$HOME/.opencode" || exit 72
 
   if printf '%s' inside >"$project_root/inside.txt" 2>/dev/null; then :; fi
   if printf '%s' sibling >"$sibling_root/outside.txt" 2>/dev/null; then exit 21; fi
@@ -92,6 +93,11 @@ if [ "${1:-}" = "--pure" ]; then
   if printf '%s' hostile >"$profile_root/credentials/auth.json" 2>/dev/null; then exit 55; fi
   if printf '%s' hostile >"$profile_manifest" 2>/dev/null; then exit 56; fi
   if printf '%s' hostile >"$HOME/.opencode/hostile" 2>/dev/null; then exit 57; fi
+  if printf '%s' hostile >"$HOME/.opencode/.gitignore" 2>/dev/null; then exit 73; fi
+  if rm "$HOME/.opencode/.gitignore" 2>/dev/null; then exit 74; fi
+  printf '%s' hostile >"$backend_state/home-bootstrap-replacement"
+  if mv "$backend_state/home-bootstrap-replacement" "$HOME/.opencode/.gitignore" 2>/dev/null; then exit 75; fi
+  rm "$backend_state/home-bootstrap-replacement"
   if mkdir "$profiles_root/hostile" 2>/dev/null; then exit 58; fi
   if mv "$profile_root" "$profiles_root/moved" 2>/dev/null; then exit 59; fi
   if rm "$profile_manifest" 2>/dev/null; then exit 60; fi
@@ -314,6 +320,8 @@ run_case approved-grant ffffffffffffffffffffffffffffffff allow allow
 [ -f "$HARNESS_BACKEND/cache-serve.txt" ] || fail "server cache was not writable"
 [ -f "$HARNESS_BACKEND/cache-attach.txt" ] || fail "attach cache was not writable"
 [ -f "$HARNESS_PROFILE_MANIFEST" ] || fail "managed profile manifest was removed"
+[ "$(find "$HARNESS_PROFILE/empty-home-opencode" -mindepth 1 -maxdepth 1 -printf '%f\n')" = .gitignore ] || fail "managed home mask tree changed"
+"$PYTHON" -I -B -c 'import pathlib,sys; expected=b"node_modules\npackage.json\npackage-lock.json\nbun.lock\n.gitignore"; raise SystemExit(0 if pathlib.Path(sys.argv[1]).read_bytes()==expected else 1)' "$HARNESS_PROFILE/empty-home-opencode/.gitignore" || fail "managed home bootstrap changed"
 [ ! -e "$HARNESS_BACKEND/profiles/hostile" ] || fail "profiles directory became writable"
 [ ! -e "$HARNESS_BACKEND/profiles/moved" ] || fail "managed profile was renamed"
 [ -d "$HARNESS_PROFILES_PRESERVED" ] || fail "profiles preserved fixture was removed"

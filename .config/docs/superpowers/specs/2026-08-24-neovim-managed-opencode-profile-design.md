@@ -64,7 +64,7 @@ Publication is atomic and refuses an existing wrong-owner, wrong-mode, wrong-kin
 The profile contains only these generated artifacts:
 
 - A managed `opencode.json` containing the fixed policy, built-in subagent disablement, and hidden-agent permission hardening.
-- The fixed OpenCode `v1.18.18` configuration-bootstrap `.gitignore` required before that complete configuration tree can remain read-only.
+- Two byte-identical copies of the fixed OpenCode `v1.18.18` bootstrap `.gitignore`, one in the complete XDG configuration tree and one as the sole entry in the legacy home `.opencode` mask.
 - A combined `AGENTS.md` instruction snapshot.
 - A filtered `auth.json` containing compatible credential records only.
 - A bounded metadata manifest containing the audited version and non-secret profile fingerprint inputs.
@@ -114,7 +114,9 @@ The filtered credentials are mounted at `$XDG_DATA_HOME/opencode/auth.json`.
 The complete isolated XDG configuration tree is mounted read-only.
 This read-only tree must make OpenCode's configuration dependency installer stop at its writability check without attempting a download.
 Project configuration discovery is disabled.
-The actual home-level `.opencode` discovery location is masked with an empty read-only directory.
+The actual home-level `.opencode` discovery location is masked with a read-only directory containing only the exact audited bootstrap `.gitignore`.
+OpenCode `v1.18.18` attempts to ensure that file exists before it checks whether configuration dependency installation is writable, so an empty read-only mask is incompatible.
+The mask supplies no other home content or configuration authority.
 Claude-compatible prompts and skills are disabled for this OpenCode process.
 External skill discovery is disabled.
 Both the server and native attach client run in audited pure mode so external plugins cannot load on either side.
@@ -207,7 +209,7 @@ It never deletes or rewrites the user's global OpenCode files.
 ## Verification Strategy
 
 Fake-CLI tests assert the exact managed launch shape, environment, pure-mode argv, profile manifest, and server-to-attach fingerprint agreement.
-Profile-builder tests cover atomic publication, ownership, modes, symlink refusal, size bounds, instruction ordering, deduplication, UTF-8 validation, and credential filtering.
+Profile-builder tests cover atomic publication, ownership, modes, symlink refusal, both bootstrap copies, home-mask sole-entry and replacement validation, size bounds, instruction ordering, deduplication, UTF-8 validation, and credential filtering.
 Credential fixtures cover accepted `api` and `oauth` records, excluded `wellknown` records, malformed input, and diagnostics that reveal no secret substrings.
 
 Hostile global and project fixtures attempt all of the following changes:
@@ -224,7 +226,7 @@ It also proves that the read-only configuration tree causes no configuration dep
 It rejects an altered version string, missing flag, changed discovery path, changed agent set, or changed permission result.
 
 Task 3 launcher tests accept every exact managed OpenCode variable and reject a changed value, unknown key, noncanonical path, or path outside backend state.
-The Bubblewrap end-to-end harness proves that global and project configuration cannot enter the managed profile and that the writable project boundary remains unchanged.
+The Bubblewrap end-to-end harness proves that global and project configuration cannot enter the managed profile, that the sole home-mask bootstrap is immutable, and that the writable project boundary remains unchanged.
 All real-binary compatibility tests run without provider connectivity and without live credentials.
 Existing identity, backend-authentication, formatting, and confinement tests remain regression coverage.
 

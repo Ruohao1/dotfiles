@@ -495,6 +495,7 @@ class ProfileConstructionTests(unittest.TestCase):
                 "credentials",
                 "credentials/auth.json",
                 "empty-home-opencode",
+                "empty-home-opencode/.gitignore",
                 "manifest.json",
                 "xdg-config",
                 "xdg-config/opencode",
@@ -540,6 +541,17 @@ class ProfileConstructionTests(unittest.TestCase):
             BOOTSTRAP_GITIGNORE_SHA256,
         )
         self.assertEqual(stat.S_IMODE(bootstrap.lstat().st_mode), 0o600)
+
+        home_bootstrap = profile / "empty-home-opencode/.gitignore"
+        home_bootstrap_bytes = home_bootstrap.read_bytes()
+        self.assertEqual(home_bootstrap_bytes, BOOTSTRAP_GITIGNORE)
+        self.assertEqual(
+            hashlib.sha256(home_bootstrap_bytes).hexdigest(),
+            BOOTSTRAP_GITIGNORE_SHA256,
+        )
+        home_bootstrap_metadata = home_bootstrap.lstat()
+        self.assertEqual(stat.S_IMODE(home_bootstrap_metadata.st_mode), 0o600)
+        self.assertEqual(home_bootstrap_metadata.st_uid, os.getuid())
 
         auth_bytes = (profile / "credentials/auth.json").read_bytes()
         self.assertTrue(auth_bytes.endswith(b"\n"))
@@ -1396,7 +1408,7 @@ class PublicationBoundaryTests(unittest.TestCase):
 
         with mock.patch.object(helper.os, "fsync", side_effect=observing_fsync):
             fixture.prepare()
-        self.assertEqual(synced["file"], 5)
+        self.assertEqual(synced["file"], 6)
         self.assertGreaterEqual(synced["directory"], 7)
         self.assertTrue(
             {
@@ -1675,6 +1687,106 @@ class InspectProfileTests(unittest.TestCase):
         self.assertTrue(replaced)
         self.assertNotIn("canary", str(caught.exception))
 
+    def test_rejects_unsafe_or_changed_home_mask_bootstrap(self) -> None:
+        mutations = (
+            "missing",
+            "changed-bytes",
+            "wrong-kind",
+            "mode",
+            "owner",
+            "symlink",
+            "extra",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                fixture = Fixture(self)
+                prepared = fixture.prepare()
+                mask = fixture.profile_root() / "empty-home-opencode"
+                path = mask / ".gitignore"
+                patcher = None
+                if mutation == "missing":
+                    path.unlink()
+                elif mutation == "changed-bytes":
+                    path.write_bytes(b"x" + BOOTSTRAP_GITIGNORE[1:])
+                elif mutation == "wrong-kind":
+                    path.unlink()
+                    path.mkdir(mode=0o700)
+                elif mutation == "mode":
+                    os.chmod(path, 0o644)
+                elif mutation == "owner":
+                    mask_metadata = mask.stat()
+                    original_entry_lstat = helper._entry_lstat
+
+                    def wrong_home_bootstrap_owner(
+                        parent_descriptor: int,
+                        name: str,
+                    ):
+                        result = original_entry_lstat(parent_descriptor, name)
+                        parent_metadata = os.fstat(parent_descriptor)
+                        if (
+                            name == ".gitignore"
+                            and parent_metadata.st_dev == mask_metadata.st_dev
+                            and parent_metadata.st_ino == mask_metadata.st_ino
+                        ):
+                            return StatProxy(result, st_uid=os.getuid() + 1)
+                        return result
+
+                    patcher = mock.patch.object(
+                        helper,
+                        "_entry_lstat",
+                        side_effect=wrong_home_bootstrap_owner,
+                    )
+                elif mutation == "symlink":
+                    target = fixture.base / "home-bootstrap-target"
+                    target.write_bytes(path.read_bytes())
+                    os.chmod(target, 0o600)
+                    path.unlink()
+                    path.symlink_to(target)
+                else:
+                    extra = mask / "unexpected"
+                    extra.write_bytes(b"unexpected")
+                    os.chmod(extra, 0o600)
+
+                context = (
+                    patcher
+                    if patcher is not None
+                    else mock.patch.object(helper, "AUDITED_VERSION", VERSION)
+                )
+                with context, self.assertRaisesRegex(
+                    ValueError, "home mask bootstrap"
+                ) as caught:
+                    helper.inspect_profile(fixture.profile_request(prepared))
+                self.assertNotIn("canary", str(caught.exception))
+
+    def test_rejects_late_home_mask_bootstrap_replacement(self) -> None:
+        fixture = Fixture(self)
+        prepared = fixture.prepare()
+        path = fixture.profile_root() / "empty-home-opencode/.gitignore"
+        original_validate = helper._validate_manifest
+        replaced = False
+
+        def replace_after_manifest_validation(*args: object, **kwargs: object):
+            nonlocal replaced
+            result = original_validate(*args, **kwargs)
+            replacement = path.with_name("home-bootstrap-replacement")
+            replacement.write_bytes(b"x" + BOOTSTRAP_GITIGNORE[1:])
+            os.chmod(replacement, 0o600)
+            os.replace(replacement, path)
+            replaced = True
+            return result
+
+        with (
+            mock.patch.object(
+                helper,
+                "_validate_manifest",
+                side_effect=replace_after_manifest_validation,
+            ),
+            self.assertRaises(ValueError) as caught,
+        ):
+            helper.inspect_profile(fixture.profile_request(prepared))
+        self.assertTrue(replaced)
+        self.assertNotIn("canary", str(caught.exception))
+
     def test_rejects_changed_reference_and_manifest_identity_fields(self) -> None:
         request_mutations = {
             "schema": 2,
@@ -1758,7 +1870,7 @@ class InspectProfileTests(unittest.TestCase):
     def test_rejects_changed_owner_mode_kind_symlink_and_unexpected_entries(
         self,
     ) -> None:
-        mutations = ("owner", "mode", "kind", "symlink", "extra", "nonempty-mask")
+        mutations = ("owner", "mode", "kind", "symlink", "extra")
         for mutation in mutations:
             with self.subTest(mutation=mutation):
                 fixture = Fixture(self)
@@ -1773,6 +1885,7 @@ class InspectProfileTests(unittest.TestCase):
                     os.chmod(profile / "manifest.json", 0o644)
                 elif mutation == "kind":
                     target = profile / "empty-home-opencode"
+                    (target / ".gitignore").unlink()
                     target.rmdir()
                     target.write_text("wrong kind", encoding="utf-8")
                     os.chmod(target, 0o600)
@@ -1785,11 +1898,6 @@ class InspectProfileTests(unittest.TestCase):
                     extra = profile / "unexpected"
                     extra.write_text("unexpected", encoding="utf-8")
                     os.chmod(extra, 0o600)
-                else:
-                    extra = profile / "empty-home-opencode/unexpected"
-                    extra.write_text("unexpected", encoding="utf-8")
-                    os.chmod(extra, 0o600)
-
                 context = (
                     patcher
                     if patcher is not None
