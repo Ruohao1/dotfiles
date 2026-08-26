@@ -40,7 +40,7 @@ for entry in pathlib.Path("/proc").iterdir():
 PY
 }
 
-HARNESS_ROOT=$(mktemp -d /tmp/nvim-ai-opencode-compat.XXXXXX)
+HARNESS_ROOT=$(mktemp -d /var/tmp/nvim-ai-opencode-compat.XXXXXX)
 chmod 700 "$HARNESS_ROOT"
 
 cleanup() {
@@ -52,7 +52,7 @@ cleanup() {
       exit 1
     fi
     case "$HARNESS_ROOT" in
-      /tmp/nvim-ai-opencode-compat.*) ;;
+      /var/tmp/nvim-ai-opencode-compat.*) ;;
       *)
         printf '%s\n' "not ok - unsafe compatibility root" >&2
         exit 1
@@ -673,6 +673,48 @@ try:
         if before != after or after != baseline:
             raise AssertionError("immutable tree changed during " + label)
         outputs[label] = (completed.stdout, completed.stderr)
+
+    home_visibility_probe = r"""
+import hashlib
+import pathlib
+import sys
+
+home = pathlib.Path(sys.argv[1])
+required_home_sources = (
+    ".config/opencode/opencode.json",
+    ".claude/CLAUDE.md",
+    ".agents/skills/hostile/SKILL.md",
+)
+for relative in required_home_sources:
+    source = home / relative
+    if not source.is_file() or b"nvim-ai-hostile-" not in source.read_bytes():
+        raise SystemExit(1)
+home_opencode = home / ".opencode"
+if sorted(path.name for path in home_opencode.iterdir()) != [".gitignore"]:
+    raise SystemExit(1)
+audited_bootstrap = (
+    b"node_modules\npackage.json\npackage-lock.json\nbun.lock\n.gitignore"
+)
+bootstrap = (home_opencode / ".gitignore").read_bytes()
+if len(bootstrap) != 63 or bootstrap != audited_bootstrap:
+    raise SystemExit(1)
+if hashlib.sha256(bootstrap).hexdigest() != (
+    "663a068e76d264d0bc6740f5450b6c4193c7b41ecf5e0dc222485b8a17404d95"
+):
+    raise SystemExit(1)
+"""
+    home_visibility_probe = "exec(" + repr(home_visibility_probe) + ")"
+    run(
+        "home-visibility",
+        [
+            manifest["python"],
+            "-I",
+            "-B",
+            "-c",
+            home_visibility_probe,
+            str(host_home),
+        ],
+    )
 
     shell_probe = (
         'if printf %s hostile >"$XDG_CONFIG_HOME/write-probe" 2>/dev/null; '
