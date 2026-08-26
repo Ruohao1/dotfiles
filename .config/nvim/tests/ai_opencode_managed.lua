@@ -2831,5 +2831,30 @@ assert(
   "real pinned OpenCode compatibility boundary failed: " .. tostring(installed_compatibility_error)
 )
 assert(managed.validate_compatibility(installed_compatibility))
+eq(
+  installed_compatibility.names,
+  { "build", "compaction", "plan", "summary", "title" },
+  "real exact five-agent enumeration"
+)
+for _, name in ipairs({ "build", "plan" }) do
+  local agent = installed_compatibility.agents[name]
+  assert(agent.native == true, "real " .. name .. " remains native")
+  eq(agent.mode, "primary", "real " .. name .. " remains primary")
+end
+for _, name in ipairs({ "compaction", "summary", "title" }) do
+  local agent = installed_compatibility.agents[name]
+  assert(
+    agent.native == true and agent.hidden == true,
+    "real " .. name .. " remains native and hidden"
+  )
+  eq(agent.tools, audited_hidden_tool_map, "real " .. name .. " actionable tools remain disabled")
+end
+eq(#compatibility_observations, 12, "real exact compatibility command count")
+for _, observed in ipairs(compatibility_observations) do
+  assert(
+    observed.observation.artifact_accepted == true,
+    "real probe artifacts accepted: " .. observed.name
+  )
+end
 
 print("AI managed OpenCode assertions: ok")

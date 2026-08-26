@@ -2710,6 +2710,32 @@ class RealHarnessContractTests(unittest.TestCase):
         missing = [snippet for snippet in required if snippet not in harness]
         self.assertEqual(missing, [])
 
+    def test_opencode_compatibility_harness_uses_the_validated_offline_boundary(
+        self,
+    ) -> None:
+        harness = (ROOT / "tests" / "nvim-ai-opencode-compat.sh").read_text(
+            encoding="utf-8"
+        )
+        required = (
+            "PROFILE_PREPARE_COUNT=0",
+            "--operation prepare",
+            "launcher.consume_manifest(",
+            "launcher.build_environment(",
+            "launcher.build_bwrap_argv(",
+            'argv.insert(1, "--unshare-net")',
+            'run("config", [opencode, "--pure", "debug", "config"])',
+            'run("agent-list", [opencode, "--pure", "agent", "list"])',
+            'for name in ("build", "plan", "compaction", "summary", "title"):',
+            'for name in ("general", "explore"):',
+            "managed instruction ordering changed",
+            "disallowed isolated account data appeared",
+            "OpenCode dependency or plugin behavior appeared",
+            "Managed OpenCode compatibility assertions: ok",
+        )
+        missing = [snippet for snippet in required if snippet not in harness]
+        self.assertEqual(missing, [])
+        self.assertEqual(harness.count("--operation prepare"), 1)
+
 
 class DescriptorAndEventTests(unittest.TestCase):
     def setUp(self) -> None:

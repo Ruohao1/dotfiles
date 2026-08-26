@@ -607,6 +607,41 @@ class ProfileConstructionTests(unittest.TestCase):
         )
         self.assertEqual(manifest_bytes, (compact_json(manifest) + "\n").encode())
 
+    def test_hostile_sibling_configuration_and_account_inputs_are_excluded(
+        self,
+    ) -> None:
+        fixture = Fixture(self)
+        hostile_sources = {
+            fixture.global_data / "account.json": b"account-sibling-canary",
+            fixture.global_data / "mcp-auth.json": b"mcp-auth-sibling-canary",
+            fixture.home / ".config/opencode/opencode.json": b"global-config-canary",
+            fixture.home / ".config/opencode/AGENTS.md": b"global-agents-canary",
+            fixture.physical_root / "opencode.json": b"project-config-canary",
+            fixture.physical_root / "nested/AGENTS.md": b"nested-agents-canary",
+        }
+        for path, payload in hostile_sources.items():
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(path.parent, 0o700)
+            path.write_bytes(payload)
+            os.chmod(path, 0o600)
+
+        fixture.prepare()
+        profile = fixture.profile_root()
+        profile_bytes = b"\n".join(
+            path.read_bytes() for path in profile.rglob("*") if path.is_file()
+        )
+        for payload in hostile_sources.values():
+            self.assertNotIn(payload, profile_bytes)
+        self.assertEqual(
+            sorted(path.name for path in (profile / "credentials").iterdir()),
+            ["auth.json"],
+        )
+        self.assertEqual(
+            (profile / "xdg-config/opencode/AGENTS.md").read_bytes(),
+            b"# User instructions\n\nuser line\n\n"
+            b"# Repository instructions\n\nrepo line\n\n",
+        )
+
     def test_instruction_order_separator_and_inode_dedup_are_exact(self) -> None:
         fixture = Fixture(self)
         fixture.write_instruction(fixture.user_agents, b"user\n\n")
