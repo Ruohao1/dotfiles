@@ -16,3 +16,4 @@ uv	linux	x86_64	0.12.5	tar.gz	https://releases.astral.sh/github/uv/releases/down
 uv	linux	arm64	0.12.5	tar.gz	https://releases.astral.sh/github/uv/releases/download/0.12.5/uv-aarch64-unknown-linux-gnu.tar.gz	9bf43b4d1a07665bf64d4c4e710930b382321a785e0eb10aac07f46471f86a31
 taplo	linux	x86_64	0.10.0	gzip	https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-x86_64.gz	8fe196b894ccf9072f98d4e1013a180306e17d244830b03986ee5e8eabeb6156
 taplo	linux	arm64	0.10.0	gzip	https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-aarch64.gz	033681d01eec8376c3fd38fa3703c79316f5e14bb013d859943b60a07bccdcc3
+rishot	linux	any	28c273b1b573725e03ef12989451f48009dabc83	tar.gz	https://codeload.github.com/Gakuseei/rishot/tar.gz/28c273b1b573725e03ef12989451f48009dabc83	ea72430cd8f207a8e0143749fd5b764074d60f9461e0f9aa4226c269cd3afcf6

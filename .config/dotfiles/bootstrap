@@ -420,6 +420,10 @@ emit_package_plan() {
         "$(package_arguments \
           "$manifest_root/packages-pacman.list" "$window_manager_packages")"
       printf '%s\n' '  install upstream herdr'
+      if [ "$selected_window_manager" = hypr ]; then
+        printf '%s\n' \
+          '  install upstream rishot 28c273b1b573725e03ef12989451f48009dabc83'
+      fi
       ;;
     *) die "unsupported package manager: $selected_manager" ;;
   esac
@@ -567,12 +571,47 @@ command_version() {
   esac
 }
 
+rishot_installation_is_satisfied() {
+  rishot_required_revision=$1
+  rishot_root=$HOME/.local/share/rishot
+  rishot_launcher=$HOME/.local/bin/rishot
+  rishot_marker=$rishot_root/.dotfiles-revision
+  rishot_expected_origin=https://github.com/Gakuseei/rishot.git
+
+  [ -d "$rishot_root" ] && [ ! -L "$rishot_root" ] || return 1
+  [ -f "$rishot_root/bin/rishot" ] \
+    && [ ! -L "$rishot_root/bin/rishot" ] \
+    && [ -x "$rishot_root/bin/rishot" ] || return 1
+  [ -f "$rishot_root/src/shell.qml" ] \
+    && [ ! -L "$rishot_root/src/shell.qml" ] || return 1
+  [ -L "$rishot_launcher" ] || return 1
+  [ "$(readlink "$rishot_launcher" 2>/dev/null || true)" \
+    = "$rishot_root/bin/rishot" ] || return 1
+
+  if [ -d "$rishot_root/.git" ] && [ ! -L "$rishot_root/.git" ]; then
+    command -v git >/dev/null 2>&1 || return 1
+    [ "$(git -C "$rishot_root" rev-parse HEAD 2>/dev/null || true)" \
+      = "$rishot_required_revision" ] || return 1
+    [ "$(git -C "$rishot_root" remote get-url origin 2>/dev/null || true)" \
+      = "$rishot_expected_origin" ] || return 1
+    rishot_git_status=$(git -C "$rishot_root" status --porcelain=v1 \
+      --untracked-files=no 2>/dev/null) || return 1
+    [ -z "$rishot_git_status" ] || return 1
+    return 0
+  fi
+
+  [ -f "$rishot_marker" ] && [ ! -L "$rishot_marker" ] \
+    && [ "$(cat "$rishot_marker")" = "$rishot_required_revision" ]
+}
+
 tool_is_satisfied() {
   tool_name=$1
   required_version=$2
 
   if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
-    && [ "${DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS+x}" = x ]; then
+    && [ "${DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS+x}" = x ] \
+    && { [ "$tool_name" != rishot ] \
+      || [ "${DOTFILES_BOOTSTRAP_TEST_REAL_RISHOT_INSTALL:-0}" != 1 ]; }; then
     case ",${DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS}," in
       *,"$tool_name",*) return 0 ;;
       *) return 1 ;;
@@ -588,6 +627,10 @@ tool_is_satisfied() {
     font-space-mono-nerd)
       command -v fc-list >/dev/null 2>&1 \
         && fc-list 2>/dev/null | grep -Fq 'SpaceMono Nerd Font Mono'
+      return
+      ;;
+    rishot)
+      rishot_installation_is_satisfied "$required_version"
       return
       ;;
   esac
@@ -1534,6 +1577,193 @@ archive_member_list_is_safe() {
   ' "$member_list"
 }
 
+maybe_fail_rishot_publication() {
+  rishot_failure_token=$1
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && [ "${DOTFILES_BOOTSTRAP_TEST_RISHOT_FAIL_AFTER:-}" \
+      = "$rishot_failure_token" ]; then
+    die "forced Rishot publication failure after $rishot_failure_token"
+  fi
+}
+
+ensure_rishot_parent_directory() {
+  rishot_parent_path=$1
+  rishot_parent_label=$2
+  if [ -e "$rishot_parent_path" ] || [ -L "$rishot_parent_path" ]; then
+    [ -d "$rishot_parent_path" ] && [ ! -L "$rishot_parent_path" ] \
+      || die "$rishot_parent_label must be a real directory"
+    return 0
+  fi
+  mkdir "$rishot_parent_path" \
+    || die "could not create $rishot_parent_label"
+}
+
+require_rishot_parent_directory_or_absent() {
+  rishot_parent_path=$1
+  rishot_parent_label=$2
+  if [ -e "$rishot_parent_path" ] || [ -L "$rishot_parent_path" ]; then
+    [ -d "$rishot_parent_path" ] && [ ! -L "$rishot_parent_path" ] \
+      || die "$rishot_parent_label must be a real directory"
+  fi
+}
+
+prepare_rishot_paths() {
+  require_rishot_parent_directory_or_absent "$HOME/.local" \
+    'the Rishot local-data parent'
+  require_rishot_parent_directory_or_absent "$HOME/.local/bin" \
+    'the Rishot launcher parent'
+  require_rishot_parent_directory_or_absent "$HOME/.local/share" \
+    'the Rishot installation parent'
+  require_rishot_targets_free
+  ensure_rishot_parent_directory "$HOME/.local" \
+    'the Rishot local-data parent'
+  ensure_rishot_parent_directory "$HOME/.local/bin" \
+    'the Rishot launcher parent'
+  ensure_rishot_parent_directory "$HOME/.local/share" \
+    'the Rishot installation parent'
+  require_rishot_targets_free
+}
+
+require_rishot_targets_free() {
+  rishot_required_target=$HOME/.local/share/rishot
+  rishot_required_link=$HOME/.local/bin/rishot
+  [ ! -e "$rishot_required_target" ] && [ ! -L "$rishot_required_target" ] \
+    || die "refusing to replace existing direct-tool target: $rishot_required_target"
+  [ ! -e "$rishot_required_link" ] && [ ! -L "$rishot_required_link" ] \
+    || die "refusing to replace existing direct-tool target: $rishot_required_link"
+}
+
+cleanup_active_rishot_publication() {
+  rishot_cleanup_status=0
+
+  if [ -n "$active_rishot_link" ]; then
+    if [ "$active_rishot_link" != "$HOME/.local/bin/rishot" ] \
+      || [ ! -L "$active_rishot_link" ] \
+      || [ "$(stat -c '%d:%i:%u:%a' "$active_rishot_link" \
+        2>/dev/null || true)" != "$active_rishot_link_identity" ] \
+      || [ "$(readlink "$active_rishot_link" 2>/dev/null || true)" \
+        != "$HOME/.local/share/rishot/bin/rishot" ]; then
+      printf 'bootstrap: refusing Rishot launcher cleanup: %s\n' \
+        "$active_rishot_link" >&2
+      rishot_cleanup_status=1
+    else
+      rm -f -- "$active_rishot_link" || rishot_cleanup_status=1
+    fi
+  fi
+
+  if [ -n "$active_rishot_directory" ]; then
+    case "$active_rishot_directory" in
+      "$HOME/.local/share/rishot") ;;
+      "$HOME/.local/share/.rishot-stage."*)
+        rishot_stage_suffix=${active_rishot_directory##*.rishot-stage.}
+        case "$rishot_stage_suffix" in
+          ''|*[!A-Za-z0-9]*) rishot_cleanup_status=1 ;;
+        esac
+        ;;
+      *) rishot_cleanup_status=1 ;;
+    esac
+    if [ "$rishot_cleanup_status" -eq 0 ]; then
+      if [ ! -d "$active_rishot_directory" ] \
+        || [ -L "$active_rishot_directory" ] \
+        || [ "$(stat -c '%d:%i:%u:%a' "$active_rishot_directory" \
+          2>/dev/null || true)" != "$active_rishot_directory_identity" ]; then
+        printf 'bootstrap: refusing Rishot directory cleanup: %s\n' \
+          "$active_rishot_directory" >&2
+        rishot_cleanup_status=1
+      else
+        rm -rf -- "$active_rishot_directory" \
+          || rishot_cleanup_status=1
+      fi
+    else
+      printf 'bootstrap: refusing Rishot directory cleanup: %s\n' \
+        "$active_rishot_directory" >&2
+    fi
+  fi
+
+  return "$rishot_cleanup_status"
+}
+
+publish_rishot_tree() {
+  rishot_publish_source=$1
+  rishot_publish_target=$2
+  rishot_publish_link=$3
+  rishot_publish_parent=$(dirname "$rishot_publish_target")
+  rishot_stage_record=$active_package_tmp/rishot-stage.path
+  : >"$rishot_stage_record" \
+    || die 'could not initialize the Rishot staging record'
+
+  begin_cleanup_registration_critical
+  if ! mktemp -d "$rishot_publish_parent/.rishot-stage.XXXXXX" \
+    >"$rishot_stage_record"; then
+    finish_cleanup_registration_critical
+    die 'could not create same-filesystem Rishot staging directory'
+  fi
+  IFS= read -r rishot_publish_stage <"$rishot_stage_record" || {
+    finish_cleanup_registration_critical
+    die 'could not read the Rishot staging directory'
+  }
+  case "$rishot_publish_stage" in
+    "$rishot_publish_parent/.rishot-stage."*) ;;
+    *)
+      finish_cleanup_registration_critical
+      die 'Rishot staging directory has an unexpected path'
+      ;;
+  esac
+  active_rishot_directory=$rishot_publish_stage
+  active_rishot_directory_identity=$(stat -c '%d:%i:%u:%a' \
+    "$active_rishot_directory") || {
+    finish_cleanup_registration_critical
+    die 'could not identify the Rishot staging directory'
+  }
+  finish_cleanup_registration_critical
+  maybe_fail_rishot_publication stage
+
+  cp -R "$rishot_publish_source/." "$rishot_publish_stage/" \
+    || die 'could not populate the Rishot staging directory'
+  [ -x "$rishot_publish_stage/bin/rishot" ] \
+    && [ -f "$rishot_publish_stage/src/shell.qml" ] \
+    && [ ! -L "$rishot_publish_stage/src/shell.qml" ] \
+    || die 'staged Rishot tree failed publication validation'
+
+  begin_cleanup_registration_critical
+  if ! mv --no-clobber --no-target-directory \
+    "$rishot_publish_stage" "$rishot_publish_target"; then
+    finish_cleanup_registration_critical
+    die 'could not publish the verified Rishot directory'
+  fi
+  if [ -e "$rishot_publish_stage" ] || [ -L "$rishot_publish_stage" ]; then
+    finish_cleanup_registration_critical
+    die 'Rishot installation target appeared during publication'
+  fi
+  [ "$(stat -c '%d:%i:%u:%a' "$rishot_publish_target" \
+      2>/dev/null || true)" = "$active_rishot_directory_identity" ] || {
+    finish_cleanup_registration_critical
+    die 'published Rishot directory identity changed unexpectedly'
+  }
+  active_rishot_directory=$rishot_publish_target
+  finish_cleanup_registration_critical
+  maybe_fail_rishot_publication directory
+
+  begin_cleanup_registration_critical
+  if ! ln -s "$rishot_publish_target/bin/rishot" "$rishot_publish_link"; then
+    finish_cleanup_registration_critical
+    die 'could not publish the verified Rishot launcher'
+  fi
+  active_rishot_link=$rishot_publish_link
+  active_rishot_link_identity=$(stat -c '%d:%i:%u:%a' \
+    "$active_rishot_link") || {
+    finish_cleanup_registration_critical
+    die 'could not identify the published Rishot launcher'
+  }
+  finish_cleanup_registration_critical
+  maybe_fail_rishot_publication launcher
+
+  active_rishot_link=
+  active_rishot_link_identity=
+  active_rishot_directory=
+  active_rishot_directory_identity=
+}
+
 lua_archive_roots_are_exact() {
   member_list=$1
   awk '
@@ -2390,13 +2620,19 @@ install_direct_tool() {
     return 0
   fi
 
-  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ]; then
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
+    && { [ "$tool_name" != rishot ] \
+      || [ "${DOTFILES_BOOTSTRAP_TEST_REAL_RISHOT_INSTALL:-0}" != 1 ]; }; then
     record_test_command direct-install "$tool_name"
     record_package_action direct "$tool_name"
     return 0
   fi
 
-  selected_arch=$(normalized_architecture)
+  if [ "$tool_name" = rishot ]; then
+    selected_arch=any
+  else
+    selected_arch=$(normalized_architecture)
+  fi
   asset_data=$(direct_asset_record "$tool_name" linux "$selected_arch" "$manifest_root/packages-direct.tsv")
   old_ifs=$IFS
   tab_character=$(printf '\t')
@@ -2419,14 +2655,22 @@ install_direct_tool() {
     *) die "direct asset URL must use HTTPS: $tool_name" ;;
   esac
 
+  local_bin=$HOME/.local/bin
+  local_opt=$HOME/.local/opt
+  if [ "$tool_name" = rishot ]; then
+    prepare_rishot_paths
+  fi
+
   install_tmp=$(temporary_directory) \
     || die "could not create temporary direct asset storage: $tool_name"
   active_package_tmp=$install_tmp
   asset_path=$install_tmp/asset
   download_verified "$asset_url" "$asset_sha256" "$asset_path"
-  local_bin=$HOME/.local/bin
-  local_opt=$HOME/.local/opt
-  mkdir -p "$local_bin" "$local_opt"
+  if [ "$tool_name" = rishot ]; then
+    prepare_rishot_paths
+  else
+    mkdir -p "$local_bin" "$local_opt"
+  fi
 
   case "$tool_name:$asset_format" in
     neovim:tar.gz)
@@ -2480,6 +2724,40 @@ install_direct_tool() {
       if command -v fc-cache >/dev/null 2>&1; then
         fc-cache -f "$target_dir" >/dev/null 2>&1 || true
       fi
+      ;;
+    rishot:tar.gz)
+      target_dir=$HOME/.local/share/rishot
+      target_link=$local_bin/rishot
+      extracted_root=rishot-$asset_version
+      require_rishot_targets_free
+      mkdir "$install_tmp/extract" \
+        || die 'could not create the Rishot extraction directory'
+      tar -tzf "$asset_path" >"$install_tmp/members" \
+        || die 'verified Rishot asset is not valid gzip tar'
+      archive_member_list_is_safe "$install_tmp/members" "$extracted_root" \
+        || die 'verified Rishot archive contains an unsafe member'
+      tar -tvzf "$asset_path" >"$install_tmp/member-details" \
+        || die 'could not inspect verified Rishot archive member types'
+      awk '
+        substr($1, 1, 1) != "-" && substr($1, 1, 1) != "d" { bad = 1 }
+        END { exit bad }
+      ' "$install_tmp/member-details" \
+        || die 'verified Rishot archive contains a non-regular member'
+      tar -xzf "$asset_path" -C "$install_tmp/extract" \
+        || die 'could not extract the verified Rishot archive'
+      extracted_dir=$install_tmp/extract/$extracted_root
+      [ -f "$extracted_dir/bin/rishot" ] \
+        && [ ! -L "$extracted_dir/bin/rishot" ] \
+        || die 'verified Rishot archive is missing bin/rishot'
+      [ -f "$extracted_dir/src/shell.qml" ] \
+        && [ ! -L "$extracted_dir/src/shell.qml" ] \
+        || die 'verified Rishot archive is missing src/shell.qml'
+      chmod 0755 "$extracted_dir/bin/rishot" \
+        || die 'could not make the verified Rishot launcher executable'
+      (umask 022 && printf '%s\n' "$asset_version" \
+        >"$extracted_dir/.dotfiles-revision") \
+        || die 'could not record the verified Rishot revision'
+      publish_rishot_tree "$extracted_dir" "$target_dir" "$target_link"
       ;;
     uv:tar.gz)
       target_dir=$local_opt/uv-$asset_version-$selected_arch
@@ -2680,6 +2958,11 @@ install_pacman_packages() {
   fi
 
   install_direct_tool herdr 0.8.0 "$manifest_root"
+  if [ "$selected_window_manager" = hypr ]; then
+    install_direct_tool rishot \
+      28c273b1b573725e03ef12989451f48009dabc83 \
+      "$manifest_root"
+  fi
 }
 
 parquet_uv_candidate_is_satisfied() {
@@ -4083,6 +4366,12 @@ handle_process_exit() {
   if [ -n "$prepared_root" ] && [ -d "$prepared_root" ]; then
     remove_temporary_directory "$prepared_root"
   fi
+  if [ "$process_status" -ne 0 ] \
+    && { [ -n "$active_rishot_directory" ] \
+      || [ -n "$active_rishot_link" ]; }; then
+    cleanup_active_rishot_publication || printf '%s\n' \
+      'bootstrap: Rishot publication cleanup was incomplete; inspect the exact reported path' >&2
+  fi
   if [ -n "$active_package_tmp" ] && [ -d "$active_package_tmp" ]; then
     remove_temporary_directory "$active_package_tmp"
   fi
@@ -4106,6 +4395,10 @@ prepared_selected_paths=
 prepared_patterns=
 prepared_commit=
 active_package_tmp=
+active_rishot_directory=
+active_rishot_directory_identity=
+active_rishot_link=
+active_rishot_link_identity=
 manifest_temp_root=
 manifest_gitdir=
 manifest_commit=

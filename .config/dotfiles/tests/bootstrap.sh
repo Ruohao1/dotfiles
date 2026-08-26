@@ -1804,6 +1804,67 @@ create_fake_taplo_asset() {
     "$fake_download_root/$fake_taplo_asset")
 }
 
+create_fake_rishot_asset_variant() {
+  fake_rishot_download_root=$1
+  fake_rishot_source_root=$2
+  fake_rishot_variant=$3
+  fake_rishot_revision=28c273b1b573725e03ef12989451f48009dabc83
+  fake_rishot_root_name=rishot-$fake_rishot_revision
+  fake_rishot_root=$fake_rishot_source_root/$fake_rishot_root_name
+  mkdir -p "$fake_rishot_download_root" "$fake_rishot_source_root"
+
+  if [ "$fake_rishot_variant" = traversal ]; then
+    printf '%s\n' payload >"$fake_rishot_source_root/payload"
+    tar -czf "$fake_rishot_download_root/$fake_rishot_revision" \
+      --transform="s|^payload$|$fake_rishot_root_name/../escape|" \
+      -C "$fake_rishot_source_root" payload
+  else
+    mkdir -p "$fake_rishot_root/bin" "$fake_rishot_root/src"
+    case "$fake_rishot_variant" in
+      normal)
+        printf '%s\n' '#!/bin/sh' 'exit 0' \
+          >"$fake_rishot_root/bin/rishot"
+        chmod 0755 "$fake_rishot_root/bin/rishot"
+        printf '%s\n' 'import QtQuick' \
+          >"$fake_rishot_root/src/shell.qml"
+        ;;
+      symlink)
+        ln -s ../../escape "$fake_rishot_root/bin/rishot"
+        printf '%s\n' 'import QtQuick' \
+          >"$fake_rishot_root/src/shell.qml"
+        ;;
+      missing-launcher)
+        printf '%s\n' 'import QtQuick' \
+          >"$fake_rishot_root/src/shell.qml"
+        ;;
+      missing-qml)
+        printf '%s\n' '#!/bin/sh' 'exit 0' \
+          >"$fake_rishot_root/bin/rishot"
+        chmod 0755 "$fake_rishot_root/bin/rishot"
+        ;;
+      *) return 1 ;;
+    esac
+    tar -czf "$fake_rishot_download_root/$fake_rishot_revision" \
+      -C "$fake_rishot_source_root" "$fake_rishot_root_name"
+  fi
+  fake_rishot_sha=$(file_sha256_for_test \
+    "$fake_rishot_download_root/$fake_rishot_revision")
+}
+
+create_fake_rishot_asset() {
+  create_fake_rishot_asset_variant "$1" "$2" normal
+}
+
+rewrite_rishot_fixture_sha() {
+  rishot_rewrite_manifest=$1
+  rishot_rewrite_sha=$2
+  awk -F '\t' -v OFS='\t' -v sha256="$rishot_rewrite_sha" '
+    $1 == "rishot" && $2 == "linux" && $3 == "any" { $7 = sha256 }
+    { print }
+  ' "$rishot_rewrite_manifest" >"$rishot_rewrite_manifest.new"
+  mv "$rishot_rewrite_manifest.new" "$rishot_rewrite_manifest"
+}
+
 file_sha256_for_test() {
   test_checksum_path=$1
   if command -v sha256sum >/dev/null 2>&1; then
@@ -3132,6 +3193,29 @@ if [ "$actual_taplo_records" = "$expected_taplo_records" ]; then
 else
   fail 'direct manifest locks the exact two Taplo 0.10.0 artifacts'
 fi
+
+actual_rishot_records=$(
+  awk -F '\t' '
+    $1 == "rishot" {
+      print $2 "|" $3 "|" $4 "|" $5 "|" $6 "|" $7
+    }
+  ' "$dotfiles_dir/manifests/packages-direct.tsv"
+)
+expected_rishot_records='linux|any|28c273b1b573725e03ef12989451f48009dabc83|tar.gz|https://codeload.github.com/Gakuseei/rishot/tar.gz/28c273b1b573725e03ef12989451f48009dabc83|ea72430cd8f207a8e0143749fd5b764074d60f9461e0f9aa4226c269cd3afcf6'
+if [ "$actual_rishot_records" = "$expected_rishot_records" ]; then
+  pass 'direct manifest locks the exact Rishot source archive'
+else
+  fail 'direct manifest locks the exact Rishot source archive'
+fi
+
+for rishot_dependency in qt6-5compat quickshell; do
+  if [ "$(grep -Fxc "$rishot_dependency" \
+      "$dotfiles_dir/manifests/packages-pacman-hypr.list" || true)" -eq 1 ]; then
+    pass "Hyprland owns exactly one $rishot_dependency dependency"
+  else
+    fail "Hyprland owns exactly one $rishot_dependency dependency"
+  fi
+done
 
 linux_output=$(
   HOME="$test_tmp/linux-home" \
@@ -5804,6 +5888,483 @@ else
 fi
 require_contains "$(cat "$hypr_pacman_output")" 'hyprland' \
   'Hyprland is included in the single pacman full-upgrade command'
+require_contains "$(cat "$hypr_pacman_output")" 'quickshell' \
+  'Hyprland includes Quickshell in the single pacman full-upgrade command'
+require_contains "$(cat "$hypr_pacman_output")" 'qt6-5compat' \
+  'Hyprland includes Qt 5 compatibility in the single pacman full-upgrade command'
+
+rishot_plan_root=$test_tmp/rishot-plan
+rishot_plan_bin=$rishot_plan_root/bin
+mkdir -p "$rishot_plan_bin"
+printf '%s\n' '#!/bin/sh' 'exit 0' >"$rishot_plan_bin/pacman"
+chmod 0755 "$rishot_plan_bin/pacman"
+
+for rishot_plan_profile in hypr i3 none; do
+  rishot_plan_log=$rishot_plan_root/$rishot_plan_profile.commands
+  run_capture "$rishot_plan_root/$rishot_plan_profile.output" env \
+    PATH="$rishot_plan_bin:/usr/bin:/bin" \
+    HOME="$rishot_plan_root/$rishot_plan_profile-home" \
+    XDG_STATE_HOME="$rishot_plan_root/$rishot_plan_profile-state" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=pacman \
+    DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS=herdr \
+    DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+    DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$rishot_plan_log" \
+    "$bootstrap" --apply --window-manager "$rishot_plan_profile"
+  rishot_plan_status=$run_status
+  rishot_plan_count=0
+  if [ -f "$rishot_plan_log" ]; then
+    rishot_plan_count=$(grep -Fxc 'direct-install rishot' \
+      "$rishot_plan_log" || true)
+  fi
+  case "$rishot_plan_profile" in
+    hypr) rishot_plan_expected=1 ;;
+    i3|none) rishot_plan_expected=0 ;;
+  esac
+  if [ "$rishot_plan_status" -eq 0 ] \
+    && [ "$rishot_plan_count" -eq "$rishot_plan_expected" ]; then
+    pass "Rishot direct install count is exact for $rishot_plan_profile"
+  else
+    fail "Rishot direct install count is exact for $rishot_plan_profile"
+  fi
+done
+
+for rishot_plan_profile in hypr i3 none; do
+  rishot_plan_output=$(env \
+    HOME="$rishot_plan_root/$rishot_plan_profile-dry-home" \
+    XDG_STATE_HOME="$rishot_plan_root/$rishot_plan_profile-dry-state" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=pacman \
+    "$bootstrap" --window-manager "$rishot_plan_profile")
+  rishot_plan_count=$(printf '%s\n' "$rishot_plan_output" | grep -Fxc \
+    '  install upstream rishot 28c273b1b573725e03ef12989451f48009dabc83' \
+    || true)
+  case "$rishot_plan_profile" in
+    hypr) rishot_plan_expected=1 ;;
+    i3|none) rishot_plan_expected=0 ;;
+  esac
+  if [ "$rishot_plan_count" -eq "$rishot_plan_expected" ]; then
+    pass "Rishot dry-run count is exact for $rishot_plan_profile"
+  else
+    fail "Rishot dry-run count is exact for $rishot_plan_profile"
+  fi
+done
+
+rishot_fixture_root=$test_tmp/rishot-fixture
+rishot_fixture_harness=$rishot_fixture_root/harness
+rishot_fixture_download=$rishot_fixture_root/download
+rishot_fixture_source=$rishot_fixture_root/source
+rishot_fixture_bin=$rishot_fixture_root/bin
+mkdir -p "$rishot_fixture_harness" "$rishot_fixture_bin"
+cp -R "$dotfiles_dir/." "$rishot_fixture_harness/"
+create_fake_rishot_asset \
+  "$rishot_fixture_download" "$rishot_fixture_source"
+rishot_fixture_manifest=$rishot_fixture_harness/manifests/packages-direct.tsv
+rewrite_rishot_fixture_sha "$rishot_fixture_manifest" "$fake_rishot_sha"
+printf '%s\n' '#!/bin/sh' 'exit 0' >"$rishot_fixture_bin/pacman"
+chmod 0755 "$rishot_fixture_bin/pacman"
+
+run_rishot_case() {
+  rishot_case_name=$1
+  rishot_case_harness=${2:-$rishot_fixture_harness}
+  rishot_case_download=${3:-$rishot_fixture_download}
+  rishot_case_failure_token=${4:-}
+  rishot_case_bin=${5:-$rishot_fixture_bin}
+  rishot_case_home=$rishot_fixture_root/$rishot_case_name-home
+  rishot_case_state=$rishot_fixture_root/$rishot_case_name-state
+  rishot_case_tmp=$rishot_fixture_root/$rishot_case_name-tmp
+  rishot_case_log=$rishot_fixture_root/$rishot_case_name.commands
+  mkdir -p "$rishot_case_home" "$rishot_case_tmp"
+  : >"$rishot_case_log"
+  run_capture "$rishot_fixture_root/$rishot_case_name.output" "$test_real_env" \
+    PATH="$rishot_case_bin:/usr/bin:/bin" \
+    TMPDIR="$rishot_case_tmp" \
+    HOME="$rishot_case_home" \
+    XDG_STATE_HOME="$rishot_case_state" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=pacman \
+    DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS=herdr,visidata \
+    DOTFILES_BOOTSTRAP_TEST_REAL_RISHOT_INSTALL=1 \
+    DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT="$rishot_case_download" \
+    DOTFILES_BOOTSTRAP_TEST_RISHOT_FAIL_AFTER="$rishot_case_failure_token" \
+    DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+    DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$rishot_case_log" \
+    "$rishot_case_harness/bootstrap" --apply --window-manager hypr
+  rishot_case_status=$run_status
+  rishot_case_output=$(cat \
+    "$rishot_fixture_root/$rishot_case_name.output")
+}
+
+rishot_transients_are_absent() {
+  rishot_absence_home=$1
+  rishot_absence_tmp=$2
+  ! find "$rishot_absence_home/.local/share" -maxdepth 1 \
+    -name '.rishot-stage.*' -print 2>/dev/null | grep -q . \
+    && ! find "$rishot_absence_tmp" -maxdepth 1 \
+      -name 'dotfiles-bootstrap.*' -print 2>/dev/null | grep -q .
+}
+
+rishot_outputs_are_absent() {
+  rishot_absence_home=$1
+  rishot_absence_tmp=$2
+  [ ! -e "$rishot_absence_home/.local/share/rishot" ] \
+    && [ ! -L "$rishot_absence_home/.local/share/rishot" ] \
+    && [ ! -e "$rishot_absence_home/.local/bin/rishot" ] \
+    && [ ! -L "$rishot_absence_home/.local/bin/rishot" ] \
+    && rishot_transients_are_absent \
+      "$rishot_absence_home" "$rishot_absence_tmp"
+}
+
+run_rishot_case successful
+if [ "$rishot_case_status" -eq 0 ] \
+  && [ -d "$rishot_case_home/.local/share/rishot" ] \
+  && [ ! -L "$rishot_case_home/.local/share/rishot" ] \
+  && [ -x "$rishot_case_home/.local/share/rishot/bin/rishot" ] \
+  && [ -f "$rishot_case_home/.local/share/rishot/src/shell.qml" ] \
+  && [ ! -L "$rishot_case_home/.local/share/rishot/src/shell.qml" ] \
+  && [ "$(cat "$rishot_case_home/.local/share/rishot/.dotfiles-revision")" \
+    = 28c273b1b573725e03ef12989451f48009dabc83 ] \
+  && [ "$(readlink "$rishot_case_home/.local/bin/rishot")" \
+    = "$rishot_case_home/.local/share/rishot/bin/rishot" ] \
+  && rishot_transients_are_absent \
+    "$rishot_case_home" "$rishot_case_tmp"; then
+  pass 'Rishot publishes the exact verified source tree and absolute launcher'
+else
+  fail 'Rishot publishes the exact verified source tree and absolute launcher'
+  printf '%s\n' "$rishot_case_output" | sed 's/^/  output: /' >&2
+fi
+
+rishot_success_home=$rishot_case_home
+rishot_success_before=$(project_state_fingerprint \
+  "$rishot_success_home/.local")
+run_rishot_case successful
+rishot_success_after=$(project_state_fingerprint \
+  "$rishot_success_home/.local")
+if [ "$rishot_case_status" -eq 0 ] \
+  && [ "$rishot_success_before" = "$rishot_success_after" ] \
+  && [ ! -s "$rishot_case_log" ] \
+  && rishot_transients_are_absent \
+    "$rishot_case_home" "$rishot_case_tmp"; then
+  pass 'Rishot exact-pin rerun is byte-stable and performs no work'
+else
+  fail 'Rishot exact-pin rerun is byte-stable and performs no work'
+fi
+
+run_rishot_archive_failure() {
+  rishot_failure_name=$1
+  rishot_failure_variant=$2
+  rishot_failure_sha_mode=$3
+  rishot_failure_diagnostic=$4
+  rishot_failure_root=$rishot_fixture_root/archive-$rishot_failure_name
+  rishot_failure_harness=$rishot_failure_root/harness
+  rishot_failure_download=$rishot_failure_root/download
+  rishot_failure_source=$rishot_failure_root/source
+  mkdir -p "$rishot_failure_harness"
+  cp -R "$rishot_fixture_harness/." "$rishot_failure_harness/"
+  create_fake_rishot_asset_variant \
+    "$rishot_failure_download" "$rishot_failure_source" \
+    "$rishot_failure_variant"
+  case "$rishot_failure_sha_mode" in
+    exact) rishot_failure_sha=$fake_rishot_sha ;;
+    mismatch)
+      rishot_failure_sha=0000000000000000000000000000000000000000000000000000000000000000
+      ;;
+    *) return 1 ;;
+  esac
+  rewrite_rishot_fixture_sha \
+    "$rishot_failure_harness/manifests/packages-direct.tsv" \
+    "$rishot_failure_sha"
+  run_rishot_case "archive-$rishot_failure_name" \
+    "$rishot_failure_harness" "$rishot_failure_download"
+  if [ "$rishot_case_status" -ne 0 ] \
+    && printf '%s\n' "$rishot_case_output" \
+      | grep -Fq "$rishot_failure_diagnostic" \
+    && rishot_outputs_are_absent \
+      "$rishot_case_home" "$rishot_case_tmp"; then
+    pass "Rishot rejects $rishot_failure_name without publication"
+  else
+    fail "Rishot rejects $rishot_failure_name without publication"
+    printf '%s\n' "$rishot_case_output" | sed 's/^/  output: /' >&2
+  fi
+}
+
+run_rishot_archive_failure \
+  checksum-mismatch normal mismatch 'checksum mismatch for'
+run_rishot_archive_failure \
+  parent-traversal traversal exact 'archive contains an unsafe member'
+run_rishot_archive_failure \
+  symbolic-link-member symlink exact 'archive contains a non-regular member'
+run_rishot_archive_failure \
+  missing-launcher missing-launcher exact 'archive is missing bin/rishot'
+run_rishot_archive_failure \
+  missing-qml missing-qml exact 'archive is missing src/shell.qml'
+
+for rishot_failure_token in stage directory launcher; do
+  run_rishot_case "failure-$rishot_failure_token" \
+    "$rishot_fixture_harness" "$rishot_fixture_download" \
+    "$rishot_failure_token"
+  if [ "$rishot_case_status" -ne 0 ] \
+    && printf '%s\n' "$rishot_case_output" | grep -Fq \
+      "forced Rishot publication failure after $rishot_failure_token" \
+    && rishot_outputs_are_absent \
+      "$rishot_case_home" "$rishot_case_tmp"; then
+    pass "Rishot cleans a forced failure after $rishot_failure_token"
+  else
+    fail "Rishot cleans a forced failure after $rishot_failure_token"
+  fi
+done
+
+for rishot_signal_boundary in stage directory launcher; do
+  rishot_signal_root=$rishot_fixture_root/signal-$rishot_signal_boundary
+  rishot_signal_bin=$rishot_signal_root/bin
+  rishot_signal_home=$rishot_signal_root/home
+  rishot_signal_tmp=$rishot_signal_root/tmp
+  mkdir -p "$rishot_signal_bin" "$rishot_signal_home" "$rishot_signal_tmp"
+  cp "$rishot_fixture_bin/pacman" "$rishot_signal_bin/pacman"
+  case "$rishot_signal_boundary" in
+    stage)
+      rishot_signal_command='mktemp'
+      rishot_signal_target=$rishot_signal_home/.local/share/.rishot-stage.XXXXXX
+      ;;
+    directory)
+      rishot_signal_command='mv'
+      rishot_signal_target=$rishot_signal_home/.local/share/rishot
+      ;;
+    launcher)
+      rishot_signal_command='ln'
+      rishot_signal_target=$rishot_signal_home/.local/bin/rishot
+      ;;
+  esac
+  rishot_signal_real_command=$(command -v "$rishot_signal_command")
+  make_signal_boundary_command \
+    "$rishot_signal_bin/$rishot_signal_command" \
+    "$rishot_signal_real_command"
+  set +e
+  "$test_real_env" \
+    PATH="$rishot_signal_bin:/usr/bin:/bin" \
+    TMPDIR="$rishot_signal_tmp" \
+    HOME="$rishot_signal_home" \
+    XDG_STATE_HOME="$rishot_signal_root/state" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=pacman \
+    DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS=herdr,visidata \
+    DOTFILES_BOOTSTRAP_TEST_REAL_RISHOT_INSTALL=1 \
+    DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT="$rishot_fixture_download" \
+    DOTFILES_BOOTSTRAP_TEST_SIGNAL_COMMAND="$rishot_signal_command" \
+    DOTFILES_BOOTSTRAP_TEST_SIGNAL_TARGET="$rishot_signal_target" \
+    DOTFILES_BOOTSTRAP_TEST_MANAGED_SIGNAL=TERM \
+    DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
+    "$rishot_fixture_harness/bootstrap" --apply --window-manager hypr \
+    >"$rishot_signal_root/output" 2>&1 &
+  rishot_signal_pid=$!
+  wait "$rishot_signal_pid"
+  rishot_signal_status=$?
+  set -e
+  if [ "$rishot_signal_status" -eq 143 ] \
+    && ! kill -0 "$rishot_signal_pid" 2>/dev/null \
+    && rishot_outputs_are_absent \
+      "$rishot_signal_home" "$rishot_signal_tmp"; then
+    pass "Rishot cleans TERM after $rishot_signal_boundary publication"
+  else
+    fail "Rishot cleans TERM after $rishot_signal_boundary publication"
+    sed 's/^/  output: /' "$rishot_signal_root/output" >&2
+  fi
+done
+
+rishot_directory_collision_home=$rishot_fixture_root/collision-directory-home
+rishot_directory_collision_root=$rishot_directory_collision_home/.local/share/rishot
+mkdir -p "$rishot_directory_collision_root"
+printf '%s\n' sentinel >"$rishot_directory_collision_root/sentinel"
+rishot_collision_before=$(project_state_fingerprint \
+  "$rishot_directory_collision_home/.local")
+run_rishot_case collision-directory
+rishot_collision_after=$(project_state_fingerprint \
+  "$rishot_directory_collision_home/.local")
+if [ "$rishot_case_status" -ne 0 ] \
+  && printf '%s\n' "$rishot_case_output" | grep -Fq \
+    "refusing to replace existing direct-tool target: $rishot_directory_collision_root" \
+  && [ "$rishot_collision_before" = "$rishot_collision_after" ] \
+  && [ ! -e "$rishot_directory_collision_home/.local/bin/rishot" ] \
+  && ! grep -Fq 'download ' "$rishot_case_log" \
+  && rishot_transients_are_absent \
+    "$rishot_case_home" "$rishot_case_tmp"; then
+  pass 'Rishot preserves an occupied installation target without downloading'
+else
+  fail 'Rishot preserves an occupied installation target without downloading'
+fi
+
+rishot_launcher_collision_home=$rishot_fixture_root/collision-launcher-home
+rishot_launcher_collision_path=$rishot_launcher_collision_home/.local/bin/rishot
+mkdir -p "$rishot_launcher_collision_home/.local/bin"
+printf '%s\n' sentinel >"$rishot_launcher_collision_path"
+rishot_collision_before=$(project_state_fingerprint \
+  "$rishot_launcher_collision_home/.local")
+run_rishot_case collision-launcher
+rishot_collision_after=$(project_state_fingerprint \
+  "$rishot_launcher_collision_home/.local")
+if [ "$rishot_case_status" -ne 0 ] \
+  && printf '%s\n' "$rishot_case_output" | grep -Fq \
+    "refusing to replace existing direct-tool target: $rishot_launcher_collision_path" \
+  && [ "$rishot_collision_before" = "$rishot_collision_after" ] \
+  && [ ! -e "$rishot_launcher_collision_home/.local/share/rishot" ] \
+  && ! grep -Fq 'download ' "$rishot_case_log" \
+  && rishot_transients_are_absent \
+    "$rishot_case_home" "$rishot_case_tmp"; then
+  pass 'Rishot preserves an occupied launcher target without downloading'
+else
+  fail 'Rishot preserves an occupied launcher target without downloading'
+fi
+
+for rishot_parent_kind in local bin share; do
+  rishot_parent_home=$rishot_fixture_root/parent-$rishot_parent_kind-home
+  rishot_parent_outside=$rishot_fixture_root/parent-$rishot_parent_kind-outside
+  mkdir -p "$rishot_parent_home" "$rishot_parent_outside"
+  case "$rishot_parent_kind" in
+    local)
+      rishot_parent_link=$rishot_parent_home/.local
+      rishot_parent_diagnostic='the Rishot local-data parent must be a real directory'
+      ;;
+    bin)
+      mkdir -p "$rishot_parent_home/.local"
+      rishot_parent_link=$rishot_parent_home/.local/bin
+      rishot_parent_diagnostic='the Rishot launcher parent must be a real directory'
+      ;;
+    share)
+      mkdir -p "$rishot_parent_home/.local"
+      rishot_parent_link=$rishot_parent_home/.local/share
+      rishot_parent_diagnostic='the Rishot installation parent must be a real directory'
+      ;;
+  esac
+  ln -s "$rishot_parent_outside" "$rishot_parent_link"
+  rishot_parent_before=$(project_state_fingerprint "$rishot_parent_outside")
+  run_rishot_case "parent-$rishot_parent_kind"
+  rishot_parent_after=$(project_state_fingerprint "$rishot_parent_outside")
+  if [ "$rishot_case_status" -ne 0 ] \
+    && printf '%s\n' "$rishot_case_output" \
+      | grep -Fq "$rishot_parent_diagnostic" \
+    && [ "$(readlink "$rishot_parent_link")" = "$rishot_parent_outside" ] \
+    && [ "$rishot_parent_before" = "$rishot_parent_after" ] \
+    && ! grep -Fq 'download ' "$rishot_case_log" \
+    && rishot_transients_are_absent \
+      "$rishot_case_home" "$rishot_case_tmp"; then
+    pass "Rishot rejects a symbolic-link $rishot_parent_kind parent before download"
+  else
+    fail "Rishot rejects a symbolic-link $rishot_parent_kind parent before download"
+  fi
+done
+
+run_rishot_case wrong-marker
+if [ "$rishot_case_status" -eq 0 ]; then
+  printf '%s\n' wrong \
+    >"$rishot_case_home/.local/share/rishot/.dotfiles-revision"
+  rishot_wrong_marker_before=$(project_state_fingerprint \
+    "$rishot_case_home/.local")
+  run_rishot_case wrong-marker
+  rishot_wrong_marker_after=$(project_state_fingerprint \
+    "$rishot_case_home/.local")
+  if [ "$rishot_case_status" -ne 0 ] \
+    && printf '%s\n' "$rishot_case_output" | grep -Fq \
+      "refusing to replace existing direct-tool target: $rishot_case_home/.local/share/rishot" \
+    && [ "$rishot_wrong_marker_before" = "$rishot_wrong_marker_after" ] \
+    && ! grep -Fq 'download ' "$rishot_case_log" \
+    && rishot_transients_are_absent \
+      "$rishot_case_home" "$rishot_case_tmp"; then
+    pass 'Rishot refuses an installed tree with the wrong revision marker'
+  else
+    fail 'Rishot refuses an installed tree with the wrong revision marker'
+  fi
+else
+  fail 'Rishot refuses an installed tree with the wrong revision marker'
+fi
+
+make_rishot_verifier_bootstrap() {
+  rishot_verifier_source=$1
+  rishot_verifier_target=$2
+  awk '
+    BEGIN { print "#!/bin/sh"; print "set -eu" }
+    /^rishot_installation_is_satisfied[(][)] [{]$/ { copy = 1 }
+    copy { print }
+    copy && /^}$/ {
+      print "rishot_installation_is_satisfied \"$1\""
+      exit
+    }
+  ' "$rishot_verifier_source" >"$rishot_verifier_target"
+  chmod 0755 "$rishot_verifier_target"
+}
+
+rishot_git_home=$rishot_fixture_root/git-home
+rishot_git_root=$rishot_git_home/.local/share/rishot
+rishot_git_verifier=$rishot_fixture_root/rishot-verifier
+mkdir -p "$rishot_git_root/bin" "$rishot_git_root/src" \
+  "$rishot_git_home/.local/bin"
+printf '%s\n' '#!/bin/sh' 'exit 0' >"$rishot_git_root/bin/rishot"
+chmod 0755 "$rishot_git_root/bin/rishot"
+printf '%s\n' 'import QtQuick' >"$rishot_git_root/src/shell.qml"
+git -C "$rishot_git_root" init -q -b main
+git -C "$rishot_git_root" add bin/rishot src/shell.qml
+git -C "$rishot_git_root" \
+  -c user.name='Dotfiles Tests' \
+  -c user.email=dotfiles-tests.invalid \
+  -c commit.gpgsign=false \
+  -c core.hooksPath=/dev/null \
+  commit -q -m fixture
+git -C "$rishot_git_root" remote add origin \
+  https://github.com/Gakuseei/rishot.git
+ln -s "$rishot_git_root/bin/rishot" \
+  "$rishot_git_home/.local/bin/rishot"
+rishot_git_revision=$(git -C "$rishot_git_root" rev-parse HEAD)
+make_rishot_verifier_bootstrap \
+  "$rishot_fixture_harness/bootstrap" "$rishot_git_verifier"
+run_capture "$rishot_fixture_root/git-exact.output" "$test_real_env" \
+  HOME="$rishot_git_home" "$rishot_git_verifier" "$rishot_git_revision"
+if [ "$run_status" -eq 0 ]; then
+  pass 'Rishot accepts an exact clean HTTPS-origin Git checkout'
+else
+  fail 'Rishot accepts an exact clean HTTPS-origin Git checkout'
+fi
+
+printf '%s\n' untracked >"$rishot_git_root/local-note"
+run_capture "$rishot_fixture_root/git-untracked.output" "$test_real_env" \
+  HOME="$rishot_git_home" "$rishot_git_verifier" "$rishot_git_revision"
+if [ "$run_status" -eq 0 ]; then
+  pass 'Rishot Git compatibility ignores untracked local files'
+else
+  fail 'Rishot Git compatibility ignores untracked local files'
+fi
+
+run_capture "$rishot_fixture_root/git-revision.output" "$test_real_env" \
+  HOME="$rishot_git_home" "$rishot_git_verifier" \
+  0000000000000000000000000000000000000000
+if [ "$run_status" -ne 0 ]; then
+  pass 'Rishot Git compatibility rejects the wrong revision'
+else
+  fail 'Rishot Git compatibility rejects the wrong revision'
+fi
+
+git -C "$rishot_git_root" remote set-url origin \
+  https://example.invalid/rishot.git
+run_capture "$rishot_fixture_root/git-origin.output" "$test_real_env" \
+  HOME="$rishot_git_home" "$rishot_git_verifier" "$rishot_git_revision"
+if [ "$run_status" -ne 0 ]; then
+  pass 'Rishot Git compatibility rejects a noncanonical origin'
+else
+  fail 'Rishot Git compatibility rejects a noncanonical origin'
+fi
+
+git -C "$rishot_git_root" remote set-url origin \
+  https://github.com/Gakuseei/rishot.git
+printf '%s\n' '# dirty' >>"$rishot_git_root/bin/rishot"
+run_capture "$rishot_fixture_root/git-dirty.output" "$test_real_env" \
+  HOME="$rishot_git_home" "$rishot_git_verifier" "$rishot_git_revision"
+if [ "$run_status" -ne 0 ]; then
+  pass 'Rishot Git compatibility rejects tracked changes'
+else
+  fail 'Rishot Git compatibility rejects tracked changes'
+fi
 
 aerospace_brew_apply_log=$test_tmp/aerospace-brew-apply.commands
 run_capture "$test_tmp/aerospace-brew-apply.output" env \
