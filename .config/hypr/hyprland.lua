@@ -50,6 +50,8 @@ hl.bind("SUPER + SHIFT + SPACE", hl.dsp.window.float({ action = "toggle" }))
 hl.bind("SUPER + SHIFT + Q", hl.dsp.window.close())
 hl.bind("SUPER + SHIFT + R", hl.dsp.exec_cmd("hyprctl reload"))
 hl.bind("SUPER + SHIFT + semicolon", hl.dsp.exec_cmd("$HOME/.config/launcher/application-launcher"))
+hl.bind("Print", hl.dsp.exec_cmd("$HOME/.local/bin/rishot"))
+hl.bind("SHIFT + Print", hl.dsp.exec_cmd("$HOME/.local/bin/rishot monitor"))
 
 hl.bind("SUPER + 1", hl.dsp.focus({ workspace = 1 }))
 hl.bind("SUPER + 2", hl.dsp.focus({ workspace = 2 }))

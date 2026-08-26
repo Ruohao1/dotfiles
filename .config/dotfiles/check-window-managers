@@ -57,6 +57,14 @@ aerospace_dwindle=$root/.config/aerospace/dwindle
 hypr_touchpad_natural_scroll='            natural_scroll = true,'
 hypr_workspace_animation='hl.animation({ leaf = "workspaces", enabled = false })'
 hypr_workspace_gesture='hl.gesture({ fingers = 3, direction = "horizontal", action = "workspace" })'
+hypr_reload='hl.bind("SUPER + SHIFT + R", hl.dsp.exec_cmd("hyprctl reload"))'
+# $HOME is a Hyprland command literal, not a checker variable.
+# shellcheck disable=SC2016
+hypr_application_launcher='hl.bind("SUPER + SHIFT + semicolon", hl.dsp.exec_cmd("$HOME/.config/launcher/application-launcher"))'
+# shellcheck disable=SC2016
+hypr_rishot_region='hl.bind("Print", hl.dsp.exec_cmd("$HOME/.local/bin/rishot"))'
+# shellcheck disable=SC2016
+hypr_rishot_monitor='hl.bind("SHIFT + Print", hl.dsp.exec_cmd("$HOME/.local/bin/rishot monitor"))'
 
 failures=0
 checks=0
@@ -461,6 +469,13 @@ else
   fail 'Hyprland preserves its manager-native right-button resize'
 fi
 
+if [ "$(grep -Fxc "$hypr_rishot_region" "$hypr_config" || true)" -eq 1 ] \
+  && [ "$(grep -Fxc "$hypr_rishot_monitor" "$hypr_config" || true)" -eq 1 ]; then
+  pass 'Hyprland implements both Rishot screenshot bindings exactly once'
+else
+  fail 'Hyprland implements both Rishot screenshot bindings exactly once'
+fi
+
 # $mod is an i3 configuration literal, not a shell variable.
 # shellcheck disable=SC2016
 if [ "$(grep -Fxc 'set $mod Mod4' "$i3_config" || true)" -eq 1 ] \
@@ -483,11 +498,20 @@ fi
 
 if awk \
   -v allowed_animation="$hypr_workspace_animation" \
-  -v allowed_gesture="$hypr_workspace_gesture" '
-  /hl[.]dsp[.]exec_/ \
-    && $0 !~ /hl[.]dsp[.]exec_cmd[(]"hyprctl reload"[)]/ \
-    && $0 !~ /hl[.]dsp[.]exec_cmd[(]"[$]HOME[/][.]config[/]launcher[/]application-launcher"[)]/ {
-    bad = 1
+  -v allowed_gesture="$hypr_workspace_gesture" \
+  -v allowed_reload="$hypr_reload" \
+  -v allowed_launcher="$hypr_application_launcher" \
+  -v allowed_rishot_region="$hypr_rishot_region" \
+  -v allowed_rishot_monitor="$hypr_rishot_monitor" '
+  /hl[.]dsp[.]exec_/ {
+    line = $0
+    sub(/^[[:space:]]*/, "", line)
+    sub(/[[:space:]]*$/, "", line)
+    if (line != allowed_reload && line != allowed_launcher \
+      && line != allowed_rishot_region \
+      && line != allowed_rishot_monitor) {
+      bad = 1
+    }
   }
   /hl[.](on|window_rule|layer_rule|curve|device)[(]/ {
     bad = 1
@@ -495,16 +519,12 @@ if awk \
   /hl[.]animation[(]/ {
     line = $0
     sub(/^[[:space:]]*/, "", line)
-    if (line != allowed_animation) {
-      bad = 1
-    }
+    if (line != allowed_animation) bad = 1
   }
   /hl[.]gesture[(]/ {
     line = $0
     sub(/^[[:space:]]*/, "", line)
-    if (line != allowed_gesture) {
-      bad = 1
-    }
+    if (line != allowed_gesture) bad = 1
   }
   END { exit bad }
 ' "$hypr_config"; then

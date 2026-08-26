@@ -194,6 +194,61 @@ if command -v git >/dev/null 2>&1; then
     fail 'contract checker preserves an untracked local legacy config'
   fi
 
+  write_rishot_binding_mutation() {
+    rishot_mutation_kind=$1
+    rishot_mutation_target=$2
+    awk \
+      -v kind="$rishot_mutation_kind" \
+      -v region='hl.bind("Print", hl.dsp.exec_cmd("$HOME/.local/bin/rishot"))' \
+      -v monitor='hl.bind("SHIFT + Print", hl.dsp.exec_cmd("$HOME/.local/bin/rishot monitor"))' '
+      $0 == region {
+        if (kind == "missing-region") next
+        if (kind == "duplicate-region") print
+        if (kind == "changed-region-command") {
+          print "hl.bind(\"Print\", hl.dsp.exec_cmd(\"$HOME/.local/bin/rishot region\"))"
+          next
+        }
+      }
+      $0 == monitor {
+        if (kind == "missing-monitor") next
+        if (kind == "duplicate-monitor") print
+        if (kind == "changed-monitor-argument") {
+          print "hl.bind(\"SHIFT + Print\", hl.dsp.exec_cmd(\"$HOME/.local/bin/rishot screen\"))"
+          next
+        }
+      }
+      { print }
+      END {
+        if (kind == "extra-rishot-command") {
+          print "hl.bind(\"SUPER + Print\", hl.dsp.exec_cmd(\"$HOME/.local/bin/rishot\"))"
+        }
+      }
+    ' "$workspace_root/.config/hypr/hyprland.lua" \
+      >"$rishot_mutation_target"
+  }
+
+  for rishot_mutation_kind in \
+    missing-region \
+    missing-monitor \
+    duplicate-region \
+    duplicate-monitor \
+    changed-region-command \
+    changed-monitor-argument \
+    extra-rishot-command
+  do
+    write_rishot_binding_mutation "$rishot_mutation_kind" \
+      "$local_root/.config/hypr/hyprland.lua"
+    run_capture "$test_tmp/checker-rishot-$rishot_mutation_kind.output" \
+      "$checker" --root "$local_root"
+    if [ "$run_status" -ne 0 ]; then
+      pass "contract checker rejects $rishot_mutation_kind"
+    else
+      fail "contract checker rejects $rishot_mutation_kind"
+    fi
+  done
+  cp "$workspace_root/.config/hypr/hyprland.lua" \
+    "$local_root/.config/hypr/hyprland.lua"
+
   sed \
     's/^preference_key=NSWindowShouldDragOnGesture$/preference_key=NSWindowShouldDragOnGestureChanged/' \
     "$workspace_root/.config/macos/window-drag-gesture" \
@@ -555,6 +610,15 @@ require_contains "$hypr_config" \
 require_contains "$hypr_config" \
   'hl.gesture({ fingers = 3, direction = "horizontal", action = "workspace" })' \
   'Hyprland slides between workspaces with a three-finger gesture'
+# $HOME is a Hyprland command literal, not a test variable.
+# shellcheck disable=SC2016
+require_contains "$hypr_config" \
+  'hl.bind("Print", hl.dsp.exec_cmd("$HOME/.local/bin/rishot"))' \
+  'Hyprland Print launches Rishot region capture'
+# shellcheck disable=SC2016
+require_contains "$hypr_config" \
+  'hl.bind("SHIFT + Print", hl.dsp.exec_cmd("$HOME/.local/bin/rishot monitor"))' \
+  'Hyprland Shift+Print launches Rishot monitor capture'
 require_contains "$hypr_config" \
   'hl.bind("SUPER + 1", hl.dsp.focus({ workspace = 1 }))' \
   'Hyprland key 1 selects numeric workspace 1'
