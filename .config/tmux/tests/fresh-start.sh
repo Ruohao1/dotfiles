@@ -19,6 +19,18 @@ assert_equal() {
   fi
 }
 
+assert_contains() {
+  assert_expected=$1
+  assert_actual=$2
+  assert_label=$3
+  case $assert_actual in
+    *"$assert_expected"*) ;;
+    *)
+      fail "$assert_label: expected <$assert_expected> in <$assert_actual>"
+      ;;
+  esac
+}
+
 assert_empty() {
   assert_file=$1
   assert_label=$2
@@ -44,8 +56,19 @@ esac
 
 test_root=
 socket_path=
+control_pid=
+control_input_open=0
 
 cleanup() {
+  if [ "$control_input_open" = 1 ]; then
+    exec 3>&-
+    control_input_open=0
+  fi
+  if [ -n "$control_pid" ]; then
+    kill "$control_pid" >/dev/null 2>&1 || :
+    wait "$control_pid" >/dev/null 2>&1 || :
+    control_pid=
+  fi
   if [ -n "$socket_path" ]; then
     "$real_tmux" -S "$socket_path" kill-server >/dev/null 2>&1 || :
   fi
@@ -114,6 +137,114 @@ passthrough=$("$real_tmux" -S "$socket_path" \
   || fail "could not read global allow-passthrough"
 assert_equal on "$passthrough" "fresh global allow-passthrough"
 
+root_bindings=$(
+  "$real_tmux" -S "$socket_path" list-keys -T root \
+    -F '#{key_string}:#{key_command}' 2>/dev/null
+) || fail "could not read root key bindings"
+m_q_binding=$(printf '%s\n' "$root_bindings" | sed -n 's/^M-q://p')
+[ -n "$m_q_binding" ] || fail "root M-q binding is missing"
+assert_contains 'confirm-before' "$m_q_binding" \
+  "root M-q uses confirm-before"
+assert_contains 'Kill pane #P? (y/n)' "$m_q_binding" \
+  "root M-q prompt"
+assert_contains 'kill-pane' "$m_q_binding" \
+  "root M-q command"
+
+prefix_key_names=$(
+  "$real_tmux" -S "$socket_path" list-keys -T prefix \
+    -F ':#{key_string}:' 2>/dev/null
+) || fail "could not read prefix key bindings"
+case $prefix_key_names in
+  *':x:'*) fail "prefix x must remain unbound" ;;
+esac
+
+test_window=$(
+  "$real_tmux" -S "$socket_path" list-windows \
+    -t '=terminal-stack-fresh-start' -F '#{window_id}'
+) || fail "could not resolve private test window"
+[ -n "$test_window" ] || fail "private test window id is empty"
+
+"$real_tmux" -S "$socket_path" split-window -d -t "$test_window" \
+  || fail "could not create second private pane"
+pane_count=$(
+  "$real_tmux" -S "$socket_path" display-message \
+    -p -t "$test_window" '#{window_panes}'
+) || fail "could not count private panes before confirmation checks"
+assert_equal 2 "$pane_count" "private pane setup"
+
+control_fifo=$test_root/control.fifo
+control_stdout=$test_root/control.stdout
+control_stderr=$test_root/control.stderr
+mkfifo "$control_fifo" || fail "could not create control-client FIFO"
+
+"$real_tmux" -C -S "$socket_path" \
+  attach-session -t '=terminal-stack-fresh-start' \
+  <"$control_fifo" >"$control_stdout" 2>"$control_stderr" &
+control_pid=$!
+exec 3>"$control_fifo"
+control_input_open=1
+
+control_client=
+attempts=0
+while [ "$attempts" -lt 5 ]; do
+  control_client=$(
+    "$real_tmux" -S "$socket_path" list-clients \
+      -F '#{client_name}' 2>/dev/null | sed -n '1p'
+  )
+  [ -n "$control_client" ] && break
+  attempts=$((attempts + 1))
+  sleep 1
+done
+if [ -z "$control_client" ]; then
+  sed 's/^/      /' "$control_stderr" >&2
+  fail "private control client did not attach"
+fi
+
+"$real_tmux" -S "$socket_path" send-keys \
+  -K -c "$control_client" M-q \
+  || fail "could not trigger private M-q cancellation prompt"
+sleep 1
+"$real_tmux" -S "$socket_path" send-keys \
+  -K -c "$control_client" n \
+  || fail "could not reject private M-q prompt"
+sleep 1
+pane_count=$(
+  "$real_tmux" -S "$socket_path" display-message \
+    -p -t "$test_window" '#{window_panes}'
+) || fail "could not count private panes after cancellation"
+assert_equal 2 "$pane_count" "M-q cancellation preserves pane"
+
+"$real_tmux" -S "$socket_path" send-keys \
+  -K -c "$control_client" M-q \
+  || fail "could not trigger private M-q confirmation prompt"
+sleep 1
+"$real_tmux" -S "$socket_path" send-keys \
+  -K -c "$control_client" y \
+  || fail "could not accept private M-q prompt"
+
+pane_count=
+attempts=0
+while [ "$attempts" -lt 5 ]; do
+  pane_count=$(
+    "$real_tmux" -S "$socket_path" display-message \
+      -p -t "$test_window" '#{window_panes}' 2>/dev/null || :
+  )
+  [ "$pane_count" = 1 ] && break
+  attempts=$((attempts + 1))
+  sleep 1
+done
+assert_equal 1 "$pane_count" "M-q confirmation kills pane"
+
+"$real_tmux" -S "$socket_path" detach-client -t "$control_client" \
+  || fail "could not detach private control client"
+exec 3>&-
+control_input_open=0
+if ! wait "$control_pid"; then
+  sed 's/^/      /' "$control_stderr" >&2
+  fail "private control client exited unsuccessfully"
+fi
+control_pid=
+
 "$real_tmux" -S "$socket_path" kill-server \
   || fail "fresh private tmux server did not stop"
 case "$socket_path" in
@@ -128,4 +259,4 @@ esac
   || fail "fresh private tmux socket remained after shutdown"
 socket_path=
 
-pass "tmux fresh-start foundation"
+pass "tmux fresh-start foundation and pane confirmation"
