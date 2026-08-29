@@ -77,21 +77,6 @@ local OPENCODE_PROBE_FORBIDDEN_ARTIFACTS = {
   ".opencode",
   "/tmp/opencode/",
 }
-local OPENCODE_PRIMARY_TOOLS = {
-  invalid = true,
-  question = true,
-  bash = true,
-  read = true,
-  glob = true,
-  grep = true,
-  edit = true,
-  write = true,
-  task = false,
-  webfetch = true,
-  todowrite = true,
-  websearch = true,
-  skill = false,
-}
 local AUTH_ARGUMENTS = {
   codex = { "login", "status" },
   claude = { "auth", "status", "--json" },
@@ -405,6 +390,256 @@ local function bounded_system(argv, options, limits, system)
   }
 end
 
+local function bounded_system_async(argv, options, limits, on_complete, overrides)
+  local async = type(overrides) == "table" and overrides or {}
+  local valid_cancel = {
+    close = true,
+    ["backend-switch"] = true,
+    shutdown = true,
+    ["executable-drift"] = true,
+    timeout = true,
+    cancellation = true,
+  }
+  local system = async.system or vim.system
+  local schedule = async.schedule or vim.schedule
+  local schedule_valid = type(schedule) == "function"
+  if not schedule_valid then
+    schedule = vim.schedule
+  end
+  local stdout_chunks = {}
+  local stderr_chunks = {}
+  local lengths = { stdout = 0, stderr = 0 }
+  local overflow = { stdout = false, stderr = false }
+  local process
+  local process_started = false
+  local process_exited = false
+  local delivered = false
+  local final_result
+  local stop_requested = false
+  local kill_attempted = false
+  local system_error = type(overrides) ~= "nil" and type(overrides) ~= "table"
+  local cancellation
+  local boundary_cause
+  local completion_claimed = false
+  local scheduling = false
+  local reentrant_completion = false
+  local handle = {}
+
+  local function record_boundary(category)
+    if boundary_cause == nil then
+      boundary_cause = category
+    end
+  end
+
+  local function failed_result()
+    return {
+      code = 126,
+      signal = 0,
+      stdout = "",
+      stderr = "",
+      stdout_overflow = overflow.stdout,
+      stderr_overflow = overflow.stderr,
+      system_error = system_error,
+      cancellation = cancellation,
+      process_started = process_started,
+      process_exited = process_exited,
+    }
+  end
+
+  local function kill_once()
+    stop_requested = true
+    if kill_attempted or process_exited or not process then
+      return
+    end
+    kill_attempted = true
+    local ok = pcall(process.kill, process, "sigkill")
+    if not ok then
+      system_error = true
+      record_boundary("probe-failure")
+    end
+  end
+
+  local function capture(stream)
+    local chunks = stream == "stdout" and stdout_chunks or stderr_chunks
+    return function(err, data)
+      local ok = pcall(function()
+        if err ~= nil or (data ~= nil and type(data) ~= "string") then
+          system_error = true
+          record_boundary("probe-failure")
+          kill_once()
+          return
+        end
+        if data == nil or data == "" or delivered or overflow.stdout or overflow.stderr then
+          return
+        end
+        local remaining = limits[stream] - lengths[stream]
+        if #data > remaining then
+          if remaining > 0 then
+            chunks[#chunks + 1] = data:sub(1, remaining)
+          end
+          lengths[stream] = limits[stream]
+          overflow[stream] = true
+          record_boundary("output-overflow")
+          kill_once()
+          return
+        end
+        chunks[#chunks + 1] = data
+        lengths[stream] = lengths[stream] + #data
+      end)
+      if not ok then
+        system_error = true
+        record_boundary("probe-failure")
+        kill_once()
+      end
+    end
+  end
+
+  local function complete_once()
+    if completion_claimed then
+      return
+    end
+    if scheduling then
+      reentrant_completion = true
+      return
+    end
+    completion_claimed = true
+    pcall(on_complete, final_result, boundary_cause)
+  end
+
+  local function deliver(completed)
+    if delivered then
+      return final_result
+    end
+    delivered = true
+    local result
+    if
+      system_error
+      or overflow.stdout
+      or overflow.stderr
+      or type(completed) ~= "table"
+      or type(completed.code) ~= "number"
+      or type(completed.signal) ~= "number"
+    then
+      result = failed_result()
+    else
+      result = {
+        code = completed.code,
+        signal = completed.signal,
+        stdout = table.concat(stdout_chunks),
+        stderr = table.concat(stderr_chunks),
+        stdout_overflow = false,
+        stderr_overflow = false,
+        system_error = false,
+        cancellation = cancellation,
+        process_started = process_started,
+        process_exited = process_exited,
+      }
+    end
+    stdout_chunks = {}
+    stderr_chunks = {}
+    final_result = result
+    scheduling = true
+    local schedule_ok = pcall(schedule, complete_once)
+    scheduling = false
+    if not schedule_ok then
+      system_error = true
+      record_boundary("probe-failure")
+      final_result = failed_result()
+      complete_once()
+    elseif reentrant_completion then
+      complete_once()
+    end
+    return final_result
+  end
+
+  local function exited(completed)
+    if delivered then
+      return
+    end
+    process_exited = type(completed) == "table"
+      and type(completed.code) == "number"
+      and type(completed.signal) == "number"
+    if not process_exited then
+      record_boundary("probe-failure")
+    elseif completed.code == 124 then
+      record_boundary("timeout")
+    elseif completed.signal ~= 0 then
+      record_boundary("probe-failure")
+    end
+    deliver(completed)
+  end
+
+  function handle:cancel(reason)
+    cancellation = valid_cancel[reason] and reason or "cancellation"
+    record_boundary(cancellation == "timeout" and "timeout" or "cancellation")
+    kill_once()
+  end
+
+  function handle:shutdown_drain(timeout_ms)
+    assert(timeout_ms == 2000, "OpenCode shutdown drain must be exactly 2000 ms")
+    if process_exited then
+      return true, final_result
+    end
+    if not process or type(process.wait) ~= "function" then
+      return false
+    end
+    kill_once()
+    local ok, completed = pcall(process.wait, process, timeout_ms)
+    if
+      not ok
+      or type(completed) ~= "table"
+      or type(completed.code) ~= "number"
+      or type(completed.signal) ~= "number"
+    then
+      return false
+    end
+    process_exited = true
+    local result = deliver(completed)
+    return true, result
+  end
+
+  local options_ok, system_options = pcall(vim.deepcopy, options)
+  if
+    type(argv) ~= "table"
+    or not vim.islist(argv)
+    or not options_ok
+    or type(system_options) ~= "table"
+    or type(limits) ~= "table"
+    or type(limits.stdout) ~= "number"
+    or limits.stdout < 0
+    or limits.stdout ~= math.floor(limits.stdout)
+    or type(limits.stderr) ~= "number"
+    or limits.stderr < 0
+    or limits.stderr ~= math.floor(limits.stderr)
+    or type(on_complete) ~= "function"
+    or type(system) ~= "function"
+    or not schedule_valid
+  then
+    system_error = true
+    record_boundary("probe-failure")
+    deliver(nil)
+    return handle
+  end
+
+  system_options.stdout = capture("stdout")
+  system_options.stderr = capture("stderr")
+  local spawn_ok, spawned = pcall(system, argv, system_options, exited)
+  if spawn_ok and type(spawned) == "table" then
+    process = spawned
+    process_started = true
+  end
+  if not spawn_ok or type(spawned) ~= "table" or type(spawned.kill) ~= "function" then
+    system_error = true
+    record_boundary("probe-failure")
+    deliver(nil)
+    return handle
+  end
+  if stop_requested then
+    kill_once()
+  end
+  return handle
+end
+
 local function valid_probe_result(result)
   return type(result) == "table"
     and type(result.code) == "number"
@@ -414,44 +649,51 @@ local function valid_probe_result(result)
     and type(result.stderr) == "string"
 end
 
-local function read_only_probe(executable, arguments, overrides)
+local function prepare_read_only_probe(executable, arguments, probe, timeout_ms)
   local tools = require("ai.tools")
-  local probe = overrides or {}
+  probe = probe or {}
   local resolve = probe.resolve or tools.resolve
   local revalidate = probe.revalidate or tools.revalidate
   local environ = probe.environ or vim.fn.environ
   local lstat = probe.lstat or vim.uv.fs_lstat
   local getuid = probe.getuid or vim.uv.getuid
-  local run = probe.run
-    or function(argv, options)
-      return bounded_system(argv, options, {
-        stdout = MAX_COMPATIBILITY_REPORT_BYTES,
-        stderr = MAX_HELP_BYTES,
-      })
+
+  local function failed(code, message)
+    return nil,
+      {
+        code = code,
+        signal = 0,
+        stdout = "",
+        stderr = message,
+      }
+  end
+
+  if
+    type(probe) ~= "table"
+    or type(arguments) ~= "table"
+    or not vim.islist(arguments)
+    or (timeout_ms ~= 2000 and timeout_ms ~= 5000)
+  then
+    return failed(126, "probe invocation is invalid")
+  end
+  for _, argument in ipairs(arguments) do
+    if type(argument) ~= "string" or has_control(argument) then
+      return failed(126, "probe argument is invalid")
     end
+  end
 
   local executable_check_ok, executable_ok, executable_error = pcall(revalidate, executable)
   if not executable_check_ok or not executable_ok then
-    return {
-      code = 126,
-      signal = 0,
-      stdout = "",
-      stderr = executable_check_ok and executable_error or executable_ok,
-    }
+    return failed(126, executable_check_ok and executable_error or executable_ok)
   end
 
   local bwrap, resolve_error = resolve("bwrap")
   if not bwrap then
-    return { code = 127, signal = 0, stdout = "", stderr = resolve_error }
+    return failed(127, resolve_error)
   end
   local bwrap_check_ok, bwrap_ok, bwrap_error = pcall(revalidate, bwrap)
   if not bwrap_check_ok or not bwrap_ok then
-    return {
-      code = 126,
-      signal = 0,
-      stdout = "",
-      stderr = bwrap_check_ok and bwrap_error or bwrap_ok,
-    }
+    return failed(126, bwrap_check_ok and bwrap_error or bwrap_ok)
   end
 
   local argv = {
@@ -476,7 +718,7 @@ local function read_only_probe(executable, arguments, overrides)
     local working_directory, directory_error =
       canonical_path(probe.working_directory, "probe working directory", false)
     if not working_directory then
-      return { code = 126, signal = 0, stdout = "", stderr = directory_error }
+      return failed(126, directory_error)
     end
     argv[#argv + 1] = "--dir"
     argv[#argv + 1] = working_directory
@@ -484,22 +726,17 @@ local function read_only_probe(executable, arguments, overrides)
   local read_only_mounts = {}
   if probe.read_only_mounts ~= nil then
     if type(probe.read_only_mounts) ~= "table" or not vim.islist(probe.read_only_mounts) then
-      return { code = 126, signal = 0, stdout = "", stderr = "probe mounts are invalid" }
+      return failed(126, "probe mounts are invalid")
     end
     for _, mount in ipairs(probe.read_only_mounts) do
       if type(mount) ~= "table" then
-        return { code = 126, signal = 0, stdout = "", stderr = "probe mount is invalid" }
+        return failed(126, "probe mount is invalid")
       end
       local source, source_error = canonical_path(mount.source, "probe mount source", false)
       local destination, destination_error =
         canonical_path(mount.destination, "probe mount destination", false)
       if not source or not destination then
-        return {
-          code = 126,
-          signal = 0,
-          stdout = "",
-          stderr = source_error or destination_error,
-        }
+        return failed(126, source_error or destination_error)
       end
       read_only_mounts[#read_only_mounts + 1] = { source = source, destination = destination }
     end
@@ -511,7 +748,7 @@ local function read_only_probe(executable, arguments, overrides)
       or not vim.islist(probe.writable_mounts)
       or #probe.writable_mounts ~= 3
     then
-      return { code = 126, signal = 0, stdout = "", stderr = "probe writable mounts are invalid" }
+      return failed(126, "probe writable mounts are invalid")
     end
     local allowed_destinations = {
       ["/tmp/nvim-ai-probe/xdg-data"] = true,
@@ -522,7 +759,7 @@ local function read_only_probe(executable, arguments, overrides)
     local seen_destinations = {}
     for _, mount in ipairs(probe.writable_mounts) do
       if type(mount) ~= "table" then
-        return { code = 126, signal = 0, stdout = "", stderr = "probe writable mount is invalid" }
+        return failed(126, "probe writable mount is invalid")
       end
       local source, source_error = canonical_path(mount.source, "probe writable source", false)
       local destination, destination_error =
@@ -536,12 +773,7 @@ local function read_only_probe(executable, arguments, overrides)
         or not private_directory(source, lstat, getuid)
         or not private_directory(vim.fs.dirname(source), lstat, getuid)
       then
-        return {
-          code = 126,
-          signal = 0,
-          stdout = "",
-          stderr = source_error or destination_error or "probe writable mount is invalid",
-        }
+        return failed(126, source_error or destination_error or "probe writable mount is invalid")
       end
       seen_sources[source] = true
       seen_destinations[destination] = true
@@ -552,7 +784,7 @@ local function read_only_probe(executable, arguments, overrides)
   for _, mounts in ipairs({ read_only_mounts, writable_mounts }) do
     for _, mount in ipairs(mounts) do
       if seen_destinations[mount.destination] then
-        return { code = 126, signal = 0, stdout = "", stderr = "probe mount is duplicated" }
+        return failed(126, "probe mount is duplicated")
       end
       seen_destinations[mount.destination] = true
       vim.list_extend(argv, { "--dir", mount.destination })
@@ -572,24 +804,52 @@ local function read_only_probe(executable, arguments, overrides)
   local environment
   if probe.environment ~= nil then
     if type(probe.environment) ~= "table" then
-      return { code = 126, signal = 0, stdout = "", stderr = "probe environment is invalid" }
+      return failed(126, "probe environment is invalid")
     end
-    environment = vim.deepcopy(probe.environment)
+    local environment_ok
+    environment_ok, environment = pcall(vim.deepcopy, probe.environment)
+    if not environment_ok or type(environment) ~= "table" then
+      return failed(126, "probe environment is invalid")
+    end
   else
-    environment = environ()
+    local environment_ok
+    environment_ok, environment = pcall(environ)
+    if not environment_ok or type(environment) ~= "table" then
+      return failed(126, "probe environment is invalid")
+    end
     environment.TMUX = nil
     environment.TMUX_PANE = nil
     environment.NVIM = nil
     environment.NVIM_LISTEN_ADDRESS = nil
   end
 
-  local ok, result = pcall(function()
-    return run(argv, {
+  return {
+    argv = argv,
+    options = {
       text = true,
-      timeout = 2000,
+      timeout = timeout_ms,
       clear_env = true,
       env = environment,
-    })
+    },
+  }
+end
+
+local function read_only_probe(executable, arguments, overrides)
+  local probe = overrides or {}
+  local run = probe.run
+    or function(argv, options)
+      return bounded_system(argv, options, {
+        stdout = MAX_COMPATIBILITY_REPORT_BYTES,
+        stderr = MAX_HELP_BYTES,
+      })
+    end
+  local invocation, invocation_error = prepare_read_only_probe(executable, arguments, probe, 2000)
+  if not invocation then
+    return invocation_error
+  end
+
+  local ok, result = pcall(function()
+    return run(invocation.argv, invocation.options)
   end)
   if probe.inspect_artifacts ~= nil then
     if type(probe.inspect_artifacts) ~= "function" then
@@ -621,8 +881,6 @@ local function read_only_probe(executable, arguments, overrides)
   end
   return result
 end
-
-local OPENCODE_COMPATIBILITY_CACHE = {}
 
 local function executable_metadata(stat)
   if
@@ -836,12 +1094,37 @@ local function validate_probe_inputs(tree, filesystem)
     and filesystem.sha256(bootstrap) == managed.bootstrap_gitignore_sha256()
 end
 
-local function cleanup_owned_probe_tree(root, remove, lstat)
+local function cleanup_owned_probe_tree(root, remove, lstat, getuid)
+  local normalize_ok, normalized = false, nil
+  if type(root) == "string" then
+    normalize_ok, normalized = pcall(vim.fs.normalize, root)
+  end
   if
     type(root) ~= "string"
     or root == ""
+    or root:sub(1, 1) ~= "/"
+    or root == "/"
+    or has_control(root)
+    or not normalize_ok
+    or normalized ~= root
     or type(remove) ~= "function"
     or type(lstat) ~= "function"
+    or type(getuid) ~= "function"
+  then
+    return false
+  end
+  local before_ok, before = pcall(lstat, root)
+  local uid_ok, uid = pcall(getuid)
+  if
+    not before_ok
+    or not uid_ok
+    or type(uid) ~= "number"
+    or type(before) ~= "table"
+    or before.type ~= "directory"
+    or type(before.uid) ~= "number"
+    or before.uid ~= uid
+    or type(before.mode) ~= "number"
+    or bit.band(before.mode, 511) ~= 448
   then
     return false
   end
@@ -896,10 +1179,13 @@ local function create_opencode_probe_tree()
     assert(validate_probe_inputs(tree))
   end)
   if not ok then
-    if created and not cleanup_owned_probe_tree(root, vim.fn.delete, vim.uv.fs_lstat) then
-      return nil, "managed OpenCode probe directory cleanup failed"
+    if
+      created
+      and not cleanup_owned_probe_tree(root, vim.fn.delete, vim.uv.fs_lstat, vim.uv.getuid)
+    then
+      return nil, "cleanup-failure"
     end
-    return nil, "managed OpenCode probe directory creation failed"
+    return nil, "probe-failure"
   end
   return tree
 end
@@ -947,6 +1233,76 @@ local function valid_probe_lock_metadata(bytes, filesystem)
     and hostname:match("^[%w][%w.-]*$") ~= nil
     and #created_at == 24
     and created_at:match("^%d%d%d%d%-%d%d%-%d%dT%d%d:%d%d:%d%d%.%d%d%dZ$") ~= nil
+end
+
+local function inspect_opencode_probe_lock(tree, overrides)
+  local filesystem = probe_artifact_filesystem(overrides)
+  local state = tree.state .. "/opencode"
+  local state_entries = directory_entries(state, filesystem)
+  if not state_entries then
+    return nil, "probe-lock-tree"
+  end
+  if #state_entries == 0 then
+    return { disposition = "quiescent", fingerprint = "absent" }
+  end
+  if not vim.deep_equal(state_entries, { "locks" }) then
+    return nil, "probe-lock-tree"
+  end
+
+  local lock_root = state .. "/locks"
+  local root_entries = directory_entries(lock_root, filesystem)
+  if not root_entries then
+    return nil, "probe-lock-tree"
+  end
+  if #root_entries == 0 then
+    return { disposition = "quiescent", fingerprint = "empty" }
+  end
+  if not vim.deep_equal(root_entries, { OPENCODE_PROBE_LOCK }) then
+    return nil, "probe-lock-tree"
+  end
+
+  local lock = lock_root .. "/" .. OPENCODE_PROBE_LOCK
+  local lock_entries = directory_entries(lock, filesystem)
+  if not lock_entries then
+    return nil, "probe-lock-tree"
+  end
+  local allowed = {
+    heartbeat = true,
+    ["meta.json"] = true,
+  }
+  for _, name in ipairs(lock_entries) do
+    if not allowed[name] then
+      return nil, "probe-lock-tree"
+    end
+  end
+
+  local has_heartbeat = vim.tbl_contains(lock_entries, "heartbeat")
+  local has_metadata = vim.tbl_contains(lock_entries, "meta.json")
+  if has_heartbeat then
+    local heartbeat = read_probe_file(lock .. "/heartbeat", 0, filesystem)
+    if heartbeat ~= "" then
+      return nil, "probe-heartbeat"
+    end
+  end
+  local metadata
+  if has_metadata then
+    metadata = read_probe_file(lock .. "/meta.json", 512, filesystem)
+    if not metadata or not valid_probe_lock_metadata(metadata, filesystem) then
+      return nil, "probe-lock-metadata"
+    end
+  end
+
+  if has_heartbeat and has_metadata and #lock_entries == 2 then
+    local digest = filesystem.sha256(metadata)
+    if type(digest) ~= "string" or #digest ~= 64 or digest:find("[^0-9a-f]") then
+      return nil, "probe-lock-metadata"
+    end
+    return { disposition = "quiescent", fingerprint = "full:" .. digest }
+  end
+
+  local partial = #lock_entries == 0 and "empty-directory"
+    or (has_heartbeat and "heartbeat" or "metadata")
+  return { disposition = "transient", fingerprint = "partial:" .. partial }
 end
 
 local SQLITE_U32_MODULO = 4294967296
@@ -1377,36 +1733,28 @@ local function inspect_opencode_probe_artifacts(tree, semantic, overrides)
     or not exact_probe_directory(data .. "/repos", {}, filesystem)
     or not exact_probe_directory(cache, { "bin" }, filesystem)
     or not exact_probe_directory(cache .. "/bin", {}, filesystem)
-    or not exact_probe_directory(state, semantic and { "locks" } or {}, filesystem)
   then
     return nil, "probe-artifact-tree"
   end
   if not semantic then
-    return true
+    if not exact_probe_directory(state, {}, filesystem) then
+      return nil, "probe-artifact-tree"
+    end
+    return { disposition = "quiescent", fingerprint = "nonsemantic" }
   end
-  local lock_root = state .. "/locks"
-  local lock = lock_root .. "/" .. OPENCODE_PROBE_LOCK
-  if
-    not exact_probe_directory(lock_root, { OPENCODE_PROBE_LOCK }, filesystem)
-    or not exact_probe_directory(lock, { "heartbeat", "meta.json" }, filesystem)
-  then
-    return nil, "probe-lock-tree"
+
+  local lock_snapshot, lock_error = inspect_opencode_probe_lock(tree, overrides)
+  if not lock_snapshot then
+    return nil, lock_error
   end
+
   local log = read_probe_file(data .. "/log/opencode.log", 994, filesystem)
-  local heartbeat = read_probe_file(lock .. "/heartbeat", 0, filesystem)
-  local metadata = read_probe_file(lock .. "/meta.json", 512, filesystem)
   local database = read_probe_file(data .. "/opencode.db", 4096, filesystem)
   local shared_memory = read_probe_file(data .. "/opencode.db-shm", 32768, filesystem)
   local write_ahead_log = read_probe_file(data .. "/opencode.db-wal", 259592, filesystem)
   local log_ok, log_error = valid_probe_log(log, filesystem)
   if not log_ok then
     return nil, log_error
-  end
-  if heartbeat ~= "" then
-    return nil, "probe-heartbeat"
-  end
-  if not metadata or not valid_probe_lock_metadata(metadata, filesystem) then
-    return nil, "probe-lock-metadata"
   end
   if not database or not shared_memory or not write_ahead_log then
     return nil, "probe-sqlite-file-boundary"
@@ -1416,7 +1764,106 @@ local function inspect_opencode_probe_artifacts(tree, semantic, overrides)
   if not sqlite_ok then
     return nil, sqlite_error
   end
-  return true
+  return lock_snapshot
+end
+
+local function stop_timer(timer)
+  if not timer then
+    return
+  end
+  if type(timer.stop) == "function" then
+    pcall(timer.stop, timer)
+  end
+  local closing = false
+  if type(timer.is_closing) == "function" then
+    local ok, value = pcall(timer.is_closing, timer)
+    closing = ok and value == true
+  end
+  if not closing and type(timer.close) == "function" then
+    pcall(timer.close, timer)
+  end
+end
+
+local function settle_opencode_probe_lock(tree, initial, overrides, callback)
+  local options = overrides or {}
+  local now = options.now or vim.uv.now
+  local defer = options.defer or vim.defer_fn
+  local inspect = options.inspect_lock or inspect_opencode_probe_lock
+  local started_at = now()
+  local candidate = initial.disposition == "quiescent" and initial.fingerprint or nil
+  local active = true
+  local timer
+
+  local function finish(accepted, category, snapshot)
+    if not active then
+      return
+    end
+    active = false
+    stop_timer(timer)
+    timer = nil
+    callback(accepted, category, snapshot)
+  end
+
+  local function step()
+    if not active then
+      return
+    end
+    local now_ok, current = pcall(now)
+    if not now_ok or type(current) ~= "number" or type(started_at) ~= "number" then
+      now_ok = nil
+      current = nil
+      finish(nil, "probe-lock-tree")
+      return
+    end
+    local elapsed = current - started_at
+    now_ok = nil
+    current = nil
+    if elapsed > 1000 then
+      finish(nil, "probe-lock-tree")
+      return
+    end
+    local inspect_ok, snapshot, category = pcall(inspect, tree, options.filesystem)
+    if not inspect_ok then
+      inspect_ok = nil
+      snapshot = nil
+      category = nil
+      finish(nil, "probe-lock-tree")
+      return
+    end
+    inspect_ok = nil
+    if not snapshot then
+      finish(nil, category or "probe-lock-tree")
+      return
+    end
+    if snapshot.disposition == "quiescent" then
+      if candidate == snapshot.fingerprint then
+        finish(true, nil, snapshot)
+        return
+      end
+      candidate = snapshot.fingerprint
+    else
+      candidate = nil
+    end
+    if elapsed >= 1000 then
+      finish(nil, "probe-lock-tree")
+      return
+    end
+    local defer_ok, next_timer = pcall(defer, step, 50)
+    if not defer_ok then
+      defer_ok = nil
+      next_timer = nil
+      finish(nil, "probe-lock-tree")
+      return
+    end
+    timer = next_timer
+    defer_ok = nil
+    next_timer = nil
+  end
+
+  timer = defer(step, 50)
+  return function()
+    finish(nil, "cancellation")
+  end
 end
 
 local function opencode_probe_environment()
@@ -1438,315 +1885,380 @@ local function opencode_probe_environment()
   }
 end
 
-local function opencode_compatibility(executable, overrides)
-  local options = overrides or {}
-  if options.observe_probe ~= nil and type(options.observe_probe) ~= "function" then
-    return nil, "managed OpenCode compatibility observer is invalid"
-  end
+local function start_opencode_probe(identity, command, on_complete, overrides)
+  local options = type(overrides) == "table" and overrides or {}
   local revalidate = options.revalidate or require("ai.tools").revalidate
   local stat = options.stat or vim.uv.fs_lstat
-  local canonical, canonical_error = canonical_path(executable, "OpenCode executable", false)
-  if not canonical then
-    return nil, canonical_error
-  end
-  local valid_ok, valid = pcall(revalidate, canonical)
-  if not valid_ok or not valid then
-    return nil, "managed OpenCode executable validation failed"
-  end
-  local before = executable_metadata(stat(canonical))
-  if not before then
-    return nil, "managed OpenCode executable metadata is invalid"
-  end
-  local cached = OPENCODE_COMPATIBILITY_CACHE[canonical]
-  if cached and cached.metadata == before then
-    return vim.deepcopy(cached.report)
-  end
+  local create_tree = options.create_tree or create_opencode_probe_tree
+  local cleanup_tree = options.cleanup_tree or cleanup_owned_probe_tree
+  local inspect_artifacts = options.inspect_artifacts or inspect_opencode_probe_artifacts
+  local settle_lock = options.settle_lock or settle_opencode_probe_lock
+  local schedule = options.schedule or vim.schedule
+  local observe = options.observe_probe
+  local delete = options.delete or vim.fn.delete
+  local lstat = options.lstat or vim.uv.fs_lstat
+  local getuid = options.getuid or vim.uv.getuid
+  local now = options.now or vim.uv.now
+  local finished = false
+  local cancellation_requested = false
+  local cancel_settle
+  local runner
+  local tree
+  local owned_root
+  local public = {}
 
-  local function run(name, arguments)
-    local check_ok, check = pcall(revalidate, canonical)
-    if not check_ok or not check then
-      return nil
-    end
-    local tree
-    local owns_tree = false
-    if options.probe then
-      tree = options.tree
-        or {
-          home = "/tmp/nvim-ai-opencode-probe-home",
-          config = "/tmp/nvim-ai-opencode-probe-config",
-          data = "/tmp/nvim-ai-opencode-probe-data",
-          cache = "/tmp/nvim-ai-opencode-probe-cache",
-          state = "/tmp/nvim-ai-opencode-probe-state",
-        }
-    else
-      local tree_error
-      tree, tree_error = create_opencode_probe_tree()
-      if not tree then
-        return nil
-      end
-      owns_tree = true
-    end
-    local probe_options = {
-      environment = opencode_probe_environment(),
-      working_directory = "/tmp/nvim-ai-probe",
-      read_only_mounts = {
-        { source = tree.home, destination = "/tmp/nvim-ai-probe/home" },
-        { source = tree.config, destination = "/tmp/nvim-ai-probe/xdg-config" },
-      },
-      writable_mounts = {
-        { source = tree.data, destination = "/tmp/nvim-ai-probe/xdg-data" },
-        { source = tree.cache, destination = "/tmp/nvim-ai-probe/xdg-cache" },
-        { source = tree.state, destination = "/tmp/nvim-ai-probe/xdg-state" },
-      },
-    }
-    local ok, result
-    local artifact_accepted = false
-    local artifact_category = "unavailable"
-    if options.probe then
-      ok, result =
-        pcall(options.probe, canonical, vim.deepcopy(arguments), vim.deepcopy(probe_options))
-      if options.inspect_artifacts ~= nil then
-        local inspection_ok, accepted =
-          pcall(options.inspect_artifacts, name, vim.deepcopy(tree), result)
-        artifact_accepted = inspection_ok and accepted == true
-        artifact_category = artifact_accepted and "injected-accepted" or "injected-rejected"
-        if not inspection_ok or accepted ~= true then
-          ok = false
-          result = nil
-        end
-      else
-        artifact_accepted = true
-        artifact_category = "injected-not-inspected"
-      end
-    else
-      probe_options.inspect_artifacts = function()
-        local semantic = name ~= "version"
-          and name ~= "root_help"
-          and name ~= "serve_help"
-          and name ~= "attach_help"
-        local accepted, category = inspect_opencode_probe_artifacts(tree, semantic)
-        artifact_accepted = accepted == true
-        artifact_category = artifact_accepted and "accepted"
-          or safe_probe_artifact_category(category)
-        return accepted
-      end
-      ok, result = pcall(read_only_probe, canonical, arguments, probe_options)
-    end
-    if options.observe_probe then
-      local observation = {
-        artifact_accepted = artifact_accepted,
-        artifact_category = safe_probe_artifact_category(artifact_category),
-        code = type(result) == "table" and result.code or nil,
-        signal = type(result) == "table" and result.signal or nil,
-        stdout_bytes = type(result) == "table"
-            and type(result.stdout) == "string"
-            and #result.stdout
-          or nil,
-        stderr_bytes = type(result) == "table"
-            and type(result.stderr) == "string"
-            and #result.stderr
-          or nil,
-        stdout_overflow = type(result) == "table" and result.stdout_overflow == true,
-        stderr_overflow = type(result) == "table" and result.stderr_overflow == true,
-        system_error = type(result) == "table" and result.system_error == true,
-      }
-      pcall(options.observe_probe, name, vim.deepcopy(tree), observation)
-    end
-    local cleanup_ok = not owns_tree
-      or cleanup_owned_probe_tree(tree.root, vim.fn.delete, vim.uv.fs_lstat)
-    if
-      not ok
-      or not cleanup_ok
-      or not valid_probe_result(result)
-      or result.code == 125
-      or result.stdout_overflow
-      or result.stderr_overflow
-      or result.system_error
-      or #result.stdout > MAX_COMPATIBILITY_REPORT_BYTES
-      or #result.stderr > MAX_HELP_BYTES
-    then
-      return nil
-    end
-    return result
-  end
-
-  local commands = {
-    version = { "--version" },
-    root_help = { "--help" },
-    serve_help = { "serve", "--help" },
-    attach_help = { "attach", "--help" },
-    names = { "--pure", "agent", "list" },
-    build = { "--pure", "debug", "agent", "build" },
-    plan = { "--pure", "debug", "agent", "plan" },
-    compaction = { "--pure", "debug", "agent", "compaction" },
-    summary = { "--pure", "debug", "agent", "summary" },
-    title = { "--pure", "debug", "agent", "title" },
-    general = { "--pure", "debug", "agent", "general" },
-    explore = { "--pure", "debug", "agent", "explore" },
-  }
-  local order = {
-    "version",
-    "root_help",
-    "serve_help",
-    "attach_help",
-    "names",
-    "build",
-    "plan",
-    "compaction",
-    "summary",
-    "title",
-    "general",
-    "explore",
-  }
-  local results = {}
-  for _, name in ipairs(order) do
-    results[name] = run(name, commands[name])
-    if not results[name] then
-      return nil, "managed OpenCode compatibility probe failed"
-    end
-  end
-
-  local forbidden_evidence = {
-    "installing configuration dependenc",
-    "downloading plugin",
-    "loading plugin",
-    "checking for update",
-    "downloading lsp",
-    "network request",
-  }
-  for _, name in ipairs(order) do
-    local output = (results[name].stdout .. "\n" .. results[name].stderr):lower()
-    for _, evidence in ipairs(forbidden_evidence) do
-      if output:find(evidence, 1, true) then
-        return nil, "managed OpenCode probe observed forbidden side-effect evidence"
-      end
-    end
-  end
-
-  local version = results.version
   if
-    version.code ~= 0
-    or version.stderr ~= ""
-    or (version.stdout ~= "1.18.18" and version.stdout ~= "1.18.18\n")
+    type(overrides) ~= "nil" and type(overrides) ~= "table"
+    or type(identity) ~= "table"
+    or identity.installed ~= true
+    or type(identity.executable) ~= "string"
+    or canonical_path(identity.executable, "OpenCode executable", false) ~= identity.executable
+    or type(identity.metadata) ~= "string"
+    or identity.metadata == ""
+    or has_control(identity.metadata)
+    or type(command) ~= "table"
+    or type(command.name) ~= "string"
+    or type(command.arguments) ~= "table"
+    or type(command.semantic) ~= "boolean"
+    or type(on_complete) ~= "function"
+    or (observe ~= nil and type(observe) ~= "function")
   then
-    return nil, "managed OpenCode exact version probe failed"
+    return nil, "probe-failure"
+  end
+  local expected_command
+  for _, expected in ipairs(require("ai.backends.opencode_validation").commands()) do
+    if expected.name == command.name then
+      expected_command = expected
+      break
+    end
+  end
+  if not expected_command or not vim.deep_equal(command, expected_command) then
+    return nil, "probe-failure"
+  end
+  local clock_ok, started_at = pcall(now)
+  if not clock_ok or type(started_at) ~= "number" then
+    return nil, "probe-failure"
   end
 
-  local help_requirements = {
-    root_help = { "--pure", "serve", "attach" },
-    serve_help = { "--hostname", "--port" },
-    attach_help = { "--dir", "--session", "OPENCODE_SERVER_PASSWORD" },
+  local valid_ok, valid = pcall(revalidate, identity.executable)
+  local stat_ok, current_stat = pcall(stat, identity.executable)
+  local current_metadata = stat_ok and executable_metadata(current_stat) or nil
+  current_stat = nil
+  valid = valid == true
+  if not valid_ok or not valid or not stat_ok or current_metadata ~= identity.metadata then
+    return nil, "executable-drift"
+  end
+  local tree_ok, created_tree, create_error = pcall(create_tree)
+  tree = tree_ok and created_tree or nil
+  created_tree = nil
+  if not tree then
+    return nil,
+      tree_ok and create_error == "cleanup-failure" and "cleanup-failure" or "probe-failure"
+  end
+  create_error = nil
+  if type(tree) ~= "table" then
+    return nil, "cleanup-failure"
+  end
+  local exact_children = {
+    home = "/home",
+    config = "/xdg-config",
+    config_opencode = "/xdg-config/opencode",
+    bootstrap = "/xdg-config/opencode/.gitignore",
+    data = "/xdg-data",
+    cache = "/xdg-cache",
+    state = "/xdg-state",
   }
-  for name, requirements in pairs(help_requirements) do
-    local result = results[name]
-    if result.code ~= 0 or result.stdout ~= "" or result.stderr == "" then
-      return nil, "managed OpenCode command compatibility probe failed"
-    end
-    if #result.stderr > MAX_HELP_BYTES then
-      return nil, "managed OpenCode command compatibility probe failed"
-    end
-    for _, requirement in ipairs(requirements) do
-      if not result.stderr:find(requirement, 1, true) then
-        return nil, "managed OpenCode command compatibility probe failed"
-      end
-    end
+  local tree_keys = vim.tbl_keys(tree)
+  table.sort(tree_keys)
+  local normalize_ok, normalized_root = false, nil
+  if type(tree.root) == "string" then
+    normalize_ok, normalized_root = pcall(vim.fs.normalize, tree.root)
   end
-
-  local names_result = results.names
   if
-    names_result.code ~= 0
-    or names_result.stderr ~= ""
-    or #names_result.stdout > MAX_HELP_BYTES
+    not vim.deep_equal(tree_keys, {
+      "bootstrap",
+      "cache",
+      "config",
+      "config_opencode",
+      "data",
+      "home",
+      "root",
+      "state",
+    })
+    or type(tree.root) ~= "string"
+    or tree.root:sub(1, 1) ~= "/"
+    or tree.root == "/"
+    or has_control(tree.root)
+    or not normalize_ok
+    or normalized_root ~= tree.root
   then
-    return nil, "managed OpenCode agent-list probe failed"
+    return nil, "cleanup-failure"
   end
-  local names = {}
-  local seen = {}
-  for line in (names_result.stdout:gsub("\r\n", "\n") .. "\n"):gmatch("(.-)\n") do
-    local name = line:match("^([%w_-]+) %([%w_-]+%)$")
-    if name then
-      if seen[name] then
-        return nil, "managed OpenCode agent-list probe failed"
-      end
-      seen[name] = true
-      names[#names + 1] = name
-    end
+  local root_private_ok, root_private = pcall(private_directory, tree.root, lstat, getuid)
+  if not root_private_ok or root_private ~= true then
+    return nil, "cleanup-failure"
   end
-  table.sort(names)
-
-  local agents = {}
-  for _, name in ipairs({ "build", "plan", "compaction", "summary", "title" }) do
-    local result = results[name]
-    if
-      result.code ~= 0
-      or result.stderr ~= ""
-      or #result.stdout > MAX_COMPATIBILITY_REPORT_BYTES
-    then
-      return nil, "managed OpenCode agent probe failed"
-    end
-    local decoded_ok, decoded = pcall(vim.json.decode, result.stdout)
-    if not decoded_ok or type(decoded) ~= "table" then
-      return nil, "managed OpenCode agent probe failed"
-    end
-    if name == "build" or name == "plan" then
-      if not vim.deep_equal(decoded.tools, OPENCODE_PRIMARY_TOOLS) then
-        return nil, "managed OpenCode primary-agent tool probe failed"
-      end
-      agents[name] = {
-        native = decoded.native,
-        mode = decoded.mode,
-        tools = {},
-        permission = decoded.permission,
-      }
-    else
-      agents[name] = {
-        native = decoded.native,
-        hidden = decoded.hidden,
-        tools = decoded.tools,
-        permission = decoded.permission,
-      }
-    end
-  end
-  for _, name in ipairs({ "general", "explore" }) do
-    local result = results[name]
-    local expected = "Agent "
-      .. name
-      .. " not found, run 'opencode agent list' to get an agent list"
-    local output = result.stderr ~= "" and result.stderr or result.stdout
-    if
-      result.code == 0
-      or (result.stderr ~= "" and result.stdout ~= "")
-      or (output ~= expected and output ~= expected .. "\n")
-    then
-      return nil, "managed OpenCode disabled-agent probe failed"
+  owned_root = tree.root
+  for field, suffix in pairs(exact_children) do
+    if tree[field] ~= owned_root .. suffix then
+      return nil, "cleanup-failure"
     end
   end
 
-  local report = {
-    version = "1.18.18",
-    help = {
-      root = { "--pure", "serve", "attach" },
-      serve = { "--hostname", "--port" },
-      attach = { "--dir", "--session", "OPENCODE_SERVER_PASSWORD" },
+  local function clean_tree()
+    if tree.root ~= owned_root then
+      return false
+    end
+    local ok, cleaned = pcall(cleanup_tree, owned_root, delete, lstat, getuid)
+    return ok and cleaned == true
+  end
+
+  local probe_options = {
+    resolve = options.resolve or require("ai.tools").resolve,
+    revalidate = revalidate,
+    lstat = lstat,
+    getuid = getuid,
+    environment = opencode_probe_environment(),
+    working_directory = "/tmp/nvim-ai-probe",
+    read_only_mounts = {
+      { source = tree.home, destination = "/tmp/nvim-ai-probe/home" },
+      { source = tree.config, destination = "/tmp/nvim-ai-probe/xdg-config" },
     },
-    names = names,
-    agents = agents,
+    writable_mounts = {
+      { source = tree.data, destination = "/tmp/nvim-ai-probe/xdg-data" },
+      { source = tree.cache, destination = "/tmp/nvim-ai-probe/xdg-cache" },
+      { source = tree.state, destination = "/tmp/nvim-ai-probe/xdg-state" },
+    },
   }
-  local managed = require("ai.backends.opencode_managed")
-  local compatible = managed.validate_compatibility(report)
-  if not compatible then
-    return nil, "managed OpenCode compatibility validation failed"
+
+  local invocation_ok, invocation =
+    pcall(prepare_read_only_probe, identity.executable, command.arguments, probe_options, 5000)
+  if not invocation_ok or type(invocation) ~= "table" then
+    invocation = nil
+    local cleaned = clean_tree()
+    return nil, cleaned and "probe-failure" or "cleanup-failure"
   end
-  local final_ok, final_valid = pcall(revalidate, canonical)
-  local after = executable_metadata(stat(canonical))
-  if not final_ok or not final_valid or after ~= before then
-    return nil, "managed OpenCode executable changed during compatibility validation"
+
+  local function exit_proven(result)
+    return type(result) == "table"
+      and (result.process_started ~= true or result.process_exited == true)
   end
-  OPENCODE_COMPATIBILITY_CACHE[canonical] = {
-    metadata = before,
-    report = vim.deepcopy(report),
-  }
-  return report
+
+  local function safe_observe(result, accepted, category)
+    if type(observe) ~= "function" or not exit_proven(result) then
+      return
+    end
+    local tree_copy = {
+      root = owned_root,
+      home = owned_root .. "/home",
+      config = owned_root .. "/xdg-config",
+      config_opencode = owned_root .. "/xdg-config/opencode",
+      bootstrap = owned_root .. "/xdg-config/opencode/.gitignore",
+      data = owned_root .. "/xdg-data",
+      cache = owned_root .. "/xdg-cache",
+      state = owned_root .. "/xdg-state",
+    }
+    local category_ok, safe_category = pcall(safe_probe_artifact_category, category)
+    if not category_ok then
+      return
+    end
+    local finished_ok, finished_at = pcall(now)
+    local duration = finished_ok
+        and type(finished_at) == "number"
+        and math.max(0, math.min(10000, finished_at - started_at))
+      or nil
+    pcall(observe, command.name, tree_copy, {
+      artifact_accepted = accepted == true,
+      artifact_category = safe_category,
+      code = type(result.code) == "number" and result.code or nil,
+      signal = type(result.signal) == "number" and result.signal or nil,
+      stdout_bytes = type(result.stdout) == "string" and #result.stdout or nil,
+      stderr_bytes = type(result.stderr) == "string" and #result.stderr or nil,
+      stdout_overflow = result.stdout_overflow == true,
+      stderr_overflow = result.stderr_overflow == true,
+      system_error = result.system_error == true,
+      duration_ms = duration,
+    })
+  end
+
+  local function result_category(
+    result,
+    artifacts_accepted,
+    artifact_category,
+    cleaned,
+    runner_cause
+  )
+    if not exit_proven(result) then
+      return "cleanup-failure"
+    end
+    if not cleaned then
+      return "cleanup-failure"
+    end
+    local cause = ({
+      ["probe-failure"] = true,
+      timeout = true,
+      ["output-overflow"] = true,
+      cancellation = true,
+    })[runner_cause] and runner_cause or nil
+    if not cause then
+      if cancellation_requested or artifact_category == "cancellation" then
+        cause = "cancellation"
+      elseif result.code == 124 then
+        cause = "timeout"
+      elseif result.stdout_overflow or result.stderr_overflow then
+        cause = "output-overflow"
+      elseif result.system_error or not valid_probe_result(result) then
+        cause = "probe-failure"
+      end
+    end
+    if cause then
+      return cause
+    end
+    if not artifacts_accepted then
+      return "artifact-rejection"
+    end
+    return ""
+  end
+
+  local function finalize(result, artifacts_accepted, artifact_category, runner_cause)
+    if finished then
+      return
+    end
+    finished = true
+    local proven = exit_proven(result)
+    if proven then
+      safe_observe(result, artifacts_accepted, artifact_category)
+    end
+    local cleaned = proven and clean_tree() or false
+    local category =
+      result_category(result, artifacts_accepted, artifact_category, cleaned, runner_cause)
+    pcall(on_complete, category == "" and result or nil, category)
+  end
+
+  local function after_process(result, runner_cause)
+    if finished then
+      return
+    end
+    if not exit_proven(result) then
+      finalize(result, false, "process-exit-unproven", runner_cause)
+      return
+    end
+    local inspect_ok, initial, artifact_category = pcall(inspect_artifacts, tree, command.semantic)
+    if not inspect_ok or not initial then
+      initial = nil
+      finalize(result, false, artifact_category or "probe-artifact-tree", runner_cause)
+      return
+    end
+    if not command.semantic then
+      initial = nil
+      finalize(result, true, "accepted", runner_cause)
+      return
+    end
+    local settle_ok, settle_cancel = pcall(settle_lock, tree, initial, {
+      now = now,
+      defer = options.defer or vim.defer_fn,
+      filesystem = options.filesystem,
+      inspect_lock = options.inspect_lock,
+    }, function(accepted, category)
+      cancel_settle = nil
+      finalize(result, accepted == true, category or "accepted", runner_cause)
+    end)
+    initial = nil
+    if finished then
+      return
+    end
+    if not settle_ok or type(settle_cancel) ~= "function" then
+      settle_cancel = nil
+      finalize(result, false, "probe-lock-tree", runner_cause)
+      return
+    end
+    cancel_settle = settle_cancel
+  end
+
+  runner = bounded_system_async(
+    invocation.argv,
+    invocation.options,
+    { stdout = MAX_COMPATIBILITY_REPORT_BYTES, stderr = MAX_HELP_BYTES },
+    after_process,
+    { system = options.system, schedule = schedule }
+  )
+  invocation = nil
+
+  function public:cancel(reason)
+    cancellation_requested = true
+    if cancel_settle then
+      local cancel = cancel_settle
+      cancel_settle = nil
+      pcall(cancel)
+    end
+    if runner then
+      pcall(runner.cancel, runner, reason)
+    end
+  end
+
+  function public:shutdown_drain(timeout_ms)
+    cancellation_requested = true
+    if runner then
+      pcall(runner.cancel, runner, "shutdown")
+    end
+    local ok, exited, result = pcall(runner.shutdown_drain, runner, timeout_ms)
+    if not ok or exited ~= true then
+      result = nil
+      return false
+    end
+    if cancel_settle then
+      local cancel = cancel_settle
+      cancel_settle = nil
+      pcall(cancel)
+    end
+    if not finished then
+      local inspect_ok, inspected = pcall(inspect_artifacts, tree, command.semantic)
+      local accepted = inspect_ok and inspected ~= nil
+      safe_observe(result, accepted, accepted and "shutdown" or "artifact-rejection")
+      local cleaned = clean_tree()
+      finished = true
+      return cleaned == true
+    end
+    return true
+  end
+
+  return public
+end
+
+local function new_opencode_validation(overrides)
+  local options = type(overrides) == "table" and overrides or {}
+  local tools = require("ai.tools")
+  local function identify()
+    local executable = options.executable or tools.resolve("opencode")
+    if not executable then
+      return { installed = false, executable = "", metadata = "" }
+    end
+    local canonical = canonical_path(executable, "OpenCode executable", false)
+    local valid_ok, valid = false, nil
+    local stat_ok, current_stat = false, nil
+    if canonical then
+      valid_ok, valid = pcall(options.revalidate or tools.revalidate, canonical)
+      stat_ok, current_stat = pcall(options.stat or vim.uv.fs_lstat, canonical)
+    end
+    local metadata = stat_ok and executable_metadata(current_stat) or nil
+    current_stat = nil
+    if not canonical or not valid_ok or valid ~= true or not metadata then
+      return { installed = false, executable = "", metadata = "" }
+    end
+    return { installed = true, executable = canonical, metadata = metadata }
+  end
+
+  return require("ai.backends.opencode_validation").new({
+    identify = identify,
+    start_probe = function(identity, command, complete)
+      return start_opencode_probe(identity, command, complete, options)
+    end,
+    now = options.now or vim.uv.now,
+    defer = options.defer or vim.defer_fn,
+    schedule = options.schedule or vim.schedule,
+    notify = options.notify or vim.notify,
+    warn_level = options.warn_level or vim.log.levels.WARN,
+  })
 end
 
 local PROFILE_HELPER_REQUEST_KEYS = {
@@ -1988,7 +2500,6 @@ local function runtime_dependencies()
     help = function(_, executable, arguments)
       return read_only_probe(executable, arguments)
     end,
-    opencode_compatibility = opencode_compatibility,
     opencode_paths = runtime_opencode_paths,
     opencode_auth_path = function()
       local paths, paths_error = runtime_opencode_paths()
@@ -2083,6 +2594,20 @@ local function runtime_dependencies()
     stat = vim.uv.fs_lstat,
     uid = vim.uv.getuid,
   }
+end
+
+local function opencode_identity(services, deps)
+  local executable = services.resolve_executable("opencode")
+  if not executable then
+    return { installed = false, executable = "", metadata = "" }
+  end
+  local stat_ok, current_stat = pcall(deps.stat, executable)
+  local metadata = stat_ok and executable_metadata(current_stat) or nil
+  current_stat = nil
+  if not metadata then
+    return { installed = false, executable = "", metadata = "" }
+  end
+  return { installed = true, executable = executable, metadata = metadata }
 end
 
 local function new(deps)
@@ -2383,12 +2908,66 @@ local function new(deps)
     return ""
   end
 
+  local opencode_controller
+  local shutdown_called = false
+  local shutdown_result = true
+
+  local function idle_opencode_compatibility()
+    return {
+      state = "not_checked",
+      installed = false,
+      executable = "",
+      version = "",
+      category = "",
+      queued = false,
+    }
+  end
+
+  local function opencode_validation_controller()
+    if opencode_controller then
+      return opencode_controller
+    end
+    if deps.opencode_validation ~= nil then
+      opencode_controller = deps.opencode_validation
+      return opencode_controller
+    end
+    opencode_controller = require("ai.backends.opencode_validation").new({
+      identify = function()
+        return opencode_identity(services, deps)
+      end,
+      start_probe = function(identity, command, complete)
+        local starter = type(deps.start_opencode_probe) == "function" and deps.start_opencode_probe
+          or start_opencode_probe
+        return starter(identity, command, complete)
+      end,
+      now = deps.now or vim.uv.now,
+      defer = deps.defer or vim.defer_fn,
+      schedule = deps.schedule or vim.schedule,
+      notify = deps.notify or vim.notify,
+      warn_level = deps.warn_level or vim.log.levels.WARN,
+    })
+    return opencode_controller
+  end
+
+  services.opencode_compatibility_snapshot = function()
+    if shutdown_called then
+      return idle_opencode_compatibility()
+    end
+    return opencode_validation_controller():snapshot()
+  end
+  services.opencode_compatibility_report = function()
+    if shutdown_called then
+      return nil
+    end
+    return opencode_validation_controller():report()
+  end
+
   local adapters = {
     codex = require("ai.backends.codex").new(services),
     claude = require("ai.backends.claude").new(services),
     opencode = require("ai.backends.opencode").new(services),
   }
-  return {
+  local registry = {
     names = function()
       return vim.deepcopy(BACKEND_NAMES)
     end,
@@ -2410,6 +2989,57 @@ local function new(deps)
       return adapter:health()
     end,
   }
+
+  function registry:opencode_compatibility()
+    if shutdown_called then
+      return idle_opencode_compatibility()
+    end
+    return opencode_validation_controller():snapshot()
+  end
+
+  function registry:ensure_opencode_compatibility(request)
+    if shutdown_called then
+      return nil, "managed OpenCode compatibility request is invalid"
+    end
+    return opencode_validation_controller():ensure(request)
+  end
+
+  function registry:take_opencode_open(identity_key)
+    if shutdown_called then
+      return false
+    end
+    return opencode_validation_controller():take_open(identity_key)
+  end
+
+  function registry:cancel_opencode_compatibility(reason)
+    if shutdown_called then
+      return nil
+    end
+    return opencode_validation_controller():cancel(reason)
+  end
+
+  function registry:subscribe_opencode_compatibility(callback)
+    if shutdown_called then
+      return nil, "managed OpenCode compatibility observer is unavailable"
+    end
+    return opencode_validation_controller():subscribe(callback)
+  end
+
+  function registry:shutdown(exit_committed)
+    assert(type(exit_committed) == "boolean", "shutdown phase must be explicit")
+    if shutdown_called then
+      return shutdown_result
+    end
+    shutdown_called = true
+    if not opencode_controller then
+      return true
+    end
+    local ok, result = pcall(opencode_controller.shutdown, opencode_controller, exit_committed)
+    shutdown_result = ok and result == true
+    return shutdown_result
+  end
+
+  return registry
 end
 
 local runtime
@@ -2433,19 +3063,50 @@ function M.health(name)
   return runtime_registry():health(name)
 end
 
+function M.opencode_compatibility()
+  return runtime_registry():opencode_compatibility()
+end
+
+function M.ensure_opencode_compatibility(request)
+  return runtime_registry():ensure_opencode_compatibility(request)
+end
+
+function M.take_opencode_open(identity_key)
+  return runtime_registry():take_opencode_open(identity_key)
+end
+
+function M.cancel_opencode_compatibility(reason)
+  return runtime_registry():cancel_opencode_compatibility(reason)
+end
+
+function M.subscribe_opencode_compatibility(callback)
+  return runtime_registry():subscribe_opencode_compatibility(callback)
+end
+
+function M.shutdown(exit_committed)
+  assert(type(exit_committed) == "boolean", "shutdown phase must be explicit")
+  if not runtime then
+    return true
+  end
+  local current = runtime
+  runtime = nil
+  return current:shutdown(exit_committed)
+end
+
 M._test = {
   auth_arguments = auth_arguments,
   bounded_system = bounded_system,
+  bounded_system_async = bounded_system_async,
   cleanup_owned_probe_tree = cleanup_owned_probe_tree,
   create_opencode_probe_tree = create_opencode_probe_tree,
+  inspect_opencode_probe_lock = inspect_opencode_probe_lock,
   inspect_opencode_probe_artifacts = inspect_opencode_probe_artifacts,
   invoke_profile_helper = invoke_profile_helper,
   new = new,
-  opencode_compatibility = opencode_compatibility,
+  new_opencode_validation = new_opencode_validation,
   read_only_probe = read_only_probe,
-  reset_opencode_compatibility_cache = function()
-    OPENCODE_COMPATIBILITY_CACHE = {}
-  end,
+  settle_opencode_probe_lock = settle_opencode_probe_lock,
+  start_opencode_probe = start_opencode_probe,
   uuid = uuid_v4,
 }
 

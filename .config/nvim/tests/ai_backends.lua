@@ -93,16 +93,65 @@ local prepared_profile = {
   credential_count = 1,
 }
 local compatibility_report = managed._test.compatibility_fixture()
+local compatibility_state = {
+  snapshot = {
+    state = "ready",
+    installed = true,
+    executable = "/usr/bin/opencode",
+    version = "1.18.18",
+    category = "",
+    queued = false,
+  },
+  report = vim.deepcopy(compatibility_report),
+  ensures = {},
+  cancels = {},
+  subscriptions = {},
+  shutdowns = {},
+  snapshot_calls = 0,
+  report_calls = 0,
+}
+local fake_validation = {
+  snapshot = function()
+    compatibility_state.snapshot_calls = compatibility_state.snapshot_calls + 1
+    return vim.deepcopy(compatibility_state.snapshot)
+  end,
+  report = function()
+    compatibility_state.report_calls = compatibility_state.report_calls + 1
+    return vim.deepcopy(compatibility_state.report)
+  end,
+  ensure = function(_, request)
+    compatibility_state.ensures[#compatibility_state.ensures + 1] = vim.deepcopy(request)
+    return vim.deepcopy(compatibility_state.snapshot)
+  end,
+  take_open = function(_, identity_key)
+    compatibility_state.take_open = identity_key
+    return false
+  end,
+  cancel = function(_, reason)
+    compatibility_state.cancels[#compatibility_state.cancels + 1] = reason
+  end,
+  subscribe = function(_, callback)
+    compatibility_state.subscriptions[#compatibility_state.subscriptions + 1] = callback
+    return function() end
+  end,
+  shutdown = function(_, exit_committed)
+    assert(type(exit_committed) == "boolean", "fake shutdown phase")
+    compatibility_state.shutdowns[#compatibility_state.shutdowns + 1] = exit_committed
+    return true
+  end,
+}
 local calls = {
   executable = {},
   revalidate = {},
   version = {},
   auth = {},
   help = {},
-  compatibility = {},
   inspect_auth = {},
   prepare = {},
   inspect_profile = {},
+  port = 0,
+  password = 0,
+  profile_token = 0,
 }
 local registry = registry_module._test.new({
   executable = function(name)
@@ -140,12 +189,15 @@ local registry = registry_module._test.new({
     return "11111111-1111-4111-8111-111111111111"
   end,
   port = function()
+    calls.port = calls.port + 1
     return 43123
   end,
   password = function()
+    calls.password = calls.password + 1
     return "0123456789abcdef0123456789abcdef"
   end,
   profile_token = function()
+    calls.profile_token = calls.profile_token + 1
     return profile_token
   end,
   prepare_opencode_profile = function(request)
@@ -163,10 +215,7 @@ local registry = registry_module._test.new({
   opencode_auth_path = function()
     return "/home/user/.local/share/opencode/auth.json"
   end,
-  opencode_compatibility = function(executable)
-    calls.compatibility[#calls.compatibility + 1] = executable
-    return vim.deepcopy(compatibility_report)
-  end,
+  opencode_validation = fake_validation,
   stat = function(path)
     if directories[path] then
       return { type = "directory", mode = 448, uid = 1000 }
@@ -281,6 +330,123 @@ contains(invalid_claude_error, "session", "Claude session error")
 
 paths.backend_state = "/state/identity/backends/opencode"
 local opencode = assert(registry:get("opencode"))
+local ready_compatibility_snapshot = vim.deepcopy(compatibility_state.snapshot)
+local function launch_side_effect_counts()
+  return {
+    prepare = #calls.prepare,
+    inspect_profile = #calls.inspect_profile,
+    port = calls.port,
+    password = calls.password,
+    profile_token = calls.profile_token,
+  }
+end
+
+for _, case in ipairs({
+  {
+    label = "not checked",
+    snapshot = {
+      state = "not_checked",
+      installed = true,
+      executable = "/usr/bin/opencode",
+      version = "",
+      category = "",
+      queued = false,
+    },
+    report = compatibility_report,
+  },
+  {
+    label = "checking",
+    snapshot = {
+      state = "checking",
+      installed = true,
+      executable = "/usr/bin/opencode",
+      version = "",
+      category = "",
+      queued = true,
+    },
+    report = compatibility_report,
+  },
+  {
+    label = "failed",
+    snapshot = {
+      state = "failed",
+      installed = true,
+      executable = "/usr/bin/opencode",
+      version = "",
+      category = "timeout",
+      queued = false,
+    },
+    report = compatibility_report,
+  },
+  {
+    label = "malformed snapshot",
+    snapshot = { state = "ready", private = "snapshot-secret-canary" },
+    report = compatibility_report,
+  },
+  {
+    label = "stale executable",
+    snapshot = {
+      state = "ready",
+      installed = true,
+      executable = "/usr/bin/stale-opencode",
+      version = "1.18.18",
+      category = "",
+      queued = false,
+    },
+    report = compatibility_report,
+  },
+  {
+    label = "missing report",
+    snapshot = ready_compatibility_snapshot,
+    report = false,
+  },
+  {
+    label = "invalid report",
+    snapshot = ready_compatibility_snapshot,
+    report = vim.tbl_extend("force", vim.deepcopy(compatibility_report), { version = "1.18.19" }),
+  },
+}) do
+  compatibility_state.snapshot = vim.deepcopy(case.snapshot)
+  compatibility_state.report = case.report == false and nil or vim.deepcopy(case.report)
+  local before = launch_side_effect_counts()
+  local launch, launch_error = opencode:new_session(identity, paths)
+  eq(launch, nil, case.label .. " launch is refused")
+  eq(
+    launch_error,
+    "managed OpenCode compatibility is not ready",
+    case.label .. " launch diagnostic"
+  )
+  eq(launch_side_effect_counts(), before, case.label .. " starts no launch preparation")
+end
+
+compatibility_state.snapshot = {
+  state = "checking",
+  installed = true,
+  executable = "/usr/bin/opencode",
+  version = "",
+  category = "",
+  queued = true,
+}
+compatibility_state.report = vim.deepcopy(compatibility_report)
+local blocked_resume_paths = vim.deepcopy(paths)
+blocked_resume_paths.opencode_profile = {
+  token = profile_token,
+  fingerprint = profile_fingerprint,
+  version = "1.18.18",
+}
+local blocked_resume_before = launch_side_effect_counts()
+local blocked_resume, blocked_resume_error =
+  opencode:resume_session(identity, blocked_resume_paths, "ses_test123")
+eq(blocked_resume, nil, "checking resume is refused")
+eq(
+  blocked_resume_error,
+  "managed OpenCode compatibility is not ready",
+  "checking resume diagnostic"
+)
+eq(launch_side_effect_counts(), blocked_resume_before, "checking resume inspects no profile")
+
+compatibility_state.snapshot = vim.deepcopy(ready_compatibility_snapshot)
+compatibility_state.report = vim.deepcopy(compatibility_report)
 local opencode_launch = assert(opencode:new_session(identity, paths))
 eq(opencode_launch.kind, "server_attach", "OpenCode launch kind")
 eq(opencode_launch.server_argv, {
@@ -484,6 +650,9 @@ for _, name in ipairs(registry_module.names()) do
   eq(health.auth, "authenticated", name .. " authentication")
   assert(type(health.capabilities) == "table", name .. " capabilities")
   eq(health.error, "", name .. " health error")
+  if name == "opencode" then
+    eq(health.compatibility, "ready", "OpenCode ready compatibility state")
+  end
 end
 assert(#calls.revalidate > before_health_revalidations, "health revalidates executables")
 eq(calls.help, {
@@ -491,12 +660,137 @@ eq(calls.help, {
   { "codex", "/usr/bin/codex", { "resume", "--help" } },
   { "claude", "/usr/bin/claude", { "--help" } },
 }, "exact compatibility help probes")
-eq(calls.compatibility, { "/usr/bin/opencode" }, "OpenCode uses the semantic compatibility probe")
 eq(
   calls.inspect_auth,
   { "/home/user/.local/share/opencode/auth.json" },
   "OpenCode health inspects only the approved global auth file"
 )
+eq(compatibility_state.ensures, {}, "health never starts validation")
+
+local auth_reads_before_passive_health = #calls.inspect_auth
+for _, case in ipairs({
+  {
+    state = "not_checked",
+    category = "",
+    queued = false,
+    error = "managed OpenCode compatibility not checked",
+  },
+  {
+    state = "checking",
+    category = "",
+    queued = true,
+    error = "managed OpenCode compatibility checking",
+  },
+  {
+    state = "failed",
+    category = "timeout",
+    queued = false,
+    error = "managed OpenCode compatibility failed: timeout",
+  },
+}) do
+  compatibility_state.snapshot = {
+    state = case.state,
+    installed = true,
+    executable = "/usr/bin/opencode",
+    version = "",
+    category = case.category,
+    queued = case.queued,
+  }
+  local report_calls = compatibility_state.report_calls
+  local health = registry:health("opencode")
+  eq(health.compatibility, case.state, case.state .. " health state")
+  eq(health.version, "", case.state .. " health has no version")
+  eq(health.auth, "unknown", case.state .. " health skips authentication")
+  eq(health.capabilities, {}, case.state .. " health has no capabilities")
+  eq(health.error, case.error, case.state .. " bounded health diagnostic")
+  eq(compatibility_state.report_calls, report_calls, case.state .. " health reads no report")
+end
+
+for _, case in ipairs({
+  {
+    label = "missing snapshot",
+    snapshot = false,
+    category = "probe-failure",
+  },
+  {
+    label = "extra snapshot field",
+    snapshot = vim.tbl_extend("force", vim.deepcopy(ready_compatibility_snapshot), {
+      private = "snapshot-secret-canary",
+    }),
+    category = "probe-failure",
+  },
+  {
+    label = "unknown snapshot state",
+    snapshot = vim.tbl_extend("force", vim.deepcopy(ready_compatibility_snapshot), {
+      state = "private-state-canary",
+    }),
+    category = "probe-failure",
+  },
+  {
+    label = "invalid failure category",
+    snapshot = {
+      state = "failed",
+      installed = true,
+      executable = "/usr/bin/opencode",
+      version = "",
+      category = "private-category-canary",
+      queued = false,
+    },
+    category = "probe-failure",
+  },
+  {
+    label = "ready executable drift",
+    snapshot = vim.tbl_extend("force", vim.deepcopy(ready_compatibility_snapshot), {
+      executable = "/usr/bin/stale-opencode",
+    }),
+    category = "executable-drift",
+  },
+}) do
+  compatibility_state.snapshot = case.snapshot == false and nil or vim.deepcopy(case.snapshot)
+  local report_calls = compatibility_state.report_calls
+  local health = registry:health("opencode")
+  eq(health.compatibility, "failed", case.label .. " maps to failed")
+  eq(health.capabilities, {}, case.label .. " has no capabilities")
+  eq(
+    health.error,
+    "managed OpenCode compatibility failed: " .. case.category,
+    case.label .. " bounded diagnostic"
+  )
+  eq(compatibility_state.report_calls, report_calls, case.label .. " reads no report")
+  assert(
+    not vim.inspect(health):find("private", 1, true),
+    case.label .. " leaked malformed snapshot data"
+  )
+end
+eq(
+  #calls.inspect_auth,
+  auth_reads_before_passive_health,
+  "non-ready health reads no authentication"
+)
+eq(compatibility_state.ensures, {}, "passive health never ensures compatibility")
+
+compatibility_state.snapshot = {
+  state = "checking",
+  installed = true,
+  executable = "/usr/bin/opencode",
+  version = "",
+  category = "",
+  queued = true,
+}
+local direct_snapshot = registry:opencode_compatibility()
+direct_snapshot.state = "failed"
+direct_snapshot.executable = "private-snapshot-mutation"
+eq(registry:opencode_compatibility(), {
+  state = "checking",
+  installed = true,
+  executable = "/usr/bin/opencode",
+  version = "",
+  category = "",
+  queued = true,
+}, "direct compatibility snapshots are fresh and passive")
+eq(compatibility_state.ensures, {}, "direct snapshot never ensures compatibility")
+compatibility_state.snapshot = vim.deepcopy(ready_compatibility_snapshot)
+compatibility_state.report = vim.deepcopy(compatibility_report)
 eq(registry_module._test.auth_arguments("codex"), { "login", "status" }, "Codex auth argv")
 eq(
   registry_module._test.auth_arguments("claude"),
@@ -672,6 +966,35 @@ end
 local function managed_health(overrides)
   local options = overrides or {}
   local order = {}
+  local controller = {
+    snapshot = function()
+      order[#order + 1] = "snapshot"
+      if options.snapshot_exception then
+        error(options.snapshot_exception)
+      end
+      return vim.deepcopy(options.snapshot or ready_compatibility_snapshot)
+    end,
+    report = function()
+      order[#order + 1] = "report"
+      if options.compatibility_error then
+        error(options.compatibility_error)
+      end
+      return vim.deepcopy(options.compatibility or compatibility_report)
+    end,
+    ensure = function()
+      error("health must not ensure compatibility")
+    end,
+    take_open = function()
+      return false
+    end,
+    cancel = function() end,
+    subscribe = function()
+      return function() end
+    end,
+    shutdown = function()
+      return true
+    end,
+  }
   local fixture = registry_module._test.new({
     executable = function(name)
       order[#order + 1] = "executable"
@@ -681,13 +1004,7 @@ local function managed_health(overrides)
       order[#order + 1] = "revalidate"
       return true
     end,
-    opencode_compatibility = function()
-      order[#order + 1] = "compatibility"
-      if options.compatibility_error then
-        return nil, options.compatibility_error
-      end
-      return vim.deepcopy(options.compatibility or compatibility_report)
-    end,
+    opencode_validation = controller,
     opencode_auth_path = function()
       order[#order + 1] = "auth_path"
       return "/home/user/.local/share/opencode/auth.json"
@@ -718,13 +1035,14 @@ eq(healthy_opencode.capabilities, opencode:capabilities(), "managed OpenCode hea
 eq(healthy_opencode.error, "", "managed OpenCode health succeeds")
 eq(
   healthy_order,
-  { "executable", "revalidate", "compatibility", "auth_path", "inspect_auth" },
+  { "executable", "revalidate", "snapshot", "report", "auth_path", "inspect_auth" },
   "managed OpenCode health ordering"
 )
 
 local health_failures = {
   {
     label = "unknown exact version",
+    compatibility_state = "failed",
     mutate = function(options)
       options.compatibility = vim.deepcopy(compatibility_report)
       options.compatibility.version = "1.18.19"
@@ -732,6 +1050,7 @@ local health_failures = {
   },
   {
     label = "missing pure mode",
+    compatibility_state = "failed",
     mutate = function(options)
       options.compatibility = vim.deepcopy(compatibility_report)
       options.compatibility.help.root[1] = "--unsafe"
@@ -739,6 +1058,7 @@ local health_failures = {
   },
   {
     label = "malformed agent report",
+    compatibility_state = "failed",
     mutate = function(options)
       options.compatibility = vim.deepcopy(compatibility_report)
       options.compatibility.agents.build = "malformed-agent-canary"
@@ -746,24 +1066,28 @@ local health_failures = {
   },
   {
     label = "semantic helper failure",
+    compatibility_state = "failed",
     mutate = function(options)
       options.compatibility_error = "compatibility-secret-canary"
     end,
   },
   {
     label = "unauthenticated filtered credentials",
+    compatibility_state = "ready",
     mutate = function(options)
       options.auth = "unauthenticated"
     end,
   },
   {
     label = "authentication helper exception",
+    compatibility_state = "ready",
     mutate = function(options)
       options.auth_exception = "credential-secret-canary"
     end,
   },
   {
     label = "unknown authentication",
+    compatibility_state = "ready",
     mutate = function(options)
       options.auth = "unknown"
       options.auth_error = "credential-helper-private-canary"
@@ -775,6 +1099,7 @@ for _, case in ipairs(health_failures) do
   case.mutate(options)
   local health = managed_health(options)
   eq(health.installed, true, case.label .. " remains detected")
+  eq(health.compatibility, case.compatibility_state, case.label .. " compatibility state")
   eq(health.capabilities, {}, case.label .. " disables capabilities")
   assert(type(health.error) == "string" and health.error ~= "", case.label .. " has no error")
   assert(#health.error <= 256, case.label .. " error is unbounded")
@@ -817,6 +1142,501 @@ local absent = registry_module._test.new({
 local absent_health = absent:health("codex")
 eq(absent_health.installed, false, "absent executable")
 eq(absent_calls, 0, "absent backend runs no probes")
+
+local function absent_opencode_health(options)
+  local calls = {
+    order = {},
+    ensure = 0,
+    report = 0,
+    auth_path = 0,
+    inspect_auth = 0,
+    revalidate = 0,
+    stat = 0,
+  }
+  local controller = {
+    snapshot = function()
+      calls.order[#calls.order + 1] = "snapshot"
+      if options.snapshot_exception then
+        error({ private = "snapshot-secret-canary" })
+      end
+      return vim.deepcopy(options.snapshot)
+    end,
+    report = function()
+      calls.report = calls.report + 1
+      error("absent health read a compatibility report")
+    end,
+    ensure = function()
+      calls.ensure = calls.ensure + 1
+      error("absent health ensured compatibility")
+    end,
+  }
+  local fixture = registry_module._test.new({
+    executable = function(name)
+      eq(name, "opencode", options.label .. " resolver backend")
+      calls.order[#calls.order + 1] = "resolve"
+      return nil, "resolver-secret-canary", false
+    end,
+    revalidate = function()
+      calls.revalidate = calls.revalidate + 1
+      error("absent health revalidated an executable")
+    end,
+    opencode_validation = controller,
+    opencode_auth_path = function()
+      calls.auth_path = calls.auth_path + 1
+      error("absent health resolved authentication")
+    end,
+    inspect_opencode_auth = function()
+      calls.inspect_auth = calls.inspect_auth + 1
+      error("absent health inspected authentication")
+    end,
+    stat = function()
+      calls.stat = calls.stat + 1
+      error("absent health inspected the filesystem")
+    end,
+    uid = function()
+      return 1000
+    end,
+  })
+  return fixture:health("opencode"), calls
+end
+
+for _, case in ipairs({
+  {
+    label = "absent not checked",
+    snapshot = {
+      state = "not_checked",
+      installed = false,
+      executable = "",
+      version = "",
+      category = "",
+      queued = false,
+    },
+    compatibility = "not_checked",
+    error = "managed OpenCode compatibility not checked",
+  },
+  {
+    label = "absent unavailable",
+    snapshot = {
+      state = "failed",
+      installed = false,
+      executable = "",
+      version = "",
+      category = "unavailable",
+      queued = false,
+    },
+    compatibility = "failed",
+    error = "managed OpenCode compatibility failed: unavailable",
+  },
+  {
+    label = "absent malformed snapshot",
+    snapshot = { state = "private-state-canary" },
+    compatibility = "failed",
+    error = "managed OpenCode compatibility failed: probe-failure",
+  },
+  {
+    label = "absent throwing snapshot",
+    snapshot_exception = true,
+    compatibility = "failed",
+    error = "managed OpenCode compatibility failed: probe-failure",
+  },
+}) do
+  local health, absent_opencode_calls = absent_opencode_health(case)
+  eq(health, {
+    installed = false,
+    executable = "",
+    version = "",
+    auth = "unknown",
+    capabilities = {},
+    compatibility = case.compatibility,
+    error = case.error,
+  }, case.label .. " health")
+  eq(absent_opencode_calls.order, { "resolve", "snapshot" }, case.label .. " ordering")
+  eq(absent_opencode_calls.ensure, 0, case.label .. " does not ensure")
+  eq(absent_opencode_calls.report, 0, case.label .. " reads no report")
+  eq(absent_opencode_calls.auth_path, 0, case.label .. " resolves no authentication path")
+  eq(absent_opencode_calls.inspect_auth, 0, case.label .. " inspects no authentication")
+  eq(absent_opencode_calls.revalidate, 0, case.label .. " revalidates no executable")
+  eq(absent_opencode_calls.stat, 0, case.label .. " inspects no filesystem")
+  assert(
+    not vim.inspect(health):find("secret-canary", 1, true),
+    case.label .. " leaked a dependency diagnostic"
+  )
+end
+
+eq(registry:health("missing"), {
+  installed = false,
+  executable = "",
+  version = "",
+  auth = "unknown",
+  capabilities = {},
+  error = "unknown backend",
+}, "unknown backend health is unchanged")
+
+local facade_calls = {}
+local facade_snapshot = {
+  state = "checking",
+  installed = true,
+  executable = "/usr/bin/opencode",
+  version = "",
+  category = "",
+  queued = true,
+}
+local facade_controller = {
+  snapshot = function()
+    facade_calls[#facade_calls + 1] = { "snapshot" }
+    return vim.deepcopy(facade_snapshot)
+  end,
+  report = function()
+    facade_calls[#facade_calls + 1] = { "report" }
+    return vim.deepcopy(compatibility_report)
+  end,
+  ensure = function(_, request)
+    facade_calls[#facade_calls + 1] = { "ensure", vim.deepcopy(request) }
+    return vim.deepcopy(facade_snapshot)
+  end,
+  take_open = function(_, identity_key)
+    facade_calls[#facade_calls + 1] = { "take_open", identity_key }
+    return true
+  end,
+  cancel = function(_, reason)
+    facade_calls[#facade_calls + 1] = { "cancel", reason }
+  end,
+  subscribe = function(_, callback)
+    facade_calls[#facade_calls + 1] = { "subscribe", callback }
+    return function()
+      facade_calls[#facade_calls + 1] = { "unsubscribe" }
+    end
+  end,
+  shutdown = function(_, exit_committed)
+    facade_calls[#facade_calls + 1] = { "shutdown", exit_committed }
+    return true
+  end,
+}
+local facade = registry_module._test.new({
+  executable = function()
+    error("facade-executable-secret-canary")
+  end,
+  revalidate = function()
+    error("facade-revalidate-secret-canary")
+  end,
+  stat = function()
+    error("facade-stat-secret-canary")
+  end,
+  uid = function()
+    return 1000
+  end,
+  opencode_validation = facade_controller,
+})
+eq(facade_calls, {}, "facade registry construction is passive")
+eq(facade:names(), { "codex", "claude", "opencode" }, "facade names remain passive")
+assert(type(facade:get("opencode")) == "table", "facade get returns OpenCode adapter")
+eq(facade_calls, {}, "facade names and get do not touch the controller")
+eq(facade:opencode_compatibility(), facade_snapshot, "facade forwards snapshot")
+local facade_request = { reason = "open", identity_key = identity.key }
+eq(facade:ensure_opencode_compatibility(facade_request), facade_snapshot, "facade forwards ensure")
+eq(facade:take_opencode_open(identity.key), true, "facade forwards queued opening")
+facade:cancel_opencode_compatibility("backend-switch")
+local facade_observer = function() end
+local unsubscribe = assert(facade:subscribe_opencode_compatibility(facade_observer))
+unsubscribe()
+local invalid_shutdown_ok = pcall(facade.shutdown, facade, "false")
+eq(invalid_shutdown_ok, false, "registry shutdown requires an explicit boolean")
+eq(facade:shutdown(true), true, "registry forwards committed shutdown")
+local terminal_snapshot = facade:opencode_compatibility()
+eq(terminal_snapshot, {
+  state = "not_checked",
+  installed = false,
+  executable = "",
+  version = "",
+  category = "",
+  queued = false,
+}, "shutdown registry returns an idle compatibility snapshot")
+terminal_snapshot.state = "failed"
+eq(facade:opencode_compatibility(), {
+  state = "not_checked",
+  installed = false,
+  executable = "",
+  version = "",
+  category = "",
+  queued = false,
+}, "shutdown registry returns fresh compatibility snapshots")
+local terminal_ensure, terminal_ensure_error =
+  facade:ensure_opencode_compatibility({ reason = "open", identity_key = identity.key })
+eq(terminal_ensure, nil, "shutdown registry refuses compatibility ensure")
+eq(
+  terminal_ensure_error,
+  "managed OpenCode compatibility request is invalid",
+  "shutdown registry ensure diagnostic"
+)
+eq(facade:take_opencode_open(identity.key), false, "shutdown registry has no queued opening")
+eq(
+  facade:cancel_opencode_compatibility("backend-switch"),
+  nil,
+  "shutdown registry cancellation is inert"
+)
+local terminal_unsubscribe, terminal_subscribe_error = facade:subscribe_opencode_compatibility(
+  function() end
+)
+eq(terminal_unsubscribe, nil, "shutdown registry refuses observers")
+eq(
+  terminal_subscribe_error,
+  "managed OpenCode compatibility observer is unavailable",
+  "shutdown registry observer diagnostic"
+)
+eq(facade:shutdown(false), true, "registry shutdown is idempotent")
+eq(facade_calls, {
+  { "snapshot" },
+  { "ensure", facade_request },
+  { "take_open", identity.key },
+  { "cancel", "backend-switch" },
+  { "subscribe", facade_observer },
+  { "unsubscribe" },
+  { "shutdown", true },
+}, "all facades use one injected controller exactly once")
+
+local unused_shutdowns = 0
+local unused_starts = 0
+local unused_controller_touches = 0
+local unused_facade = registry_module._test.new({
+  executable = function()
+    error("unused facade resolved an executable")
+  end,
+  revalidate = function()
+    error("unused facade revalidated an executable")
+  end,
+  stat = function()
+    error("unused facade inspected the filesystem")
+  end,
+  uid = function()
+    return 1000
+  end,
+  start_opencode_probe = function()
+    unused_starts = unused_starts + 1
+    error("unused facade started a probe")
+  end,
+  opencode_validation = setmetatable({}, {
+    __index = function(_, method)
+      unused_controller_touches = unused_controller_touches + 1
+      if method == "shutdown" then
+        return function()
+          unused_shutdowns = unused_shutdowns + 1
+          return true
+        end
+      end
+      error("unused facade touched its controller")
+    end,
+  }),
+})
+eq(unused_facade:shutdown(false), true, "unused registry shutdown succeeds passively")
+eq(unused_facade:opencode_compatibility(), {
+  state = "not_checked",
+  installed = false,
+  executable = "",
+  version = "",
+  category = "",
+  queued = false,
+}, "unused shutdown registry remains terminal")
+eq(unused_facade:shutdown(true), true, "unused registry shutdown remains idempotent")
+eq(unused_shutdowns, 0, "unused registry shutdown does not touch an injected controller")
+eq(unused_controller_touches, 0, "terminal facades never construct an injected controller")
+eq(unused_starts, 0, "terminal facades never start a compatibility probe")
+
+local terminal_ready_snapshot = {
+  state = "ready",
+  installed = true,
+  executable = "/usr/bin/opencode",
+  version = "1.18.18",
+  category = "",
+  queued = false,
+}
+
+local function new_terminal_registry(label, executable_present)
+  local controller_calls = {
+    snapshot = 0,
+    report = 0,
+    ensure = 0,
+    shutdown = 0,
+    start = 0,
+  }
+  local effects = {
+    auth_path = 0,
+    inspect_auth = 0,
+    prepare = 0,
+    inspect_profile = 0,
+    port = 0,
+    password = 0,
+    profile_token = 0,
+  }
+  local controller = {
+    snapshot = function()
+      controller_calls.snapshot = controller_calls.snapshot + 1
+      return vim.deepcopy(terminal_ready_snapshot)
+    end,
+    report = function()
+      controller_calls.report = controller_calls.report + 1
+      return vim.deepcopy(compatibility_report)
+    end,
+    ensure = function()
+      controller_calls.ensure = controller_calls.ensure + 1
+      return vim.deepcopy(terminal_ready_snapshot)
+    end,
+    shutdown = function(_, exit_committed)
+      assert(type(exit_committed) == "boolean", label .. " shutdown phase")
+      controller_calls.shutdown = controller_calls.shutdown + 1
+      return true
+    end,
+  }
+  local registry = registry_module._test.new({
+    executable = function(name)
+      eq(name, "opencode", label .. " executable backend")
+      if executable_present then
+        return "/usr/bin/opencode"
+      end
+      return nil, "terminal-resolver-secret-canary", false
+    end,
+    revalidate = function(executable)
+      eq(executable, "/usr/bin/opencode", label .. " executable revalidation")
+      return true
+    end,
+    opencode_validation = controller,
+    start_opencode_probe = function()
+      controller_calls.start = controller_calls.start + 1
+      error("terminal registry started a probe")
+    end,
+    opencode_auth_path = function()
+      effects.auth_path = effects.auth_path + 1
+      return "/home/user/.local/share/opencode/auth.json"
+    end,
+    inspect_opencode_auth = function()
+      effects.inspect_auth = effects.inspect_auth + 1
+      return "authenticated"
+    end,
+    prepare_opencode_profile = function()
+      effects.prepare = effects.prepare + 1
+      return vim.deepcopy(prepared_profile)
+    end,
+    inspect_opencode_profile = function()
+      effects.inspect_profile = effects.inspect_profile + 1
+      return vim.deepcopy(prepared_profile)
+    end,
+    port = function()
+      effects.port = effects.port + 1
+      return 43123
+    end,
+    password = function()
+      effects.password = effects.password + 1
+      return "0123456789abcdef0123456789abcdef"
+    end,
+    profile_token = function()
+      effects.profile_token = effects.profile_token + 1
+      return profile_token
+    end,
+    stat = function(path)
+      if path == "/usr/bin/opencode" and executable_present then
+        return { type = "file", mode = 493, uid = 0 }
+      end
+      return nil
+    end,
+    uid = function()
+      return 1000
+    end,
+  })
+  local terminal_paths = vim.deepcopy(paths)
+  terminal_paths.backend_state = "/state/identity/backends/opencode"
+  terminal_paths.grants = {}
+  terminal_paths.opencode_profile = nil
+  local resume_paths = vim.deepcopy(terminal_paths)
+  resume_paths.opencode_profile = {
+    token = profile_token,
+    fingerprint = profile_fingerprint,
+    version = "1.18.18",
+  }
+  return {
+    registry = registry,
+    adapter = assert(registry:get("opencode")),
+    controller_calls = controller_calls,
+    effects = effects,
+    paths = terminal_paths,
+    resume_paths = resume_paths,
+  }
+end
+
+local function terminal_health(executable_present)
+  return {
+    installed = executable_present,
+    executable = executable_present and "/usr/bin/opencode" or "",
+    version = "",
+    auth = "unknown",
+    capabilities = {},
+    compatibility = "not_checked",
+    error = "managed OpenCode compatibility not checked",
+  }
+end
+
+local function assert_terminal_effects(fixture, label)
+  eq(fixture.effects, {
+    auth_path = 0,
+    inspect_auth = 0,
+    prepare = 0,
+    inspect_profile = 0,
+    port = 0,
+    password = 0,
+    profile_token = 0,
+  }, label .. " has no authentication or launch effects")
+end
+
+for _, active in ipairs({ false, true }) do
+  for _, executable_present in ipairs({ false, true }) do
+    local label = string.format(
+      "%s %s terminal registry",
+      active and "active" or "unused",
+      executable_present and "present" or "absent"
+    )
+    local fixture = new_terminal_registry(label, executable_present)
+    if active then
+      eq(
+        fixture.registry:opencode_compatibility(),
+        terminal_ready_snapshot,
+        label .. " activates one controller"
+      )
+    end
+    eq(fixture.registry:shutdown(false), true, label .. " first shutdown")
+    eq(
+      fixture.registry:health("opencode"),
+      terminal_health(executable_present),
+      label .. " registry health"
+    )
+    eq(
+      fixture.adapter:health(),
+      terminal_health(executable_present),
+      label .. " retained adapter health"
+    )
+    local new_launch, new_error = fixture.adapter:new_session(identity, fixture.paths)
+    eq(new_launch, nil, label .. " retained new session is refused")
+    eq(
+      new_error,
+      "managed OpenCode compatibility is not ready",
+      label .. " retained new-session diagnostic"
+    )
+    local resume_launch, resume_error =
+      fixture.adapter:resume_session(identity, fixture.resume_paths, "ses_terminal123")
+    eq(resume_launch, nil, label .. " retained resume is refused")
+    eq(
+      resume_error,
+      "managed OpenCode compatibility is not ready",
+      label .. " retained resume diagnostic"
+    )
+    eq(fixture.registry:shutdown(true), true, label .. " repeated shutdown is cached")
+    eq(fixture.controller_calls, {
+      snapshot = active and 1 or 0,
+      report = 0,
+      ensure = 0,
+      shutdown = active and 1 or 0,
+      start = 0,
+    }, label .. " has exact controller access")
+    assert_terminal_effects(fixture, label)
+  end
+end
 
 for _, case in ipairs({
   {
@@ -1030,5 +1850,94 @@ local missing_bwrap = registry_module._test.read_only_probe("/usr/bin/codex", { 
 })
 eq(missing_bwrap.code, 127, "missing Bubblewrap fails health probe")
 eq(unconfined_run, false, "missing Bubblewrap never retries unconfined")
+
+for _, method in ipairs({
+  "opencode_compatibility",
+  "ensure_opencode_compatibility",
+  "take_opencode_open",
+  "cancel_opencode_compatibility",
+  "subscribe_opencode_compatibility",
+  "shutdown",
+}) do
+  assert(type(registry_module[method]) == "function", "module facade is missing: " .. method)
+end
+local invalid_module_shutdown_ok = pcall(registry_module.shutdown, "false")
+eq(invalid_module_shutdown_ok, false, "module shutdown requires an explicit boolean")
+eq(registry_module.shutdown(false), true, "unused module shutdown is passive")
+
+local runtime_upvalue
+local original_runtime
+for index = 1, 32 do
+  local name, value = debug.getupvalue(registry_module.shutdown, index)
+  if name == nil then
+    break
+  end
+  if name == "runtime" then
+    runtime_upvalue = index
+    original_runtime = value
+    break
+  end
+end
+assert(runtime_upvalue, "module runtime upvalue is unavailable")
+eq(original_runtime, nil, "module runtime starts empty")
+
+local old_runtime = new_terminal_registry("old module runtime", true)
+eq(
+  old_runtime.registry:opencode_compatibility(),
+  terminal_ready_snapshot,
+  "old module runtime activates its controller"
+)
+debug.setupvalue(registry_module.shutdown, runtime_upvalue, old_runtime.registry)
+local retained_runtime_adapter = registry_module.get("opencode")
+eq(retained_runtime_adapter, old_runtime.adapter, "module returns the old runtime adapter")
+eq(registry_module.shutdown(true), true, "module shutdown clears and stops the old singleton")
+
+local fresh_runtime = new_terminal_registry("fresh module runtime", true)
+debug.setupvalue(registry_module.shutdown, runtime_upvalue, fresh_runtime.registry)
+local fresh_runtime_adapter = registry_module.get("opencode")
+assert(
+  retained_runtime_adapter ~= fresh_runtime_adapter,
+  "module singleton replacement reused the old adapter"
+)
+eq(
+  retained_runtime_adapter:health(),
+  terminal_health(true),
+  "old retained adapter remains terminal after singleton replacement"
+)
+local old_launch, old_launch_error =
+  retained_runtime_adapter:new_session(identity, old_runtime.paths)
+eq(old_launch, nil, "old retained adapter refuses launch after singleton replacement")
+eq(
+  old_launch_error,
+  "managed OpenCode compatibility is not ready",
+  "old retained adapter launch diagnostic after singleton replacement"
+)
+local old_resume, old_resume_error =
+  retained_runtime_adapter:resume_session(identity, old_runtime.resume_paths, "ses_terminal123")
+eq(old_resume, nil, "old retained adapter refuses resume after singleton replacement")
+eq(
+  old_resume_error,
+  "managed OpenCode compatibility is not ready",
+  "old retained adapter resume diagnostic after singleton replacement"
+)
+eq(old_runtime.registry:shutdown(false), true, "old registry shutdown result remains cached")
+eq(old_runtime.controller_calls, {
+  snapshot = 1,
+  report = 0,
+  ensure = 0,
+  shutdown = 1,
+  start = 0,
+}, "old retained adapter never re-enters either controller generation")
+eq(fresh_runtime.controller_calls, {
+  snapshot = 0,
+  report = 0,
+  ensure = 0,
+  shutdown = 0,
+  start = 0,
+}, "old retained adapter never touches the fresh controller")
+assert_terminal_effects(old_runtime, "old retained adapter")
+assert_terminal_effects(fresh_runtime, "fresh replacement runtime")
+eq(registry_module.shutdown(false), true, "replacement singleton shuts down independently")
+debug.setupvalue(registry_module.shutdown, runtime_upvalue, original_runtime)
 
 print("AI backend adapter assertions: ok")

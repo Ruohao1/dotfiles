@@ -11,6 +11,39 @@ local CAPABILITIES = {
 
 local MAX_DIAGNOSTIC_BYTES = 256
 
+local VALID_COMPATIBILITY_STATE = {
+  not_checked = true,
+  checking = true,
+  ready = true,
+  failed = true,
+}
+
+local VALID_COMPATIBILITY_FAILURE = {
+  unavailable = true,
+  timeout = true,
+  ["output-overflow"] = true,
+  ["executable-drift"] = true,
+  ["probe-failure"] = true,
+  ["artifact-rejection"] = true,
+  ["parse-failure"] = true,
+  cancellation = true,
+  ["cleanup-failure"] = true,
+}
+
+local COMPATIBILITY_SNAPSHOT_FIELDS = {
+  state = true,
+  installed = true,
+  executable = true,
+  version = true,
+  category = true,
+  queued = true,
+}
+
+local compatibility_errors = {
+  not_checked = "managed OpenCode compatibility not checked",
+  checking = "managed OpenCode compatibility checking",
+}
+
 local function valid_session(value, allow_empty)
   if allow_empty and value == "" then
     return true
@@ -23,6 +56,61 @@ end
 
 local function generic_error(category)
   return ("managed OpenCode " .. category .. " failed"):sub(1, MAX_DIAGNOSTIC_BYTES)
+end
+
+local function valid_compatibility_snapshot(snapshot)
+  if type(snapshot) ~= "table" then
+    return false
+  end
+  local field_count = 0
+  for field in pairs(snapshot) do
+    if not COMPATIBILITY_SNAPSHOT_FIELDS[field] then
+      return false
+    end
+    field_count = field_count + 1
+  end
+  if
+    field_count ~= 6
+    or not VALID_COMPATIBILITY_STATE[snapshot.state]
+    or type(snapshot.installed) ~= "boolean"
+    or type(snapshot.executable) ~= "string"
+    or type(snapshot.version) ~= "string"
+    or type(snapshot.category) ~= "string"
+    or type(snapshot.queued) ~= "boolean"
+    or (snapshot.installed and snapshot.executable:sub(1, 1) ~= "/")
+    or (not snapshot.installed and snapshot.executable ~= "")
+  then
+    return false
+  end
+  if snapshot.state == "ready" then
+    return snapshot.installed and snapshot.version == managed.version() and snapshot.category == ""
+  end
+  if snapshot.version ~= "" then
+    return false
+  end
+  if snapshot.state == "failed" then
+    return VALID_COMPATIBILITY_FAILURE[snapshot.category] == true
+  end
+  return snapshot.category == ""
+end
+
+local function compatibility_health(executable, snapshot, installed)
+  local state = type(snapshot) == "table" and snapshot.state or "failed"
+  local category = type(snapshot) == "table" and snapshot.category or "probe-failure"
+  local detail = compatibility_errors[state]
+    or ("managed OpenCode compatibility failed: " .. tostring(category)):sub(
+      1,
+      MAX_DIAGNOSTIC_BYTES
+    )
+  return {
+    installed = installed ~= false,
+    executable = executable,
+    version = "",
+    auth = "unknown",
+    capabilities = {},
+    compatibility = state,
+    error = detail,
+  }
 end
 
 local function without_profile_reference(paths)
@@ -108,8 +196,29 @@ function M.new(deps)
       return nil, validation_error
     end
     local executable, executable_error = deps.resolve_executable("opencode")
+    local snapshot_ok, snapshot = pcall(deps.opencode_compatibility_snapshot)
+    local valid_snapshot_ok, valid_snapshot = pcall(valid_compatibility_snapshot, snapshot)
+    if
+      not snapshot_ok
+      or not valid_snapshot_ok
+      or not valid_snapshot
+      or snapshot.state ~= "ready"
+      or snapshot.installed ~= true
+      or snapshot.version ~= managed.version()
+      or snapshot.category ~= ""
+    then
+      return nil, "managed OpenCode compatibility is not ready"
+    end
     if not executable then
       return nil, executable_error
+    end
+    if snapshot.executable ~= executable then
+      return nil, "managed OpenCode compatibility is not ready"
+    end
+    local report_ok, report = pcall(deps.opencode_compatibility_report)
+    local validation_ok, compatible = pcall(managed.validate_compatibility, report)
+    if not report_ok or type(report) ~= "table" or not validation_ok or not compatible then
+      return nil, "managed OpenCode compatibility is not ready"
     end
 
     local profile, profile_error
@@ -219,28 +328,35 @@ function M.new(deps)
   end
 
   function adapter:health()
-    local executable, executable_error, installed = deps.resolve_executable("opencode")
-    if not executable then
-      return {
-        installed = installed,
-        executable = "",
-        version = "",
-        auth = "unknown",
-        capabilities = {},
-        error = executable_error or generic_error("executable validation"),
+    local executable = deps.resolve_executable("opencode")
+    local snapshot_ok, snapshot = pcall(deps.opencode_compatibility_snapshot)
+    local valid_snapshot_ok, valid_snapshot = pcall(valid_compatibility_snapshot, snapshot)
+    if not snapshot_ok or not valid_snapshot_ok or not valid_snapshot then
+      snapshot = {
+        state = "failed",
+        category = "probe-failure",
       }
     end
-
-    local compatibility_ok, report = pcall(deps.opencode_compatibility, executable)
-    if not compatibility_ok or not report or not managed.validate_compatibility(report) then
-      return {
-        installed = true,
-        executable = executable,
-        version = "",
-        auth = "unknown",
-        capabilities = {},
-        error = generic_error("compatibility validation"),
+    if snapshot.state == "ready" and (not executable or snapshot.executable ~= executable) then
+      snapshot = {
+        state = "failed",
+        category = "executable-drift",
       }
+    end
+    if not executable then
+      return compatibility_health("", snapshot, false)
+    end
+    if snapshot.state ~= "ready" then
+      return compatibility_health(executable, snapshot)
+    end
+
+    local report_ok, report = pcall(deps.opencode_compatibility_report)
+    local validation_ok, compatible = pcall(managed.validate_compatibility, report)
+    if not report_ok or type(report) ~= "table" or not validation_ok or not compatible then
+      return compatibility_health(executable, {
+        state = "failed",
+        category = "probe-failure",
+      })
     end
 
     local path_ok, auth_path = pcall(deps.opencode_auth_path)
@@ -251,6 +367,7 @@ function M.new(deps)
         version = managed.version(),
         auth = "unknown",
         capabilities = {},
+        compatibility = "ready",
         error = generic_error("authentication path validation"),
       }
     end
@@ -262,6 +379,7 @@ function M.new(deps)
         version = managed.version(),
         auth = auth_ok and auth == "unauthenticated" and "unauthenticated" or "unknown",
         capabilities = {},
+        compatibility = "ready",
         error = generic_error("authentication inspection"),
       }
     end
@@ -271,6 +389,7 @@ function M.new(deps)
       version = managed.version(),
       auth = "authenticated",
       capabilities = vim.deepcopy(CAPABILITIES),
+      compatibility = "ready",
       error = "",
     }
   end
