@@ -4335,6 +4335,7 @@ for child_exit_kind in exit-zero-child exit-nonzero-child; do
   child_exit_pid_file=$child_exit_root/target.pid
   child_exit_child_pid_file=$child_exit_root/child.pid
   child_exit_relation_file=$child_exit_root/relation
+  child_exit_audit_file=$child_exit_root/probe.audit
   mkdir -p "$child_exit_root"
   make_probe_tree_command \
     "$child_exit_command" "$child_exit_kind" \
@@ -4342,7 +4343,8 @@ for child_exit_kind in exit-zero-child exit-nonzero-child; do
     "$child_exit_child_pid_file" \
     "$child_exit_relation_file"
   run_direct_probe_case "$child_exit_kind" "$child_exit_command" \
-    "$direct_probe_bootstrap"
+    "$direct_probe_bootstrap" \
+    DOTFILES_BOOTSTRAP_TEST_PROBE_AUDIT_FILE="$child_exit_audit_file"
   child_exit_pass=true
   case "$child_exit_kind:$run_status" in
     exit-zero-child:0|exit-nonzero-child:42) ;;
@@ -4354,6 +4356,9 @@ for child_exit_kind in exit-zero-child exit-nonzero-child; do
     = "$child_exit_pid|$child_exit_child_pid" ] || child_exit_pass=false
   [ "$(cat "$child_exit_relation_file.ready" 2>/dev/null || true)" = ready ] \
     || child_exit_pass=false
+  if grep -Fq 'group-term|' "$child_exit_audit_file" 2>/dev/null; then
+    child_exit_pass=false
+  fi
   case "$child_exit_child_pid" in
     ''|*[!0-9]*) child_exit_pass=false ;;
     *)

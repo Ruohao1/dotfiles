@@ -1044,10 +1044,13 @@ stop_owned_probe() {
     && [ -n "$active_probe_anchor_pid" ]; then
     if probe_anchor_identity_is_valid \
       "$active_probe_anchor_pid" "$active_probe_anchor_parent"; then
-      record_probe_test_audit "group-term|$active_probe_group_id" \
-        || probe_cleanup_status=1
-      kill -TERM -- "-$active_probe_group_id" >/dev/null 2>&1 \
-        || probe_cleanup_status=1
+      if probe_group_has_non_anchor_member \
+        "$active_probe_group_id" "$active_probe_anchor_pid"; then
+        record_probe_test_audit "group-term|$active_probe_group_id" \
+          || probe_cleanup_status=1
+        kill -TERM -- "-$active_probe_group_id" >/dev/null 2>&1 \
+          || probe_cleanup_status=1
+      fi
       if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
         && [ "${DOTFILES_BOOTSTRAP_TEST_PROBE_SIGNAL_AT:-}" = teardown ]; then
         record_probe_test_audit 'teardown-signal|TERM' \
